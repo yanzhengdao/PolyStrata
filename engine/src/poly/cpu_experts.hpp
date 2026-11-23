@@ -18,20 +18,17 @@
 
 namespace strata::poly {
 
-enum class CpuAffinityPolicy { kDefault, kPCores };
-
 /// Runs fn(0..n-1) on the workers and the calling thread, and returns when all of them are done.  A call from
 /// inside fn does its work on the thread it is on.
 class Workers {
 public:
-    explicit Workers(int threads, CpuAffinityPolicy policy = CpuAffinityPolicy::kDefault);
+    explicit Workers(int threads, int idle_spins = 20000);
     ~Workers();
     Workers(const Workers&) = delete;
     Workers& operator=(const Workers&) = delete;
 
     void run(int n, const std::function<void(int)>& fn);
     int threads() const { return (int) th_.size() + 1; }
-    const std::vector<unsigned long>& cpu_set_ids() const { return cpu_set_ids_; }
 
 private:
     // Every thread takes tasks from next and counts what it ran down from left once, when it finds no more: with a
@@ -50,8 +47,8 @@ private:
     void loop(int i);
     static bool drain(Batch& b);
 
+    const int idle_spins_;                  ///< how long idle workers pause before atomic wait
     std::vector<std::thread> th_;
-    std::vector<unsigned long> cpu_set_ids_;   ///< only when Windows P-core scheduling was requested
     std::vector<Busy> busy_;                     ///< a worker's Busy
     alignas(64) std::atomic<Batch*> cur_{nullptr};   ///< every idle worker reads it in a loop
     alignas(64) std::atomic<int> sleepers_{0};

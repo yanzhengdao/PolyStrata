@@ -54,7 +54,6 @@ namespace {
 
 using strata::poly::CacheOptions;
 using strata::poly::Conversations;
-using strata::poly::CpuAffinityPolicy;
 using strata::poly::Engine;
 using strata::poly::Guesses;
 using strata::poly::KvFmt;
@@ -1609,8 +1608,8 @@ void usage() {
                  "  --max-context N        tokens the attention caches hold (default 8192)\n"
                  "  --threads N            CPU threads for the experts that are not in VRAM (default: 70%% of the usable\n"
                  "                         CPUs; all of them in a container with a CPU quota)\n"
-                 "  --cpu-affinity MODE    CPU expert scheduling: default (Windows decides) or p-cores (Windows\n"
-                 "                         high-performance CPU Sets only; no process-wide pinning)\n"
+                 "  --worker-idle-spins N  CPU expert worker pause-loop iterations before sleeping (0..1000000;\n"
+                 "                         default 20000; 0 = sleep immediately; experimental)\n"
                  "  --vram-reserve-mib N   VRAM left free beside the expert cache, 256 at least (default: a\n"
                  "                         thirty-second of the card, 256 to 768, or a sixteenth, 512 to 1024,\n"
                  "                         when the PC's free RAM is within 4 GiB of the model's files, and then\n"
@@ -1825,15 +1824,7 @@ int main(int argc, char** argv) {
 #endif
         else if (a == "--max-context") o.max_context = std::atoi(val());
         else if (a == "--threads") o.threads = std::atoi(val());
-        else if (a == "--cpu-affinity") {
-            const std::string mode = val();
-            if (mode == "default") o.cpu_affinity = CpuAffinityPolicy::kDefault;
-            else if (mode == "p-cores") o.cpu_affinity = CpuAffinityPolicy::kPCores;
-            else {
-                std::fprintf(stderr, "strata-poly: --cpu-affinity needs default or p-cores\n");
-                return 2;
-            }
-        }
+        else if (a == "--worker-idle-spins") o.worker_idle_spins = std::atoi(val());
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(val());
         else if (a == "--vram-pool") o.vram_pool = true;
         else if (a == "--expert-profile") o.profile = val();
@@ -1924,6 +1915,10 @@ int main(int argc, char** argv) {
     }
     if (o.model.empty() || (!want_serve && ids.empty()) || max_new < 1) {
         usage();
+        return 2;
+    }
+    if (o.worker_idle_spins < 0 || o.worker_idle_spins > 1000000) {
+        std::fprintf(stderr, "strata-poly: --worker-idle-spins requires 0..1000000\n");
         return 2;
     }
     if (o.batch < 0 || o.batch > 16 || check < 0 || check > o.batch || (check > 0 && (int) ids.size() <= check)) {
