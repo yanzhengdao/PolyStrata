@@ -54,6 +54,7 @@ namespace {
 
 using strata::poly::CacheOptions;
 using strata::poly::Conversations;
+using strata::poly::CpuAffinityPolicy;
 using strata::poly::Engine;
 using strata::poly::Guesses;
 using strata::poly::KvFmt;
