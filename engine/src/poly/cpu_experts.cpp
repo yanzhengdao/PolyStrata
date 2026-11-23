@@ -1,5 +1,6 @@
 // src/poly/cpu_experts.cpp - see the header.
 #include "cpu_experts.hpp"
+#include "cpu_affinity.hpp"
 
 #include "strata/quant/act.hpp"
 #include "strata/quant/dot.hpp"
@@ -9,9 +10,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 #include <immintrin.h>
 #include <mutex>
 #include <numeric>
+#include <stdexcept>
 #include <utility>
 
 namespace strata::poly {
@@ -134,8 +137,34 @@ CpuDotX4 cpu_dot_x4(int type) {
     return out;
 }
 
-Workers::Workers(int threads) : busy_((size_t) std::max(threads - 1, 0)) {
-    for (int i = 1; i < threads; ++i) th_.emplace_back([this, i] { loop(i - 1); });
+Workers::Workers(int threads, CpuAffinityPolicy policy) : busy_((size_t) std::max(threads - 1, 0)) {
+    if (policy == CpuAffinityPolicy::kPCores) {
+        cpu_set_ids_ = cpu_affinity::windows_pcore_sets();
+        if (cpu_set_ids_.empty())
+            throw std::runtime_error("--cpu-affinity p-cores needs Windows CPU Sets with distinct efficiency classes");
+        std::fprintf(stderr, "strata-poly: CPU experts prefer %zu high-performance CPU Sets (%d threads total)\n",
+                     cpu_set_ids_.size(), threads);
+    }
+    // Verify each background worker's requested CPU Sets before reporting a working P-core mode.
+    std::atomic<int> ready{0}, failed{0};
+    for (int i = 1; i < threads; ++i)
+        th_.emplace_back([this, i, &ready, &failed] {
+            if (!cpu_set_ids_.empty()) {
+                if (!cpu_affinity::select_current(cpu_set_ids_)) failed.fetch_add(1, std::memory_order_relaxed);
+                ready.fetch_add(1, std::memory_order_release);
+            }
+            loop(i - 1);
+        });
+    if (!cpu_set_ids_.empty()) {
+        while (ready.load(std::memory_order_acquire) < threads - 1) std::this_thread::yield();
+        if (failed.load(std::memory_order_relaxed)) {
+            quit_.store(true);
+            posted_.fetch_add(1);
+            posted_.notify_all();
+            for (std::thread& t : th_) t.join();
+            throw std::runtime_error("--cpu-affinity p-cores: Windows rejected a worker's CPU Set selection");
+        }
+    }
 }
 
 Workers::~Workers() {
@@ -301,6 +330,9 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
                  int n_embd, int n_ff, const float* x, float limit, bool gelu, float* out,
                  const std::function<void()>* meanwhile, const uint8_t* late, const std::function<void(int)>* wait,
                  float situ_beta, float situ_lb) {
+    cpu_affinity::CallerScope caller(workers.cpu_set_ids());
+    if (!workers.cpu_set_ids().empty() && !caller.applied())
+        throw std::runtime_error("--cpu-affinity p-cores: Windows rejected the CPU expert caller's CPU Sets");
     const Rows tg = rows_of(gu_type), tu = rows_of(u_type), td = rows_of(d_type);
     const size_t gu_row = Q::row_bytes(gu_type, n_embd);
     const size_t u_row = Q::row_bytes(u_type, n_embd);

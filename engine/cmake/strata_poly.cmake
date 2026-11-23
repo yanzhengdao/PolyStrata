@@ -11,6 +11,8 @@
 
 macro(strata_poly)
 if(STRATA_BUILD_TESTS)
+  add_executable(poly_cpu_affinity_test src/poly/cpu_affinity_test.cpp)
+  add_test(NAME poly_cpu_affinity_test COMMAND poly_cpu_affinity_test)
   add_executable(glm_conversations_test src/poly/conversations_test.cpp src/poly/spill.cpp)
   add_test(NAME glm_conversations_test COMMAND glm_conversations_test)
   add_executable(poly_guesses_test src/poly/guesses_test.cpp src/spec/draft_policy.cpp)

@@ -3568,7 +3568,7 @@ void Engine::load(const Options& o) {
             if (dg_) files.insert(files.end(), dg_->paths().begin(), dg_->paths().end());
             node_ = stay_near(spans, files, threads, node_share_);
         }
-        workers_ = std::make_shared<Workers>(threads);
+        workers_ = std::make_shared<Workers>(threads, opt_.cpu_affinity);
     }
     if (!aside_) aside_ = std::make_unique<Aside>();
     // save_state()'s pinned memory, and read()'s for the checkpoints inside a read, with the load: made at the

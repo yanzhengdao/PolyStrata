@@ -1608,6 +1608,8 @@ void usage() {
                  "  --max-context N        tokens the attention caches hold (default 8192)\n"
                  "  --threads N            CPU threads for the experts that are not in VRAM (default: 70%% of the usable\n"
                  "                         CPUs; all of them in a container with a CPU quota)\n"
+                 "  --cpu-affinity MODE    CPU expert scheduling: default (Windows decides) or p-cores (Windows\n"
+                 "                         high-performance CPU Sets only; no process-wide pinning)\n"
                  "  --vram-reserve-mib N   VRAM left free beside the expert cache, 256 at least (default: a\n"
                  "                         thirty-second of the card, 256 to 768, or a sixteenth, 512 to 1024,\n"
                  "                         when the PC's free RAM is within 4 GiB of the model's files, and then\n"
@@ -1822,6 +1824,15 @@ int main(int argc, char** argv) {
 #endif
         else if (a == "--max-context") o.max_context = std::atoi(val());
         else if (a == "--threads") o.threads = std::atoi(val());
+        else if (a == "--cpu-affinity") {
+            const std::string mode = val();
+            if (mode == "default") o.cpu_affinity = CpuAffinityPolicy::kDefault;
+            else if (mode == "p-cores") o.cpu_affinity = CpuAffinityPolicy::kPCores;
+            else {
+                std::fprintf(stderr, "strata-poly: --cpu-affinity needs default or p-cores\n");
+                return 2;
+            }
+        }
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(val());
         else if (a == "--vram-pool") o.vram_pool = true;
         else if (a == "--expert-profile") o.profile = val();

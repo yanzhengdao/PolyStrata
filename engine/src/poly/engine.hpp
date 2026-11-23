@@ -65,6 +65,7 @@ struct Options {
     std::string model;
     int max_context = 8192;
     int threads = 0;              ///< 0: the CPUs this process may use
+    CpuAffinityPolicy cpu_affinity = CpuAffinityPolicy::kDefault;  ///< opt-in Windows CPU expert P-core scheduling
     int vram_reserve_mib = -1;    ///< left free after the expert cache is filled; below 0: by the card's size
     bool vram_pool = false;       ///< one pool of VRAM claimed at load, kept for the whole run: the expert cache and the
                                   ///< attention caches trade pieces of it and nothing is given back to the card; the
