@@ -12,6 +12,8 @@
 #include "strata/core/conversation_memory.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
+#include "strata/quant/isa.hpp"
+#include "strata/quant/types.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -61,8 +63,38 @@ using strata::poly::KvFmt;
 using strata::poly::Options;
 using strata::poly::OverlapTiming;
 using Clock = std::chrono::steady_clock;
+using strata::poly::DecodeRounds;
+using strata::poly::Stats;
+namespace Q = strata::quant;
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
+// Epoch timestamps are for joining external telemetry; elapsed durations use
+// steady_clock so changes to the system clock do not change throughput.
+long long unix_ms() {
+    return (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+const char* quant_name(int type) {
+    const auto* q = Q::type_info(type);
+    return q ? q->name : "unknown";
+}
+
+void report_quant_mix(const char* phase, const strata::poly::CpuExpertTiming& p) {
+    for (const auto& q : p.quant_mixes) {
+        if (!q.calls) continue;
+        std::fprintf(stderr,
+            "cpu-quant-profile: %s calls %lld uses %lld unique %lld; "
+            "gate %s/%s dot=%s x4=%s rows=%d; up %s/%s dot=%s x4=%s rows=%d; "
+            "down %s/%s dot=%s x4=%s experimental_multi=%d; gate_up_ms %.3f down_ms %.3f\n",
+            phase, (long long)q.calls, (long long)q.uses, (long long)q.unique_runs,
+            quant_name(q.gate.weight), quant_name(q.gate.act), q.gate.dot, q.gate.x4, (int)q.gate.rows,
+            quant_name(q.up.weight), quant_name(q.up.act), q.up.dot, q.up.x4, (int)q.up.rows,
+            quant_name(q.down.weight), quant_name(q.down.act), q.down.dot, q.down.x4, (int)q.down_multi,
+            q.gate_up_ms, q.down_ms);
+    }
+}
 
 // Per-request deltas. GPU "submit" is host-side enqueue time, NOT CUDA kernel time.
 void report_overlap(const OverlapTiming& before, const OverlapTiming& after, double router_wait_ms) {
@@ -125,6 +157,7 @@ void report_overlap_phase(const char* phase, const OverlapTiming& p, double wall
                  phase, (long long) tokens, wall_ms, wait.ms, (long long) wait.calls,
                  p.small_cpu_ms, p.small_submit_ms, p.small_concurrent_ms, p.small_join_ms, p.prompt_cpu_ms);
     report_cpu_experts(phase, p.cpu_detail);
+    report_quant_mix(phase, p.cpu_detail);
     if (wait.calls == 0) return;
     // One compact line per phase, not a log per layer invocation. ms/calls per layer.
     std::fprintf(stderr, "overlap-router-layers: %s [layer=ms/calls]", phase);
@@ -455,6 +488,8 @@ struct Session {
     strata::spec::SuffixDrafter repeats;
     strata::spec::DraftPolicy policy;
     Guesses guesses;                      // whether the block is asked in a round, and for how many (guesses.hpp)
+    int profile_decode_window = 0;        // emitted-token target, zero disables
+    int64_t profile_request_id = 0;
     int piece_calls = kPiece;             // generate()'s pieces when it is given `between`
     std::string pinned;                   // --pinned-session: the file serve() pins before its first request
     std::vector<Engine::CoRead> co_read;  // BCO: prompts for generate()'s first read() to take along
@@ -606,6 +641,71 @@ struct Session {
         if (std::strcmp(r.finish, "cancel") == 0) return r;
 
         t0 = Clock::now();
+        // The same exclusion as phase attribution: no window statistics for
+        // requests that share/interleave prompt work with another sequence.
+        const bool trace = profile_decode_window > 0 && r.overlap_phases;
+        const int64_t request_id = trace ? ++profile_request_id : 0;
+        Clock::time_point window_start = t0;
+        long long window_epoch = trace ? unix_ms() : 0;
+        int64_t window_from = 0, window_pos = trace ? engine.pos() : 0;
+        int window_cache = trace ? engine.cached_experts() : 0;
+        Stats window_stats;
+        DecodeRounds window_rounds;
+        if (trace) window_stats = engine.stats();
+        const auto report_window = [&](bool final) {
+            if (!trace || r.produced == window_from ||
+                (!final && r.produced - window_from < profile_decode_window)) return;
+            const auto now = Clock::now();
+            const long long epoch = unix_ms();
+            const Stats& stats = engine.stats();
+            const auto delta = stats.overlap.minus(window_stats.overlap);
+            const auto wait = delta.router.total();
+            const auto& cpu = delta.cpu_detail;
+            const auto& w = window_rounds;
+            const double wall = strata::poly::interval_ms(window_start, now);
+            const int64_t emitted = r.produced - window_from;
+            const int64_t pos = engine.pos();
+            const int cache = engine.cached_experts();
+            std::fprintf(stderr,
+                "decode-window: request %lld tokens %lld-%lld final %d "
+                "start_unix_ms %lld end_unix_ms %lld context %lld-%lld "
+                "wall %.3f ms speed %.2f t/s; single %lld model_rounds %lld lookup_rounds %lld "
+                "model_drafts %lld/%lld lookup_drafts %lld/%lld model_calls %lld model_draft_ms %.3f "
+                "model_unused_rounds %lld lookup_candidates %lld verify_rows %lld kept_rows %lld "
+                "discarded_rows %lld mismatch_rounds %lld; "
+                "router_ms %.3f router_calls %lld cpu_ms %.3f cpu_uses %lld cpu_unique %lld "
+                "gate_up_ms %.3f down_ms %.3f worker_wait_ms %.3f worker_batches %lld "
+                "enqueue_ms %.3f join_ms %.3f; gpu_uses %lld cpu_route_uses %lld "
+                "batch_cached %lld batch_staged %lld swaps %lld ahead_sent %lld ahead_used %lld "
+                "resident %d-%d\n",
+                (long long)request_id, (long long)window_from, (long long)r.produced, (int)final,
+                window_epoch, epoch, (long long)window_pos, (long long)pos,
+                wall, wall > 0 ? 1000.0 * emitted / wall : 0.0,
+                (long long)w.single, (long long)w.model_rounds, (long long)w.lookup_rounds,
+                (long long)w.model_accepted, (long long)w.model_offered,
+                (long long)w.lookup_accepted, (long long)w.lookup_offered,
+                (long long)w.model_calls, w.model_draft_ms, (long long)w.model_draft_unused_rounds,
+                (long long)w.lookup_candidates, (long long)w.verified_rows, (long long)w.kept_rows,
+                (long long)(w.verified_rows-w.kept_rows), (long long)w.mismatch_rounds,
+                wait.ms, (long long)wait.calls, cpu.total_ms, (long long)cpu.expert_uses,
+                (long long)cpu.unique_experts, cpu.gate_up_activation_ms, cpu.down_reduce_ms,
+                cpu.workers.completion_ms, (long long)cpu.workers.batches,
+                delta.small_submit_ms, delta.small_join_ms,
+                (long long)(stats.gpu_experts-window_stats.gpu_experts),
+                (long long)(stats.cpu_experts-window_stats.cpu_experts),
+                (long long)(stats.batch_cached-window_stats.batch_cached),
+                (long long)(stats.batch_staged-window_stats.batch_staged),
+                (long long)(stats.swapped_experts-window_stats.swapped_experts),
+                (long long)(stats.ahead_sent-window_stats.ahead_sent),
+                (long long)(stats.ahead_used-window_stats.ahead_used), window_cache, cache);
+            window_stats = stats;
+            window_rounds = {};
+            window_from = r.produced;
+            window_pos = pos;
+            window_cache = cache;
+            window_epoch = epoch;
+            window_start = now;
+        };
         std::vector<int32_t> history = kept.seq();
         std::replace_if(history.begin(), history.end(), [](int32_t t) { return t < 0; }, pad);
         if (look) {
@@ -655,13 +755,17 @@ struct Session {
                     return guesses.end(in, n, ms_since(round), engine.took_record());
                 };
                 strata::spec::DraftPolicy::Pick use = policy.choose(1, k, match);
+                int trace_drafts = 0;
+                double trace_draft_ms = 0.0;
                 if (ask) {
                     int n_d = 0;
                     for (int32_t from = t; n_d < std::min(most, block_window) - 1 && guesses.wants(n_d); from = d[n_d++]) {
                         float p = 0.f;
                         const Clock::time_point asked_at = Clock::now();
                         d[n_d] = engine.draft(from, n_d, &p);
-                        if (!guesses.takes(n_d, p, ms_since(asked_at))) break;
+                        const double elapsed = ms_since(asked_at);
+                        if (trace) { ++trace_drafts; trace_draft_ms += elapsed; }
+                        if (!guesses.takes(n_d, p, elapsed)) break;
                     }
                     use = policy.choose(1 + n_d, k, match);
                 }
@@ -671,6 +775,10 @@ struct Session {
                     kept.read(&t, 1);
                     t = card_picks ? engine.picked(0) : pick(engine.logits());
                     policy.observe(false, 1, 0, 0, count(1, 1));
+                    if (trace) {
+                        window_rounds.record(1, false, 1, 0, true, trace_drafts, k, trace_draft_ms);
+                        report_window(false);
+                    }
                     continue;
                 }
                 w[0] = t;
@@ -687,9 +795,15 @@ struct Session {
                 r.guessed += use.t - 1;
                 r.guessed_right += right + (more ? 0 : 1);
                 policy.observe(use.lookup, use.t, right, match, count(use.t, right + 1));
+                if (trace) {
+                    window_rounds.record(use.t, use.lookup, right + 1, right + (more ? 0 : 1),
+                                         more, trace_drafts, k, trace_draft_ms);
+                    report_window(!more);
+                }
                 if (!more) break;
             }
         }
+        if (trace) report_window(true);
         r.decode_ms = ms_since(t0);
         if (r.overlap_phases) r.decode_overlap = engine.stats().overlap.minus(profile_boundary);
         return r;
@@ -1745,7 +1859,8 @@ void usage() {
                  "  --cpu-down-rows N      CPU Down task rows (multiple of 4 in 4..256; default 16)\n"
                  "  --cpu-down-reuse      experimental Q5_K Down multi-activation AVX2 path (default off)\n"
                  "  --profile-overlap     report host CPU/GPU submission, mixed-batch wait and overlap timings\n"
-                 "  --profile-cpu-experts  extra CPU expert/worker stage timing (implies --profile-overlap)\n"
+                 "  --profile-cpu-experts  extra CPU expert/worker stage timing and quant mix (implies --profile-overlap)\n"
+                 "  --profile-decode-window N  log each ~N emitted tokens (1..65536; 0 off; implies CPU profiling)\n"
                  "  --vram-reserve-mib N   VRAM left free beside the expert cache, 256 at least (default: a\n"
                  "                         thirty-second of the card, 256 to 768, or a sixteenth, 512 to 1024,\n"
                  "                         when the PC's free RAM is within 4 GiB of the model's files, and then\n"
@@ -1937,6 +2052,7 @@ int main(int argc, char** argv) {
     bool want_serve = false;
     long long max_new = 32;
     int top_probs = 0, lookup = 3, image_pad = -1, check = 0;
+    int profile_decode_window = 0;
     bool stagger = false;   // --check-stagger
     std::string images, pinned;
     std::vector<int32_t> ids, eos, follow;
@@ -1979,6 +2095,16 @@ int main(int argc, char** argv) {
             else o.cpu_task_shape.down_rows = (int) n;
         }
         else if (a == "--cpu-down-reuse") o.cpu_task_shape.down_reuse = true;
+        else if (a == "--profile-decode-window") {
+            const char* raw = val();
+            char* end = nullptr;
+            const long n = std::strtol(raw, &end, 10);
+            if (end == raw || *end != '\0' || n < 0 || n > 65536) {
+                std::fprintf(stderr, "strata-poly: --profile-decode-window requires 0..65536\n");
+                return 2;
+            }
+            profile_decode_window = (int)n;
+        }
         else if (a == "--profile-overlap") o.profile_overlap = true;
         else if (a == "--profile-cpu-experts") o.profile_cpu_experts = o.profile_overlap = true;
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(val());
@@ -2122,6 +2248,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<Engine> loaded;
     try {
         const Clock::time_point t0 = Clock::now();
+        if (profile_decode_window > 0) o.profile_cpu_experts = o.profile_overlap = true;
         loaded = Engine::open(o);
         Engine& engine = *loaded;
         std::fprintf(stderr, "strata-poly: loaded in %.1f s; %d of %d routed experts in VRAM (%.1f GiB), %d CPU threads\n",
@@ -2178,6 +2305,17 @@ int main(int argc, char** argv) {
                                      "(--conversation-cache-mib N asks for one anyway)\n");
         }
         Session ss(engine, eos, cache, lookup);
+        ss.profile_decode_window = profile_decode_window;
+        if (o.profile_cpu_experts) {
+            const auto& caps = Q::caps();
+            std::fprintf(stderr, "cpu-isa-profile: arith %s best %s avx2 %d avx_vnni %d "
+                         "avx512 %d avx512_vnni %d avx512_vbmi %d (effective capabilities)\n",
+                         Q::arith_name(Q::default_arith()), Q::isa_name(Q::best_isa()), (int)caps.avx2,
+                         (int)caps.avx_vnni, (int)caps.avx512, (int)caps.avx512_vnni, (int)caps.avx512_vbmi);
+        }
+        if (profile_decode_window)
+            std::fprintf(stderr, "strata-poly: decode-window profiling every ~%d emitted tokens (epoch ms, no extra CUDA sync)\n",
+                         profile_decode_window);
         ss.pinned = pinned;
         int rc = 0;
         if (want_serve) {

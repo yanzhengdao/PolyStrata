@@ -85,6 +85,37 @@ int main() {
         cd.gate_tasks != 12 || cd.gate_weight_rows != 384 || cd.down_tasks != 16 || cd.down_output_rows != 256 ||
         cd.down_reuse_calls != 2 || cd.down_reuse_runs != 4 || cd.down_reuse_uses != 7)
         return std::fprintf(stderr, "overlap_timing_test: bad CPU detail aggregate/delta\n"), 1;
+    // A quant mix first seen in decode must survive deltas, and a prefill-only
+    // mix must disappear. Gate+Up stage time is joint, never split by guesswork.
+    CpuExpertTiming qa, qb;
+    CpuQuantMix q1;
+    q1.gate.weight = 12; q1.up.weight = 13; q1.down.weight = 14;
+    q1.calls = 2; q1.uses = 9; q1.unique_runs = 6; q1.gate_up_ms = 5; q1.down_ms = 3;
+    auto q2 = q1;
+    q2.down.weight = 13; q2.down_multi = true; q2.calls = 1; q2.uses = 4;
+    add_quant_mix(qa.quant_mixes, q1);
+    qb = qa;
+    add_quant_mix(qb.quant_mixes, q2);
+    const auto only = qb.minus(qa);
+    if (only.quant_mixes.size()!=1 || !only.quant_mixes[0].same(q2) ||
+        only.quant_mixes[0].uses!=4 || only.quant_mixes[0].gate_up_ms!=5)
+        return std::fprintf(stderr, "overlap_timing_test: bad quant mix delta\n"), 1;
+    qa.add(only);
+    qa.add(only);
+    if (qa.quant_mixes.size()!=2 || qa.quant_mixes[1].calls!=2 ||
+        qa.quant_mixes[1].uses!=8 || qa.quant_mixes[1].down_ms!=6)
+        return std::fprintf(stderr, "overlap_timing_test: bad quant mix add\n"), 1;
+    DecodeRounds rounds;
+    rounds.record(1,false,1,0,true,2,1,0.5);
+    rounds.record(4,false,2,1,true,3,1,1.0);
+    rounds.record(4,true,4,3,true,0,3,0.0);
+    rounds.record(4,true,2,2,false,1,3,0.5);
+    if (rounds.single!=1 || rounds.model_rounds!=1 || rounds.lookup_rounds!=2 ||
+        rounds.model_calls!=6 || rounds.model_offered!=3 || rounds.model_accepted!=1 ||
+        rounds.lookup_offered!=6 || rounds.lookup_accepted!=5 ||
+        rounds.verified_rows!=12 || rounds.kept_rows!=8 || rounds.mismatch_rounds!=1 ||
+        rounds.model_draft_unused_rounds!=2 || rounds.lookup_candidates!=8 || rounds.model_draft_ms!=2)
+        return std::fprintf(stderr, "overlap_timing_test: bad decode round accounting\n"), 1;
     std::puts("overlap_timing_test: passed");
     return 0;
 }

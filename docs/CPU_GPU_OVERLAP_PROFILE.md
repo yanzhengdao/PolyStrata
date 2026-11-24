@@ -160,3 +160,49 @@ distribution and reuse rate are not a model end-to-end speed prediction.
 The existing poly_workers_test also checks Q5_K output parity and counters
 with the experiment on and off. Keep the flag off in normal usage until
 bitwise parity and paired benchmark results are verified on the target CPU.
+
+
+## Decode stability / quantization diagnosis
+
+`--profile-decode-window N` (0/off by default; valid 0..65536) enables
+CPU and overlap profiling and emits a compact `decode-window:` line
+after a completed generation round once at least N additional tokens
+have been emitted (and a final partial interval if present).
+Use N=256. The interval can exceed N by a speculative window; the first
+and final emitted token need not be fed back into the model. No extra
+CUDA synchronization, no policy or sampling changes. Only non-interleaved
+Session::generate requests are attributed. The request counter is local
+to this engine session and restarts on engine restart.
+
+* `start_unix_ms/end_unix_ms`: system-clock milliseconds since Unix
+  epoch; use these to join external nvidia-smi data in local time.
+  Throughput uses steady-clock time, including sampling and host work.
+  Logging and snapshot bookkeeping can contribute to adjacent intervals.
+* `model_drafts accepted/offered` (MTP for Qwen), `lookup_drafts accepted/offered`:
+  only drafts selected for verification, split by actual selected source.
+  `model_calls` counts calls to engine.draft including unused proposals;
+  `model_draft_ms` is summed host-observed time in those calls.
+  `lookup_candidates` counts candidate length after the window cap, not
+  verified drafts. `model_unused_rounds` counts model-draft calls made
+  in rounds that instead use lookup or a single-token eval.
+* `verify_rows/kept_rows/discarded_rows` count speculative window rows,
+  including the known anchor; discarded includes a terminal accepted row
+  not kept. `mismatch_rounds` counts observed mismatch, not truncation
+  at EOS/cancel/length. The final output-only token may have no eval.
+* Router, CPU and worker timings are deltas of existing counters.
+  GPU/CPU uses, batch cached/staged, swap and ahead counters are existing
+  Engine::Stats deltas (including speculative work), not a universal
+  cache hit rate. Resident counts are snapshots at interval boundaries.
+* `cpu-quant-profile:` appears per prefill/decode phase with observed
+  gate/up/down weight and activation format combinations, selected base
+  dot and eligible x4/multi-activation kernels, calls, uses and combined
+  Gate/Up and Down wall times. Gate and Up timing cannot be separated
+  from each other or activation. Eligible x4/rows does not assert they
+  executed on every row. The Down experimental flag reflects availability
+  for that call, not actual grouped uses; see cpu-down-reuse-profile.
+* `cpu-isa-profile:` prints effective capability flags and arithmetic
+  contract at startup; a supported ISA is not necessarily selected.
+
+Do not enable `--cpu-down-reuse` for baseline stability tests.
+Keep external GPU telemetry separate. Full CPU profiling (including
+quant mix aggregation) is diagnostic and may add small host overhead.

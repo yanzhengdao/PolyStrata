@@ -58,6 +58,7 @@ void dot_bf16(int n, float* s, const void* w, const void* a) {
 
 struct Rows {
     DotFn dot = nullptr;
+    const char* dot_name = "none", *x4_name = "none";
     Q::DotRowsFn dots = nullptr;   // the same products for several activation rows at once, where there is one
     Q::DotX4Fn x4 = nullptr;       // four weight rows against one activation row, each value dot's bits, where there is one
     ActFn act = nullptr;
@@ -74,6 +75,9 @@ Rows rows_of(int type) {
     if (t == nullptr) return r;
     if (t->type == Q::Type::F32 || t->type == Q::Type::F16 || t->type == Q::Type::BF16) {
         r.dot = t->type == Q::Type::F32 ? dot_f32 : t->type == Q::Type::F16 ? dot_f16 : dot_bf16;
+        r.dot_name = t->type == Q::Type::F32 ? "scalar_f32" :
+                     t->type == Q::Type::F16 ? "scalar_f16" : "scalar_bf16";
+        r.act_type = (int) Q::Type::F32;
         r.act = act_floats;
         return r;
     }
@@ -84,11 +88,12 @@ Rows rows_of(int type) {
     const Q::ActKernel* act = Q::act_kernel(t->act, arith);
     if (dot == nullptr || act == nullptr) return r;
     r.dot = dot->fn;
+    r.dot_name = dot->name;
     r.dots = Q::dot_rows_kernel(t->type, arith);
     // the layer's four-row kernel of dot's own level only: one of another level (AVX-512 beside the AVX2 Q4_K the
     // table keeps) need not give dot's bits.  cpu_x4_test checks that each one taken here does.
     const Q::DotX4Kernel* x4 = Q::dot_x4_kernel(t->type, arith, dot->isa);
-    if (x4 != nullptr && x4->isa == dot->isa) r.x4 = x4->fn;
+    if (x4 != nullptr && x4->isa == dot->isa) { r.x4 = x4->fn; r.x4_name = x4->name; }
     r.act = act->fn;
     r.blck = t->blck;
     r.act_blck = a->blck;
@@ -338,9 +343,12 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     const auto stage_time = [&](double CpuExpertTiming::* field) {
         if (profile) {
             const auto now = OverlapClock::now();
-            profile->*field += interval_ms(mark, now);
+            const double ms = interval_ms(mark, now);
+            profile->*field += ms;
             mark = now;
+            return ms;
         }
+        return 0.0;
     };
     const Rows tg = rows_of(gu_type), tu = rows_of(u_type), td = rows_of(d_type);
     const size_t gu_row = Q::row_bytes(gu_type, n_embd);
@@ -483,7 +491,7 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
             if (hiddenp) hiddenp[u] = interval_ms(before, OverlapClock::now());
         }
     }, worker_profile);
-    stage_time(&CpuExpertTiming::gate_up_activation_ms);
+    const double gate_ms = stage_time(&CpuExpertTiming::gate_up_activation_ms);
 
     // Only opt in for Q5_K Down. Keep all other formats and Gate/Up unchanged.
     const Q::DotRowsFn reuse = workers.task_shape().down_reuse && d_type == (int) Q::Type::Q5_K && rows > 1
@@ -541,12 +549,17 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
             r += nr;
         }
     }, worker_profile);
-    stage_time(&CpuExpertTiming::down_reduce_ms);
+    const double down_ms = stage_time(&CpuExpertTiming::down_reduce_ms);
     if (profile) {
         ++profile->calls;
         profile->rows += rows;
         profile->expert_uses += n;
         profile->unique_experts += n_run;
+        const auto choice = [](int type, const Rows& r) {
+            return CpuKernelChoice{type, r.act_type, r.dot_name, r.x4_name, r.dots != nullptr};
+        };
+        add_quant_mix(profile->quant_mixes, {choice(gu_type,tg), choice(u_type,tu), choice(d_type,td),
+                      reuse != nullptr, 1, n, n_run, gate_ms, down_ms});
         profile->gate_tasks += (int64_t) n_run * gu_tasks;
         profile->gate_weight_rows += (int64_t) n_run * n_ff;
         profile->down_tasks += d_tasks;

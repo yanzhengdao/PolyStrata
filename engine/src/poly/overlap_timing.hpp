@@ -90,6 +90,67 @@ struct WorkerTiming {
     }
 };
 
+// CPU kernel selection for actual expert calls. Names point to static kernel
+// registry entries (or static scalar labels), not model-owned memory.
+// x4/rows describe selected eligible paths, not measured invocation counts.
+struct CpuKernelChoice {
+    int weight = -1, act = -1;
+    const char* dot = "none";
+    const char* x4 = "none";
+    bool rows = false;
+    bool operator==(const CpuKernelChoice&) const = default;
+};
+struct CpuQuantMix {
+    CpuKernelChoice gate, up, down;
+    bool down_multi = false;
+    int64_t calls = 0, uses = 0, unique_runs = 0;
+    double gate_up_ms = 0, down_ms = 0;
+    bool same(const CpuQuantMix& b) const {
+        return gate == b.gate && up == b.up && down == b.down && down_multi == b.down_multi;
+    }
+    void add(const CpuQuantMix& b, int sign = 1) {
+        calls += sign * b.calls;
+        uses += sign * b.uses;
+        unique_runs += sign * b.unique_runs;
+        gate_up_ms += sign * b.gate_up_ms;
+        down_ms += sign * b.down_ms;
+    }
+};
+inline void add_quant_mix(std::vector<CpuQuantMix>& mixes, const CpuQuantMix& v, int sign = 1) {
+    for (auto& m : mixes) {
+        if (m.same(v)) { m.add(v, sign); return; }
+    }
+    if (sign > 0) mixes.push_back(v);
+}
+
+// Counters for completed generation rounds. An accepted terminal token may
+// have been emitted but not committed to the model state. Offered minus
+// accepted is not necessarily a mismatch (the response can end first).
+struct DecodeRounds {
+    int64_t single = 0, model_rounds = 0, lookup_rounds = 0;
+    int64_t model_calls = 0, lookup_candidates = 0;
+    int64_t model_offered = 0, model_accepted = 0, lookup_offered = 0, lookup_accepted = 0;
+    int64_t verified_rows = 0, kept_rows = 0, mismatch_rounds = 0;
+    int64_t model_draft_unused_rounds = 0;
+    double model_draft_ms = 0;
+    void record(int width, bool lookup, int kept, int accepted, bool more, int draft_calls,
+                int lookup_n, double draft_ms) {
+        model_calls += draft_calls;
+        lookup_candidates += lookup_n;
+        model_draft_ms += draft_ms;
+        if (draft_calls && (lookup || width == 1)) ++model_draft_unused_rounds;
+        if (width == 1) { ++single; return; }
+        verified_rows += width;
+        kept_rows += kept;
+        if (more && accepted < width - 1) ++mismatch_rounds;
+        if (lookup) {
+            ++lookup_rounds; lookup_offered += width - 1; lookup_accepted += accepted;
+        } else {
+            ++model_rounds; model_offered += width - 1; model_accepted += accepted;
+        }
+    }
+};
+
 // The CPU expert stage wall times are disjoint within a call. Thread times
 // for hidden quantization and explicit late callbacks are nested in Gate/Up,
 // may overlap one another, and must NOT be added to the wall times.
@@ -100,6 +161,7 @@ struct CpuExpertTiming {
     int64_t gate_tasks = 0, gate_weight_rows = 0, down_tasks = 0, down_output_rows = 0;
     int64_t down_reuse_calls = 0, down_reuse_runs = 0, down_reuse_uses = 0;
     WorkerTiming workers;
+    std::vector<CpuQuantMix> quant_mixes;
 
     void add(const CpuExpertTiming& v) {
         calls += v.calls;
@@ -125,6 +187,7 @@ struct CpuExpertTiming {
         down_reuse_runs += v.down_reuse_runs;
         down_reuse_uses += v.down_reuse_uses;
         workers.add(v.workers);
+        for (const auto& q : v.quant_mixes) add_quant_mix(quant_mixes, q);
     }
     CpuExpertTiming minus(const CpuExpertTiming& b) const {
         CpuExpertTiming d = *this;
@@ -151,6 +214,9 @@ struct CpuExpertTiming {
         d.down_reuse_runs -= b.down_reuse_runs;
         d.down_reuse_uses -= b.down_reuse_uses;
         d.workers = workers.minus(b.workers);
+        for (const auto& q : b.quant_mixes) add_quant_mix(d.quant_mixes, q, -1);
+        d.quant_mixes.erase(std::remove_if(d.quant_mixes.begin(), d.quant_mixes.end(),
+            [](const CpuQuantMix& q) { return q.calls == 0; }), d.quant_mixes.end());
         return d;
     }
 };
