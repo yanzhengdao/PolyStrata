@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <random>
 #include <string>
 #include <utility>
@@ -314,16 +315,159 @@ int decode_main() {
     return bad ? 1 : 0;
 }
 
+// Standalone Q8 FDEC A/B. Test exactly the same split layout, input and
+// position for every mode. Timings are CUDA event intervals for both kernels
+// combined; no timing events are added to the production engine.
+int decode_ab(int repeats) {
+    constexpr int rows = 262144, max_n = 9;
+    cudaDeviceProp prop{};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return 1;
+    if (!fdec_fits(kDim, kHeads, kKvHeads, rows, kScore)) {
+        std::fprintf(stderr, "FDEC unavailable on this device / scratch\n");
+        return 1;
+    }
+    std::printf("FDEC A/B %s sm_%d%d SMs=%d heads=%d kv_heads=%d repeats=%d\n", prop.name,
+                prop.major, prop.minor, prop.multiProcessorCount, kHeads, kKvHeads, repeats);
+    for (int mt : {1,2}) for (bool late : {false,true}) {
+        FdecKernelInfo info;
+        if (!fdec_q8_kernel_info(kHeads/kKvHeads, mt, late, info)) {
+            std::fprintf(stderr, "FAIL kernel attributes\n"); return 1;
+        }
+        std::printf("fdec-kernel-info: MT=%d late_v=%d regs/thread=%d local_bytes/thread=%zu static_shared=%zu "
+                    "max_blocks/SM=%d threads/block=%d theoretical_warps/SM=%d\n",
+                    mt, (int)late, info.registers, info.local_bytes, info.shared_bytes,
+                    info.blocks_per_sm, info.threads_per_block, info.blocks_per_sm*info.threads_per_block/32);
+    }
+    auto check_cuda = [](cudaError_t e) {
+        if (e == cudaSuccess) return;
+        std::fprintf(stderr, "CUDA: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    };
+    // Fast deterministic synthetic valid cache (no slow normal draws for 2*134M bytes).
+    std::mt19937 rng(119);
+    auto cache = [&] {
+        Cache a;
+        a.codes.resize(size_t(rows)*kWidth);
+        a.scales.resize(size_t(rows)*(kWidth/32));
+        for (auto& x:a.codes) x=(int8_t)((int)(rng()%255)-127);
+        for (auto& x:a.scales) x=__half_as_ushort(__float2half((float)(0.5+uniform(rng))/80.f));
+        return a;
+    };
+    Cache K=cache(), V=cache();
+    int8_t *kc=upload(K.codes), *vc=upload(V.codes);
+    uint16_t *ks=upload(K.scales), *vs=upload(V.scales);
+    check_cuda(cudaGetLastError());
+    std::vector<float> q(size_t(max_n)*kHeads*kDim);
+    for (auto& x:q) x=2.f*draw(rng);
+    float* dq=upload(q);
+    float *scratch=nullptr, *out=nullptr, *ml=nullptr;
+    long long* at=nullptr;
+    check_cuda(cudaMalloc(&scratch,kScore*sizeof(float)));
+    check_cuda(cudaMalloc(&out,q.size()*sizeof(float)));
+    check_cuda(cudaMalloc(&ml,size_t(max_n)*kHeads*2*sizeof(float)));
+    check_cuda(cudaMalloc(&at,sizeof(long long)));
+    cudaStream_t stream;
+    check_cuda(cudaStreamCreate(&stream));
+    cudaEvent_t e0,e1;
+    check_cuda(cudaEventCreate(&e0)); check_cuda(cudaEventCreate(&e1));
+    const float scale=1.f/16.f;
+    struct Case { long long pos; int n, room; bool whole; size_t stride, sf; };
+    std::vector<Case> cases;
+    // Exact-position dispatch, recorded-position dispatch, both sides of
+    // split boundaries; 256K scratch fallback to 1024-key splits.
+    for (long long pos:{4095LL,16383LL,32767LL,65535LL,131071LL,262135LL})
+        for (int n:{1,2,4,8}) cases.push_back({pos,n,0,false,0,kScore});
+    for (int n:{1,3,4,9}) cases.push_back({65527,n,131072,false,0,kScore});
+    cases.push_back({32763,4,65536,true,0,kScore});
+    cases.push_back({32763,4,65536,false,2*size_t(kWidth),kScore});
+    cases.push_back({120003,3,131072,false,0,kScore/4});
+    int bad=0;
+    auto same = [](const std::vector<float>& a,const std::vector<float>& b) {
+        return a.size()==b.size() && std::memcmp(a.data(),b.data(),a.size()*sizeof(float))==0;
+    };
+    for (const auto& c:cases) {
+        const Kvq8 kq{kc,ks,c.stride}, vq{vc,vs,c.stride};
+        if (c.room) check_cuda(cudaMemcpyAsync(at,&c.pos,sizeof(c.pos),cudaMemcpyHostToDevice,stream));
+        const size_t cells=size_t(c.n)*kHeads*kDim, meta=size_t(c.n)*kHeads*2;
+        auto run=[&](int mode) {
+            if(!fdec_q8(dq,kq,vq,c.pos,c.n,c.room?at:nullptr,c.room,out,kDim,kHeads,kKvHeads,scale,
+                        scratch,c.sf,stream,c.whole,ml,mode)) {
+                std::fprintf(stderr,"FAIL refused pos=%lld n=%d mode=%d\n",c.pos,c.n,mode);
+                std::exit(1);
+            }
+        };
+        auto read=[&](float* p,size_t n) {
+            std::vector<float> v(n);
+            check_cuda(cudaMemcpyAsync(v.data(),p,n*sizeof(float),cudaMemcpyDeviceToHost,stream));
+            check_cuda(cudaStreamSynchronize(stream));
+            return v;
+        };
+        run(0);
+        const auto ref=read(out,cells), rm=read(ml,meta);
+        bool ok=std::all_of(ref.begin(),ref.end(),[](float x){return std::isfinite(x);}) &&
+                std::all_of(rm.begin(),rm.end(),[](float x){return std::isfinite(x);});
+        for(int mode=1;mode<=3;++mode) {
+            run(mode);
+            const auto test=read(out,cells), tm=read(ml,meta);
+            if(!same(ref,test) || !same(rm,tm)) {
+                float err=0, em=0;
+                for(size_t i=0;i<cells;++i) err=std::max(err,std::fabs(ref[i]-test[i]));
+                for(size_t i=0;i<meta;++i) em=std::max(em,std::fabs(rm[i]-tm[i]));
+                std::printf("FAIL bitwise mode=%d pos=%lld n=%d output_abs=%g meta_abs=%g\n",mode,c.pos,c.n,err,em);
+                ok=false;
+            }
+        }
+        if(!ok) { ++bad; continue; }
+        // Paired GPU event intervals in alternating order. Warm each mode;
+        // do not include host readback, first launch, or cache allocation.
+        auto time=[&](int mode) {
+            for(int i=0;i<3;++i) run(mode);
+            check_cuda(cudaEventRecord(e0,stream));
+            for(int i=0;i<repeats;++i) run(mode);
+            check_cuda(cudaEventRecord(e1,stream)); check_cuda(cudaEventSynchronize(e1));
+            float ms=0; check_cuda(cudaEventElapsedTime(&ms,e0,e1));
+            return double(ms)*1000/repeats;
+        };
+        std::printf("fdec-ab: pos=%lld n=%d room=%d whole=%d stride=%zu scratch_MiB=%.0f parity PASS",
+                    c.pos,c.n,c.room,(int)c.whole,c.stride,c.sf*4.0/(1<<20));
+        for(int mode=1;mode<=3;++mode) {
+            double a=0,b=0;
+            for(int r=0;r<3;++r) {
+                if(r%2==0) { a+=time(0); b+=time(mode); }
+                else { b+=time(mode); a+=time(0); }
+            }
+            std::printf("; mode%d %.2f -> %.2f us (%+.2f%%)",mode,a/3,b/3,100*(a/b-1));
+        }
+        std::printf("\n"); std::fflush(stdout);
+    }
+    check_cuda(cudaEventDestroy(e0)); check_cuda(cudaEventDestroy(e1));
+    check_cuda(cudaStreamDestroy(stream));
+    for(void* p:{(void*)kc,(void*)vc,(void*)ks,(void*)vs,(void*)dq,(void*)scratch,(void*)out,(void*)ml,(void*)at})
+        check_cuda(cudaFree(p));
+    std::printf("FDEC A/B: %s (%d failed cases)\n",bad?"FAIL":"PASS",bad);
+    return bad?1:0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool decode = false;
+    bool decode = false, ab = false;
+    int repeats = 20;
     for (int i = 1; i < argc; ++i) {
         const std::string arg(argv[i]);
         if (arg == "dec") decode = true;
+        else if (arg == "dec-ab") ab = true;
         else if (arg == "gqa16") kHeads = 32;
+        else if (arg == "--repeats" && i+1<argc) {
+            char* end=nullptr;
+            const char* raw=argv[++i];
+            const long n=std::strtol(raw,&end,10);
+            if(end==raw || *end || n<1 || n>1000) return 2;
+            repeats=(int)n;
+        }
         else {
-            std::fprintf(stderr, "usage: poly_fattn_test [dec] [gqa16]\n");
+            std::fprintf(stderr, "usage: poly_fattn_test [dec|dec-ab] [gqa16] [--repeats N]\n");
             return 2;
         }
     }
@@ -339,6 +483,7 @@ int main(int argc, char** argv) {
         std::printf("FAIL: unsupported shape or insufficient scratch accepted\n");
         return 1;
     }
+    if (ab) return decode_ab(repeats);
     if (decode) {
         if (!fdec_fits(kDim, kHeads, kKvHeads, 172032, kScore)) {
             std::printf("no decode kernel for this card\n");

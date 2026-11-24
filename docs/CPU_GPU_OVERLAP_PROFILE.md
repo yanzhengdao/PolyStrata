@@ -273,3 +273,40 @@ extreme valid Q8_K bytes and full mixed-quant expert output/dispatch.
 rotating-bank mixed-quant benchmark as --vnni, comparing baseline
 against Q5-only, Q6-only and both. Keep the existing --vnni and --check
 modes. These are CPU stage measurements, not end-to-end inference.
+
+
+## GPU FDEC q8 experiments (Blackwell / SM120 target)
+
+After the unsuccessful K-quant x4 CPU experiment, isolate the CUDA
+attention path. Upstream main was still 36e654b1 (already merged) at
+this review. The existing FDEC kernel uses 4 warps, 64 keys per tile,
+256 or 1024 keys per split depending on scratch, and MT=1/2 (16/32
+query rows). The current q8 kernel loads all V fragments before QK;
+the merge computes identical softmax split coefficients for each output
+dimension. The opt-in environment variable STRATA_FDEC_EXPERIMENT:
+0 baseline (default), 1 late V fragment load (16 keys at a time during
+PV), 2 shared split coefficients during merge, 3 both. Only q8 FDEC
+is changed, not F16, prefill, split selection, quantization or draft
+policy. The shared merge is bounded to 4096 splits (32 KiB dynamic
+shared); otherwise it falls back. No production CUDA events or host
+synchronization. Potential tradeoff: late V reduces live registers but
+may lose memory latency hiding; shared merge adds CTA barriers. Neither
+is assumed faster until measured. Runtime mode is read once per process.
+
+Build the existing CUDA target `poly_fattn_test`; run
+`poly_fattn_test dec-ab --repeats 20` (GQA8, heads16/KV2), or add
+`gqa16` for heads32/KV2. It prints device attributes and static kernel
+resource usage (registers, local bytes, shared bytes, theoretical
+active blocks/warps per SM, not measured occupancy); then pairs each
+candidate against the baseline in alternating order with CUDA events.
+The reported time includes FDEC attention and merge launches together,
+not separate kernel durations or end-to-end token speed. Cases cover
+4K-262K positions, n=1/2/4/8, device position/room, whole mask, a
+strided cache and reduced scratch. It checks bitwise output and softmax
+max/sum against baseline for each mode; the existing `dec` numerical
+reference test remains available (run with the chosen environment mode).
+Device-position launches exercise recorded-launch sizing, but this
+benchmark does not capture/replay CUDA graphs. Keep all CPU experiment
+flags off. First test only the standalone benchmark; then enable the
+winning mode in the engine's process environment, if any. No defaults
+are changed without target-machine parity and performance evidence.

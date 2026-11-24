@@ -13,6 +13,8 @@
 #endif
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstdio>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -305,7 +307,7 @@ __device__ __forceinline__ float scale_of(const uint4& v, int b) {   // half b o
 // token comes out the same to the bit whatever tokens the launch has beside it.  The dimensions are numbered as
 // suits the reads (a thread's 8 values of a block of K, its 8 dimensions of V), which the sums don't see.  F16: an
 // fp16 cache (kc and vc are halves, no scales), read as it is.
-template <int MT, bool F16, int Group>
+template <int MT, bool F16, int Group, bool LateV = false>
 __global__ void __launch_bounds__(kDecWarps * WARP_SIZE)
 fdec_kernel(const float* __restrict__ q, const void* __restrict__ kc, const uint16_t* __restrict__ ks,
             const void* __restrict__ vc, const uint16_t* __restrict__ vs, long long pos,
@@ -365,16 +367,21 @@ fdec_kernel(const float* __restrict__ q, const void* __restrict__ kc, const uint
                 if (!F16 && k2 <= last) ksc[nt][j] = *reinterpret_cast<const uint4*>(ksg + k2 * swidth);
             }
         }
+        // The baseline overlaps all V reads with QK. The experimental
+        // variant keeps only a 16-key V fragment live during PV, avoiding
+        // holding V registers across QK and the softmax barriers.
+        if constexpr (!LateV) {
 #pragma unroll
-        for (int kk = 0; kk < 4; ++kk)
+            for (int kk = 0; kk < 4; ++kk)
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const long long key = tb + 16 * kk + 2 * t + (i & 1) + 8 * (i >> 1);
-                vx[kk][i] = key > last ? make_uint4(kZero, kZero, kZero, kZero)
-                          : F16 ? *reinterpret_cast<const uint4*>(vg + key * width * E)
-                                : widen(*reinterpret_cast<const uint2*>(vg + key * width));
-                if (!F16 && key <= last) vsc[kk][i] = vsg[key * swidth];
-            }
+                for (int i = 0; i < 4; ++i) {
+                    const long long key = tb + 16 * kk + 2 * t + (i & 1) + 8 * (i >> 1);
+                    vx[kk][i] = key > last ? make_uint4(kZero, kZero, kZero, kZero)
+                              : F16 ? *reinterpret_cast<const uint4*>(vg + key * width * E)
+                                    : widen(*reinterpret_cast<const uint2*>(vg + key * width));
+                    if (!F16 && key <= last) vsc[kk][i] = vsg[key * swidth];
+                }
+        }
         // S = Q K^T, a 32-value block (two k-steps) at a time, then times the keys' scales of the block
         float s[MT][2][4];
 #pragma unroll
@@ -489,6 +496,16 @@ fdec_kernel(const float* __restrict__ q, const void* __restrict__ kc, const uint
         // O += P V: k-step kk is keys 16 kk.. of the tile; n-tile j column g8 is dimension 64 w + 8 g8 + j
 #pragma unroll
         for (int kk = 0; kk < 4; ++kk) {
+            if constexpr (LateV) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const long long key = tb + 16 * kk + 2 * t + (i & 1) + 8 * (i >> 1);
+                    vx[kk][i] = key > last ? make_uint4(kZero, kZero, kZero, kZero)
+                              : F16 ? *reinterpret_cast<const uint4*>(vg + key * width * E)
+                                    : widen(*reinterpret_cast<const uint2*>(vg + key * width));
+                    if constexpr (!F16) vsc[kk][i] = key <= last ? vsg[key * swidth] : 0;
+                }
+            }
             uint32_t a[MT][4];
 #pragma unroll
             for (int mt = 0; mt < MT; ++mt) {
@@ -579,6 +596,72 @@ __global__ void fdec_merge_kernel(const float* __restrict__ part, const float* _
     out[out_row * kD + d] = sum > 0.f ? acc / sum : 0.f;
 }
 
+// Experimental merge: compute each split's exponential coefficient once
+// per CTA. All 256 output dimensions consume the coefficients in the
+// original order; keep the FP32 multiply-adds and divide unchanged.
+// The parallel max is exact for finite input (and -infinity masks).
+template <int Group>
+__global__ void fdec_merge_shared_kernel(const float* __restrict__ part, const float* __restrict__ ml,
+                                         float* __restrict__ out, long long pos, const long long* __restrict__ at,
+                                         int first, int total_tokens, bool whole, int n_head, int kv_heads,
+                                         float* __restrict__ ml_out, int keys) {
+    const int h = blockIdx.x, tok = blockIdx.y, d = threadIdx.x, grp = h / Group;
+    const long long base_pos = at ? *at : pos;
+    const long long p = whole ? (base_pos + total_tokens - 1) : (base_pos + first + tok);
+    const int splits = int(p / keys) + 1, row = tok * Group + h % Group;
+    __shared__ float warp_max[8];
+    __shared__ float top_shared;
+    extern __shared__ float coefficients[];
+    float* sums = coefficients + splits;
+    float top = -INFINITY;
+    for (int i = d; i < splits; i += blockDim.x)
+        top = fmaxf(top, ml[2 * (((size_t) i * kv_heads + grp) * kDecRows + row)]);
+    for (int step = 16; step > 0; step /= 2)
+        top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, step));
+    if ((d & 31) == 0) warp_max[d / 32] = top;
+    __syncthreads();
+    if (d == 0) {
+        top = -INFINITY;
+        for (int w = 0; w < 8; ++w) top = fmaxf(top, warp_max[w]);
+        top_shared = top;
+    }
+    __syncthreads();
+    top = top_shared;
+    for (int i = d; i < splits; i += blockDim.x) {
+        const size_t idx = ((size_t) i * kv_heads + grp) * kDecRows + row;
+        coefficients[i] = top == -INFINITY ? 0.f : expf(ml[2 * idx] - top);
+        sums[i] = ml[2 * idx + 1];
+    }
+    __syncthreads();
+    float sum = 0.f, acc = 0.f;
+    for (int i = 0; i < splits; ++i) {
+        const size_t idx = ((size_t) i * kv_heads + grp) * kDecRows + row;
+        const float e = coefficients[i];
+        sum += sums[i] * e;
+        acc += part[idx * kD + d] * e;
+    }
+    const size_t out_row = (size_t) (first + tok) * n_head + h;
+    if (ml_out && d == 0) {
+        ml_out[2 * out_row + 0] = top;
+        ml_out[2 * out_row + 1] = sum;
+    }
+    out[out_row * kD + d] = sum > 0.f ? acc / sum : 0.f;
+}
+
+// Process-wide opt-in, read once; never change launch choice during graph
+// replay. An explicit mode in the test bypasses the environment.
+int fdec_experiment() {
+    static const int mode = [] {
+        const char* v = std::getenv("STRATA_FDEC_EXPERIMENT");
+        if (!v || !v[0] || v[1] || v[0] < '0' || v[0] > '3') return 0;
+        const int m = v[0] - '0';
+        if (m) std::fprintf(stderr, "strata-poly: FDEC q8 experiment=%d (late V=%d shared merge=%d)\n",
+                            m, m & 1, (m >> 1) & 1);
+        return m;
+    }();
+    return mode;
+}
+
 // splits of `keys` keys up to `rows`, each with its results for kDecRows query rows and a max and a sum each
 size_t fdec_floats(int rows, int kv_heads, int keys) {
     return (size_t) grid(rows, keys) * kv_heads * kDecRows * (kD + 2);
@@ -644,7 +727,7 @@ namespace {
 template <bool F16, int Group>
 bool run_dec(const float* q, const void* kc, const uint16_t* ks, const void* vc, const uint16_t* vs, int64_t pos, int n,
              const long long* at, int room, float* out, int dim, int n_head, int kv_heads, float scale, float* scratch,
-             size_t scratch_floats, void* stream, bool whole, float* ml_out, size_t rs = 0) {
+             size_t scratch_floats, void* stream, bool whole, float* ml_out, size_t rs = 0, int experiment = 0) {
     const int rows = (int) (at ? room : pos + n);   // a recorded launch is sized for `room` rows
     if (n <= 0 || rows <= 0 || !kc || !vc || !fdec_fits(dim, n_head, kv_heads, rows, scratch_floats)) return false;
     if (!rs) rs = size_t(kv_heads) * dim;
@@ -655,11 +738,23 @@ bool run_dec(const float* q, const void* kc, const uint16_t* ks, const void* vc,
     for (int first = 0; first < n; first += kDecTokens) {
         const int c = std::min(kDecTokens, n - first);
         const dim3 blocks(splits, kv_heads);
-        const auto kernel = c * Group <= 16 ? fdec_kernel<1, F16, Group> : fdec_kernel<2, F16, Group>;
+        const auto kernel = [&] {
+            if constexpr (!F16) {
+                if (experiment & 1)
+                    return c * Group <= 16 ? fdec_kernel<1, F16, Group, true> : fdec_kernel<2, F16, Group, true>;
+            }
+            return c * Group <= 16 ? fdec_kernel<1, F16, Group> : fdec_kernel<2, F16, Group>;
+        }();
         kernel<<<blocks, kDecWarps * WARP_SIZE, 0, s>>>(q, kc, ks, vc, vs, (long long) pos, at, first, c, n, whole,
                                                         n_head, kv_heads, scale, scratch, ml, rs, keys);
-        fdec_merge_kernel<Group><<<dim3(n_head, c), kD, 0, s>>>(scratch, ml, out, (long long) pos, at, first, n, whole,
-                                                                n_head, kv_heads, ml_out, keys);
+        // Bound dynamic shared memory to 32 KiB (plus a few static bytes).
+        // On a recorded launch the room, not the current position, sizes it.
+        if (!F16 && (experiment & 2) && splits <= 4096)
+            fdec_merge_shared_kernel<Group><<<dim3(n_head, c), kD, 2 * size_t(splits) * sizeof(float), s>>>(
+                scratch, ml, out, (long long) pos, at, first, n, whole, n_head, kv_heads, ml_out, keys);
+        else
+            fdec_merge_kernel<Group><<<dim3(n_head, c), kD, 0, s>>>(scratch, ml, out, (long long) pos, at, first, n, whole,
+                                                                    n_head, kv_heads, ml_out, keys);
     }
     ck("decode attention");
     return true;
@@ -669,14 +764,32 @@ bool run_dec(const float* q, const void* kc, const uint16_t* ks, const void* vc,
 
 bool fdec_q8(const float* q, Kvq8 kq8, Kvq8 vq8, int64_t pos, int n, const long long* at, int room, float* out,
              int dim, int n_head, int kv_heads, float scale, float* scratch, size_t scratch_floats, void* stream,
-             bool whole, float* ml_out) {
+             bool whole, float* ml_out, int experiment) {
+    if (experiment < 0) experiment = fdec_experiment();
+    if (experiment > 3) return false;
     // the keys' and the values' rows are one stride apart: a layout either interleaves both or neither
     return kq8.scales && vq8.scales && kq8.rs == vq8.rs &&
            (n_head == 16 * kv_heads
                 ? run_dec<false, 16>(q, kq8.codes, kq8.scales, vq8.codes, vq8.scales, pos, n, at, room, out, dim,
-                                     n_head, kv_heads, scale, scratch, scratch_floats, stream, whole, ml_out, kq8.rs)
+                                     n_head, kv_heads, scale, scratch, scratch_floats, stream, whole, ml_out, kq8.rs, experiment)
                 : run_dec<false, 8>(q, kq8.codes, kq8.scales, vq8.codes, vq8.scales, pos, n, at, room, out, dim,
-                                    n_head, kv_heads, scale, scratch, scratch_floats, stream, whole, ml_out, kq8.rs));
+                                    n_head, kv_heads, scale, scratch, scratch_floats, stream, whole, ml_out, kq8.rs, experiment));
+}
+
+bool fdec_q8_kernel_info(int group, int mt, bool late_v, FdecKernelInfo& out) {
+    if ((group != 8 && group != 16) || (mt != 1 && mt != 2)) return false;
+    const auto kernel = group == 8
+        ? (mt == 1 ? (late_v ? fdec_kernel<1, false, 8, true> : fdec_kernel<1, false, 8>)
+                   : (late_v ? fdec_kernel<2, false, 8, true> : fdec_kernel<2, false, 8>))
+        : (mt == 1 ? (late_v ? fdec_kernel<1, false, 16, true> : fdec_kernel<1, false, 16>)
+                   : (late_v ? fdec_kernel<2, false, 16, true> : fdec_kernel<2, false, 16>));
+    cudaFuncAttributes attr{};
+    int blocks = 0;
+    if (cudaFuncGetAttributes(&attr, kernel) != cudaSuccess ||
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, kDecWarps * WARP_SIZE, 0) != cudaSuccess)
+        return false;
+    out = {attr.numRegs, attr.localSizeBytes, attr.sharedSizeBytes, blocks, kDecWarps * WARP_SIZE};
+    return true;
 }
 
 bool fdec_f16(const float* q, const uint16_t* keys, const uint16_t* vals, int64_t pos, int n, const long long* at,
@@ -696,9 +809,11 @@ bool fattn_fits(int, int, int, int, size_t) { return false; }
 bool fdec_fits(int, int, int, int, size_t) { return false; }
 
 bool fdec_q8(const float*, Kvq8, Kvq8, int64_t, int, const long long*, int, float*, int, int, int, float, float*, size_t,
-             void*, bool, float*) {
+             void*, bool, float*, int) {
     return false;
 }
+
+bool fdec_q8_kernel_info(int, int, bool, FdecKernelInfo&) { return false; }
 
 bool fdec_f16(const float*, const uint16_t*, const uint16_t*, int64_t, int, const long long*, int, float*, int, int, int,
               float, float*, size_t, void*, bool, float*) {

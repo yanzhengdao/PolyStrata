@@ -46,7 +46,17 @@ bool fdec_fits(int dim, int n_head, int kv_heads, int rows, size_t scratch_float
 /// with ml_out (n_head floats a token pair) each token's (max, sum) of its softmax is written there for merging.
 bool fdec_q8(const float* q, Kvq8 kq8, Kvq8 vq8, int64_t pos, int n, const long long* at, int room, float* out,
              int dim, int n_head, int kv_heads, float scale, float* scratch, size_t scratch_floats, void* stream,
-             bool whole = false, float* ml_out = nullptr);
+             bool whole = false, float* ml_out = nullptr, int experiment = -1);
+
+/// Explicit experiment 0=baseline, 1=late V, 2=shared merge, 3=both.
+/// Negative uses STRATA_FDEC_EXPERIMENT (default 0); only q8 path changes.
+/// Static CUDA resource metrics, for the standalone benchmark only.
+struct FdecKernelInfo {
+    int registers = 0;
+    size_t local_bytes = 0, shared_bytes = 0;
+    int blocks_per_sm = 0, threads_per_block = 0;
+};
+bool fdec_q8_kernel_info(int group, int mt, bool late_v, FdecKernelInfo& out);
 
 /// fdec_q8() over an fp16 cache (keys and vals, kv_heads * dim halves a row), read where it lies.
 bool fdec_f16(const float* q, const uint16_t* keys, const uint16_t* vals, int64_t pos, int n, const long long* at,
