@@ -5353,7 +5353,8 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         any_host = true;
         t0 = Clock::now();
         OverlapClock::time_point submit_start{}, submit_end{};
-        const std::function<void()> timed_launch = [&] {
+        std::function<void()> timed_launch;   // empty and allocation-free with profiling disabled
+        if (opt_.profile_overlap) timed_launch = [&] {
             submit_start = OverlapClock::now();
             launch();
             submit_end = OverlapClock::now();
