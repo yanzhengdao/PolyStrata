@@ -85,6 +85,14 @@ DotRowsFn dot_rows_kernel(Type w, Arith a) noexcept {
     return nullptr;
 }
 
+DotRowsFn experimental_q5_rows_kernel(Arith a) noexcept {
+#ifdef STRATA_QUANT_X86_TIERS
+    if (a == Arith::Avx2 && isa_ok(Isa::Avx2)) return avx2_experimental_q5_rows();
+#endif
+    (void) a;
+    return nullptr;
+}
+
 const DotX4Kernel* dot_x4_kernel(Type w, Arith a, Isa max_isa) noexcept {
 #ifdef STRATA_QUANT_X86_TIERS
     const DotX4Table tables[] = {avx512_dot_x4_table(), avx2_dot_x4_table()};

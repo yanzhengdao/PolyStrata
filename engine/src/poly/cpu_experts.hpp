@@ -28,6 +28,7 @@ struct CpuExpertTaskShape {
     static constexpr int max_rows = 256;
     int gate_max_rows = 32;
     int down_rows = 16;
+    bool down_reuse = false; ///< opt-in Q5_K Down multi-activation path
 
     static constexpr bool valid_rows(int n) {
         return n >= row_step && n <= max_rows && n % row_step == 0;

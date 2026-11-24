@@ -125,3 +125,38 @@ per unique run, worker completion wait and throughput. Keep the VM load
 consistent. `poly_workers_test` verifies the default sizing formula,
 validation, task counts and bitwise Q5_K CPU output parity across seven
 shapes with repeated uses. No new kernels or synchronization changes.
+
+
+## Experimental Q5_K Down reuse (kernel phase 1)
+
+`--cpu-down-reuse` is off by default. It selects a new AVX2 Q5_K/Q8_K
+multi-activation dot only for repeated uses of the same CPU Down expert.
+Gate/Up, all other weight types, the single-use path, and the original
+expert reduction order are unchanged. The kernel decodes each weight
+block and scale vector once per group of 2–4 activations; it retains the
+existing AVX2 dot's accumulation order. Groups of up to eight uses are
+handled in the existing task, with singleton tails using a one-row dot.
+It is intentionally NOT installed in the default DotRows dispatch:
+the upstream multi-activation registry has IQ3_XXS, IQ2_XXS, IQ2_S and
+Q3_K but no Q5_K/Q4_K. This experiment targets Q5_K only.
+
+`cpu-down-reuse-profile:` reports calls where the new kernel is available
+with more than one input row, runs with repeated uses, and the uses
+actually covered by multi-activation groups (singleton remainders excluded).
+The denominator includes all CPU expert uses, not just Q5_K Down.
+It is not a per-kernel invocation counter. No additional GPU synchronization.
+
+Build `poly_cpu_expert_bench` in the same Release build as strata-poly.
+Run `poly_cpu_expert_bench --check` for bitwise dot and full-expert parity
+(AVX2; reports skip if unsupported). The actual dot tests cover 1–9
+activations and 256–4096 columns. Run `poly_cpu_expert_bench 12 8 16 100`
+for three paired A/B rounds with fixed seed, 2048/512 dimensions,
+eight rotating banks, one/two/four/eight/nine shared activations and a
+mixed four-token routing pattern. This isolates the CPU kernel from
+MTP acceptance, GPU, and context. Both modes include identical profiling;
+no two worker pools run simultaneously. It prints total and Down wall
+us/use, throughput deltas and reuse coverage. The synthetic weight
+distribution and reuse rate are not a model end-to-end speed prediction.
+The existing poly_workers_test also checks Q5_K output parity and counters
+with the experiment on and off. Keep the flag off in normal usage until
+bitwise parity and paired benchmark results are verified on the target CPU.

@@ -426,6 +426,11 @@ if(STRATA_BUILD_POLY AND STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA
   add_executable(poly_workers_test src/poly/workers_test.cpp src/poly/cpu_experts.cpp)
   target_link_libraries(poly_workers_test PRIVATE strata_quant Threads::Threads)
   add_test(NAME poly_workers_test COMMAND poly_workers_test)
+  # Standalone paired CPU microbenchmark, without loading a model or using a GPU.
+  add_executable(poly_cpu_expert_bench src/poly/cpu_expert_bench.cpp src/poly/cpu_experts.cpp)
+  target_link_libraries(poly_cpu_expert_bench PRIVATE strata_quant Threads::Threads)
+  add_test(NAME poly_cpu_down_reuse_test COMMAND poly_cpu_expert_bench --check)
+  set_tests_properties(poly_cpu_down_reuse_test PROPERTIES TIMEOUT 120)
   # the four-row dot products the CPU experts take, bit for bit against the one-row ones, without a model
   add_executable(poly_cpu_x4_test src/poly/cpu_x4_test.cpp src/poly/cpu_experts.cpp)
   target_link_libraries(poly_cpu_x4_test PRIVATE strata_quant Threads::Threads)

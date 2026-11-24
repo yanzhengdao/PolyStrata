@@ -65,4 +65,7 @@ void dot_ref(Type w, int n, float* s, const void* wrow, const void* act);
 using DotRowsFn = void (*)(int n, int rows, float* s, const void* w, const void* const* a);
 DotRowsFn dot_rows_kernel(Type w, Arith a) noexcept;
 
+/// Opt-in Q5_K/Q8_K AVX2 multi-activation experiment; not in the default dispatch.
+DotRowsFn experimental_q5_rows_kernel(Arith a) noexcept;
+
 }  // namespace strata::quant

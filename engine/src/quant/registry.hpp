@@ -36,6 +36,7 @@ ActTable avx512_act_table() noexcept;    // x86/act_avx512.cpp   (Arith::Avx2 bi
 DotTable avx512_dot_table() noexcept;    // x86/dot_avx512.cpp   (Arith::Avx2 bits in 512-bit lanes, Isa::Avx512)
 DotTable avx512vbmi_dot_table() noexcept;   // x86/dot_avx512vbmi.cpp (Arith::Avx2 bits with VBMI byte lookups, Isa::Avx512Vbmi)
 DotTable avxvnni_dot_table() noexcept;   // x86/dot_avxvnni.cpp  (Arith::Avx2 bits with AVX-VNNI, Isa::AvxVnni), with STRATA_QUANT_AVXVNNI
+DotRowsFn avx2_experimental_q5_rows() noexcept;
 DotRowsFn avx2_dot_rows(Type w) noexcept;   // x86/dot_avx2.cpp: dot_rows_kernel() of the Avx2 contract, or nullptr
 DotX4Table avx512_dot_x4_table() noexcept; // x86/dot_avx512.cpp (4-row shared-activation VPDPBUSD/VPDPWSSD kernels)
 #endif

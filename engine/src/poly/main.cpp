@@ -100,6 +100,11 @@ void report_cpu_experts(const char* phase, const strata::poly::CpuExpertTiming& 
                  p.gate_tasks ? (double) p.gate_weight_rows / p.gate_tasks : 0.0,
                  (long long) p.down_tasks, (long long) p.down_output_rows,
                  p.down_tasks ? (double) p.down_output_rows / p.down_tasks : 0.0);
+    if (p.down_reuse_calls)
+        std::fprintf(stderr, "cpu-down-reuse-profile: %s supported calls %lld, grouped runs %lld, "
+                     "multi-activation uses %lld of %lld total CPU uses\n",
+                     phase, (long long) p.down_reuse_calls, (long long) p.down_reuse_runs,
+                     (long long) p.down_reuse_uses, (long long) p.expert_uses);
     const auto& w = p.workers;
     std::fprintf(stderr,
                  "cpu-worker-profile: %s batches %lld, serial calls %lld, tasks %lld; "
@@ -1738,6 +1743,7 @@ void usage() {
                  "                         default 20000; 0 = sleep immediately; experimental)\n"
                  "  --cpu-gate-max-rows N  CPU Gate/Up task row cap (dynamic; multiple of 4 in 4..256; default 32)\n"
                  "  --cpu-down-rows N      CPU Down task rows (multiple of 4 in 4..256; default 16)\n"
+                 "  --cpu-down-reuse      experimental Q5_K Down multi-activation AVX2 path (default off)\n"
                  "  --profile-overlap     report host CPU/GPU submission, mixed-batch wait and overlap timings\n"
                  "  --profile-cpu-experts  extra CPU expert/worker stage timing (implies --profile-overlap)\n"
                  "  --vram-reserve-mib N   VRAM left free beside the expert cache, 256 at least (default: a\n"
@@ -1972,6 +1978,7 @@ int main(int argc, char** argv) {
             if (a == "--cpu-gate-max-rows") o.cpu_task_shape.gate_max_rows = (int) n;
             else o.cpu_task_shape.down_rows = (int) n;
         }
+        else if (a == "--cpu-down-reuse") o.cpu_task_shape.down_reuse = true;
         else if (a == "--profile-overlap") o.profile_overlap = true;
         else if (a == "--profile-cpu-experts") o.profile_cpu_experts = o.profile_overlap = true;
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(val());

@@ -680,6 +680,80 @@ void dot_q5_K_q8_K_opt(int n, float* STRATA_RESTRICT s, const void* STRATA_RESTR
     *s = hsum_float_8(acc) + summs;
 }
 
+// Experimental: decode each Q5_K weight block once for M activation rows.
+// Each row retains the existing AVX2 dot's integer sums, block order,
+// FMA accumulation, scalar minimum correction and final horizontal sum.
+template<int M>
+void rows_q5_K_q8_K_experimental(int n, float* s, const void* vx, const void* const* vy) {
+    static_assert(M >= 2 && M <= 4);
+    assert(n % QK_K == 0);
+    const auto* x = (const block_q5_K*) vx;
+    const block_q8_K* y[M];
+    __m256 acc[M];
+    float summs[M] = {};
+    for (int k = 0; k < M; ++k) {
+        y[k] = (const block_q8_K*) vy[k];
+        acc[k] = _mm256_setzero_ps();
+    }
+    const __m256i m4 = _mm256_set1_epi8(0x0f);
+    const __m256i m16 = _mm256_set1_epi8(16);
+    const __m128i zero = _mm_setzero_si128();
+    constexpr uint32_t mask1 = 0x3f3f3f3f, mask2 = 0x0f0f0f0f, mask3 = 0x03030303;
+    const int nb = n / QK_K;
+    for (int i = 0; i < nb; ++i) {
+        if (i + 2 < nb) {
+            _mm_prefetch((const char*) &x[i + 2], _MM_HINT_T0);
+            for (int k = 0; k < M; ++k)
+                _mm_prefetch((const char*) &y[k][i + 2], _MM_HINT_T0);
+        }
+        const float wd = h2f(x[i].d), wm = h2f(x[i].dmin);
+        uint32_t u[4];
+        std::memcpy(u, x[i].scales, 12);
+        u[3] = ((u[2] >> 4) & mask2) | (((u[1] >> 6) & mask3) << 4);
+        const uint32_t aux = u[1] & mask1;
+        u[1] = (u[2] & mask2) | (((u[0] >> 6) & mask3) << 4);
+        u[2] = aux;
+        u[0] &= mask1;
+        const __m256i ms = _mm256_cvtepu8_epi16(_mm_set_epi32(u[3], u[2], u[1], u[0]));
+        const __m128i sc = _mm256_castsi256_si128(ms);
+        const __m256i scales = MM256_SET_M128I(sc, sc);
+        const __m256i hbits = _mm256_loadu_si256((const __m256i*) x[i].qh);
+        __m256i lo[M], hi[M];
+        for (int k = 0; k < M; ++k) {
+            const __m256i bs = _mm256_loadu_si256((const __m256i*) y[k][i].bsums);
+            const __m128i qs = _mm_hadd_epi16(_mm256_extracti128_si256(bs, 0), _mm256_extracti128_si256(bs, 1));
+            const __m128i p = _mm_madd_epi16(_mm256_extracti128_si256(ms, 1), qs);
+            const __m128i hs = _mm_hadd_epi32(_mm_hadd_epi32(p, zero), zero);
+            summs[k] += (-y[k][i].d * wm) * _mm_extract_epi32(hs, 0);
+            lo[k] = _mm256_setzero_si256();
+            hi[k] = _mm256_setzero_si256();
+        }
+        // Unrolled constant shifts, exactly as in the single-activation kernel.
+        const auto step = [&](int j, __m256i h0, __m256i h1) {
+            const __m256i sl = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j));
+            const __m256i sh = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+1));
+            const __m256i bits = _mm256_loadu_si256((const __m256i*) (x[i].qs + 32*j));
+            const __m256i ql = _mm256_or_si256(_mm256_and_si256(bits, m4), h0);
+            const __m256i qh = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(bits, 4), m4), h1);
+            for (int k = 0; k < M; ++k) {
+                const int8_t* q8 = y[k][i].qs + 64*j;
+                const __m256i al = _mm256_loadu_si256((const __m256i*) q8);
+                const __m256i ah = _mm256_loadu_si256((const __m256i*) (q8+32));
+                lo[k] = _mm256_add_epi32(lo[k], _mm256_madd_epi16(sl, _mm256_maddubs_epi16(ql, al)));
+                hi[k] = _mm256_add_epi32(hi[k], _mm256_madd_epi16(sh, _mm256_maddubs_epi16(qh, ah)));
+            }
+        };
+        step(0, _mm256_and_si256(_mm256_slli_epi16(hbits, 4), m16), _mm256_and_si256(_mm256_slli_epi16(hbits, 3), m16));
+        step(1, _mm256_and_si256(_mm256_slli_epi16(hbits, 2), m16), _mm256_and_si256(_mm256_slli_epi16(hbits, 1), m16));
+        step(2, _mm256_and_si256(hbits, m16), _mm256_and_si256(_mm256_srli_epi16(hbits, 1), m16));
+        step(3, _mm256_and_si256(_mm256_srli_epi16(hbits, 2), m16), _mm256_and_si256(_mm256_srli_epi16(hbits, 3), m16));
+        for (int k = 0; k < M; ++k)
+            acc[k] = _mm256_fmadd_ps(_mm256_set1_ps(y[k][i].d * wd),
+                                     _mm256_cvtepi32_ps(_mm256_add_epi32(lo[k], hi[k])), acc[k]);
+    }
+    for (int k = 0; k < M; ++k) s[k] = hsum_float_8(acc[k]) + summs[k];
+}
+
 void dot_q6_K_q8_K_opt(int n, float* STRATA_RESTRICT s, const void* STRATA_RESTRICT vx, const void* STRATA_RESTRICT vy) {
     assert(n % QK_K == 0);
     const block_q6_K* STRATA_RESTRICT x = (const block_q6_K*) vx;
@@ -1044,6 +1118,12 @@ void dot_q8_0_q8_0_x4_avx2(int n, float out[4], const void* STRATA_RESTRICT w_ba
 }
 
 }  // namespace avx2
+
+DotRowsFn avx2_experimental_q5_rows() noexcept {
+    using namespace avx2;
+    return rows_by_four<rows_q5_K_q8_K_experimental<2>, rows_q5_K_q8_K_experimental<3>,
+                        rows_q5_K_q8_K_experimental<4>, dot_q5_K_q8_K_opt>;
+}
 
 DotRowsFn avx2_dot_rows(Type w) noexcept {
     using namespace avx2;

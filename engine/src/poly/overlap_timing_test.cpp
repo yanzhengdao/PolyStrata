@@ -68,6 +68,9 @@ int main() {
     cpu_a.cpu_detail.gate_weight_rows = 384;
     cpu_a.cpu_detail.down_tasks = 16;
     cpu_a.cpu_detail.down_output_rows = 256;
+    cpu_a.cpu_detail.down_reuse_calls = 2;
+    cpu_a.cpu_detail.down_reuse_runs = 4;
+    cpu_a.cpu_detail.down_reuse_uses = 7;
     cpu_a.cpu_detail.workers.batches = 4;
     cpu_a.cpu_detail.workers.tasks = 160;
     cpu_a.cpu_detail.workers.completion_ms = 6;
@@ -79,7 +82,8 @@ int main() {
         cd.down_reduce_ms != 10 || cd.hidden_quant_thread_ms != 4 || cd.hidden_quant_calls != 5 ||
         cd.late_wait_calls != 3 || cd.late_wait_thread_ms != 7 || cd.workers.batches != 4 ||
         cd.workers.tasks != 160 || cd.workers.completion_ms != 6 ||
-        cd.gate_tasks != 12 || cd.gate_weight_rows != 384 || cd.down_tasks != 16 || cd.down_output_rows != 256)
+        cd.gate_tasks != 12 || cd.gate_weight_rows != 384 || cd.down_tasks != 16 || cd.down_output_rows != 256 ||
+        cd.down_reuse_calls != 2 || cd.down_reuse_runs != 4 || cd.down_reuse_uses != 7)
         return std::fprintf(stderr, "overlap_timing_test: bad CPU detail aggregate/delta\n"), 1;
     std::puts("overlap_timing_test: passed");
     return 0;

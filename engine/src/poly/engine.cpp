@@ -3662,6 +3662,8 @@ void Engine::load(const Options& o) {
         workers_ = std::make_shared<Workers>(threads, opt_.worker_idle_spins, opt_.cpu_task_shape);
         std::fprintf(stderr, "strata-poly: CPU expert task rows: gate/up cap %d (dynamic), down %d, alignment 4\n",
                      opt_.cpu_task_shape.gate_max_rows, opt_.cpu_task_shape.down_rows);
+        if (opt_.cpu_task_shape.down_reuse)
+            std::fprintf(stderr, "strata-poly: experimental Q5_K Down multi-activation reuse requested (AVX2 only)\n");
     }
     if (!aside_) aside_ = std::make_unique<Aside>();
     // save_state()'s pinned memory, and read()'s for the checkpoints inside a read, with the load: made at the

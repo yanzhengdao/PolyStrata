@@ -98,6 +98,7 @@ struct CpuExpertTiming {
     double total_ms = 0, setup_ms = 0, input_quant_ms = 0, group_ms = 0, gate_up_activation_ms = 0, down_reduce_ms = 0, hidden_quant_thread_ms = 0, late_wait_thread_ms = 0;
     // Weight rows counted once per unique Gate/Up run; Down output rows once per call.
     int64_t gate_tasks = 0, gate_weight_rows = 0, down_tasks = 0, down_output_rows = 0;
+    int64_t down_reuse_calls = 0, down_reuse_runs = 0, down_reuse_uses = 0;
     WorkerTiming workers;
 
     void add(const CpuExpertTiming& v) {
@@ -120,6 +121,9 @@ struct CpuExpertTiming {
         gate_weight_rows += v.gate_weight_rows;
         down_tasks += v.down_tasks;
         down_output_rows += v.down_output_rows;
+        down_reuse_calls += v.down_reuse_calls;
+        down_reuse_runs += v.down_reuse_runs;
+        down_reuse_uses += v.down_reuse_uses;
         workers.add(v.workers);
     }
     CpuExpertTiming minus(const CpuExpertTiming& b) const {
@@ -143,6 +147,9 @@ struct CpuExpertTiming {
         d.gate_weight_rows -= b.gate_weight_rows;
         d.down_tasks -= b.down_tasks;
         d.down_output_rows -= b.down_output_rows;
+        d.down_reuse_calls -= b.down_reuse_calls;
+        d.down_reuse_runs -= b.down_reuse_runs;
+        d.down_reuse_uses -= b.down_reuse_uses;
         d.workers = workers.minus(b.workers);
         return d;
     }

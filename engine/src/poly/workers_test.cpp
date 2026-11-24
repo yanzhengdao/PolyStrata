@@ -2,6 +2,7 @@
 // own comes back.  The rest of cpu_experts.cpp needs ggml, so CMake builds this: poly_workers_test.
 #include "cpu_experts.hpp"
 #include "strata/quant/types.hpp"
+#include "strata/quant/dot.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -62,7 +63,9 @@ bool task_shape_test() {
     };
     std::vector<float> x(ne*nr), ref(ne*nr), out(ne*nr);
     for (auto& v : x) v = (float)((int)(rng()%201)-100) / 100.f;
-    const CpuExpertTaskShape shapes[] = {{32,16},{16,8},{32,32},{64,32},{64,64},{4,4},{256,256}};
+    const CpuExpertTaskShape shapes[] = {{32,16},{16,8},{32,32},{64,32},{64,64},{4,4},{256,256},
+                                        {8,16,true},{16,16,true}};
+    const bool supported = Q::experimental_q5_rows_kernel(Q::default_arith()) != nullptr;
     bool first = true;
     for (const auto shape : shapes) {
         Workers pool(4, 20000, shape);
@@ -73,7 +76,10 @@ bool task_shape_test() {
         const int per = shape.gate_rows(2,nf,pool.threads());
         if (timing.calls != 1 || timing.expert_uses != 5 || timing.unique_experts != 2 ||
             timing.gate_tasks != 2*((nf+per-1)/per) || timing.gate_weight_rows != 2*nf ||
-            timing.down_tasks != (ne+shape.down_rows-1)/shape.down_rows || timing.down_output_rows != ne)
+            timing.down_tasks != (ne+shape.down_rows-1)/shape.down_rows || timing.down_output_rows != ne ||
+            timing.down_reuse_calls != (shape.down_reuse && supported ? 1 : 0) ||
+            timing.down_reuse_runs != (shape.down_reuse && supported ? 2 : 0) ||
+            timing.down_reuse_uses != (shape.down_reuse && supported ? 5 : 0))
             return false;
         if (first) {
             bool nonzero = false;

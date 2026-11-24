@@ -485,6 +485,9 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     }, worker_profile);
     stage_time(&CpuExpertTiming::gate_up_activation_ms);
 
+    // Only opt in for Q5_K Down. Keep all other formats and Gate/Up unchanged.
+    const Q::DotRowsFn reuse = workers.task_shape().down_reuse && d_type == (int) Q::Type::Q5_K && rows > 1
+        ? Q::experimental_q5_rows_kernel(Q::default_arith()) : nullptr;
     const int down_rows = workers.task_shape().down_rows;
     const int d_tasks = (n_embd + down_rows - 1) / down_rows;
     workers.run(d_tasks, [&](int t) {
@@ -495,7 +498,25 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
             const int nr = td.x4 && r + 4 <= r1 ? 4 : 1;   // four rows a call where the format has a four-row kernel
             for (int u = 0; u < n_run; ++u) {
                 const uint8_t* down = experts[byp[runp[u]]].down + (size_t) r * d_row;
-                for (int i = runp[u]; i < runp[u + 1]; ++i) {
+                int begin = runp[u], end = runp[u + 1];
+                if (reuse && end - begin > 1) {
+                    // Process up to eight uses, keeping the original indices for
+                    // reduction. A single-use tail falls through to the old dot.
+                    while (end - begin > 1) {
+                        const int m = std::min(kUses, end - begin);
+                        const void* acts[kUses];
+                        for (int k = 0; k < m; ++k)
+                            acts[k] = hqp + (size_t) byp[begin+k] * h_bytes;
+                        for (int q = 0; q < nr; ++q) {
+                            float values[kUses];
+                            reuse(n_ff, m, values, down + (size_t) q * d_row, acts);
+                            for (int k = 0; k < m; ++k)
+                                one[(size_t) q * n + byp[begin+k]] = values[k];
+                        }
+                        begin += m;
+                    }
+                }
+                for (int i = begin; i < end; ++i) {
                     const int j = byp[i];
                     const uint8_t* hj = hqp + (size_t) j * h_bytes;
                     if (nr == 4) {
@@ -530,6 +551,17 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
         profile->gate_weight_rows += (int64_t) n_run * n_ff;
         profile->down_tasks += d_tasks;
         profile->down_output_rows += n_embd;
+        if (reuse) {
+            ++profile->down_reuse_calls;
+            for (int u = 0; u < n_run; ++u) {
+                const int m = runp[u+1] - runp[u];
+                if (m > 1) {
+                    ++profile->down_reuse_runs;
+                    // rows_by_four falls back for a singleton remainder.
+                    profile->down_reuse_uses += m - (m % 4 == 1 ? 1 : 0);
+                }
+            }
+        }
         profile->hidden_quant_calls += n_run;
         for (double ms : hidden_samples) profile->hidden_quant_thread_ms += ms;
         if (late)
