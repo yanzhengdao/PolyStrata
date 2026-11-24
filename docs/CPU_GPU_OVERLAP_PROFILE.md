@@ -94,3 +94,34 @@ Normal single-request logs contain `cpu-expert-profile: prefill/decode` and
 The additional clock reads and sample buffers are opt-in. No SIMD kernel,
 task assignment, weight residency policy or synchronization is changed.
 Compare throughput with the flag disabled before drawing conclusions.
+
+
+## CPU expert task granularity (experimental)
+
+Two opt-in CLI parameters, independent of the profiling flags:
+
+- `--cpu-gate-max-rows N`: dynamic Gate/Up task row cap (default 32).
+  The actual rows/task remain aligned to four, between 4 and the cap,
+  targeting roughly four tasks per worker: floor(unique_runs * n_ff /
+  (4 * threads)), rounded down to four and clamped to that range.
+- `--cpu-down-rows N`: Down task row count (default 16).
+
+Both accept multiples of four from 4 through 256; invalid input is rejected.
+Four-row alignment and reduction order remain unchanged. These options are
+stored in the CPU expert worker pool; staging workers keep their defaults.
+They apply to small, mixed-prompt and doorbell CPU expert calls.
+
+With `--profile-cpu-experts`, `cpu-task-profile:` reports gate tasks,
+gate weight rows (one set per unique expert run, not per token use),
+down tasks and down output rows, plus each stage's mean actual rows/task.
+A larger gate cap can be ineffective when the dynamic formula is smaller;
+compare the actual rows/task before interpreting throughput.
+
+Suggested first tests at 12 threads and otherwise identical settings:
+32/16 (baseline), 32/32 (Down only), 16/16 (Gate/Up only). If these show
+a meaningful gain or loss, extend with 16/8 and 64/32 or 64/64. Keep the
+same prompt, cache state and workload; compare CPU ms per expert use,
+per unique run, worker completion wait and throughput. Keep the VM load
+consistent. `poly_workers_test` verifies the default sizing formula,
+validation, task counts and bitwise Q5_K CPU output parity across seven
+shapes with repeated uses. No new kernels or synchronization changes.

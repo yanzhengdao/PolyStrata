@@ -3245,6 +3245,8 @@ void Engine::load(const Options& o) {
     gpu::metal::set_scoped_residency(o.metal_balanced);
 #endif
     opt_ = o;
+    if (!opt_.cpu_task_shape.valid())
+        throw std::invalid_argument("CPU expert task rows must be multiples of four in 4..256");
     if ((!opt_.kv_grow || opt_.batch > 0) && opt_.kv_resident > 0) opt_.kv_resident = 0;
     asked_reserve_mib_ = o.vram_reserve_mib;
     if (opt_.max_context < 16) throw std::runtime_error("the context must be at least 16 tokens");
@@ -3657,7 +3659,9 @@ void Engine::load(const Options& o) {
             if (dg_) files.insert(files.end(), dg_->paths().begin(), dg_->paths().end());
             node_ = stay_near(spans, files, threads, node_share_);
         }
-        workers_ = std::make_shared<Workers>(threads, opt_.worker_idle_spins);
+        workers_ = std::make_shared<Workers>(threads, opt_.worker_idle_spins, opt_.cpu_task_shape);
+        std::fprintf(stderr, "strata-poly: CPU expert task rows: gate/up cap %d (dynamic), down %d, alignment 4\n",
+                     opt_.cpu_task_shape.gate_max_rows, opt_.cpu_task_shape.down_rows);
     }
     if (!aside_) aside_ = std::make_unique<Aside>();
     // save_state()'s pinned memory, and read()'s for the checkpoints inside a read, with the load: made at the

@@ -66,6 +66,7 @@ struct Options {
     std::string model;
     int max_context = 8192;
     int threads = 0;              ///< 0: the CPUs this process may use
+    CpuExpertTaskShape cpu_task_shape; ///< experimental Gate/Up cap and Down task rows (32/16 by default)
     int worker_idle_spins = 20000; ///< CPU expert Workers: pause iterations before atomic wait (opt-in tuning)
     bool profile_overlap = false;    ///< opt-in host-side CPU/GPU orchestration timing (no extra CUDA sync)
     bool profile_cpu_experts = false; ///< extra CPU expert stage/worker detail (also enables overlap logging in CLI)

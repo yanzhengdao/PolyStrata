@@ -12,16 +12,12 @@
 #include <immintrin.h>
 #include <mutex>
 #include <numeric>
+#include <stdexcept>
 #include <utility>
 
 namespace strata::poly {
 namespace {
 
-// Rows of gate and up, and of down, a task.  With fewer tasks than several a thread, the last round left threads
-// idle at the end of every layer: 64 rows gave Tiel's 512-row experts 8 tasks each, and its down products 32 tasks.
-constexpr int kRowsPerTask = 32;
-constexpr int kRowsStep = 4;   // a gate and up task's rows are a multiple of this, from it up to kRowsPerTask
-constexpr int kRowsPerDownTask = 16;
 constexpr int kRowsOnCaller = 4;   // up to this many rows' activations are quantized by the caller's thread
 constexpr int kSpinsBeforeSleep = 20000;   // about a millisecond of pause instructions
 
@@ -134,8 +130,10 @@ CpuDotX4 cpu_dot_x4(int type) {
     return out;
 }
 
-Workers::Workers(int threads, int idle_spins)
-    : idle_spins_(idle_spins), busy_((size_t) std::max(threads - 1, 0)) {
+Workers::Workers(int threads, int idle_spins, CpuExpertTaskShape task_shape)
+    : task_shape_(task_shape), idle_spins_(idle_spins), busy_((size_t) std::max(threads - 1, 0)) {
+    if (!task_shape_.valid())
+        throw std::invalid_argument("CPU expert task rows must be multiples of four in 4..256");
     if (idle_spins_ != kSpinsBeforeSleep)
         std::fprintf(stderr, "strata-poly: CPU expert workers idle-spin budget %d (default %d)\n",
                      idle_spins_, kSpinsBeforeSleep);
@@ -400,9 +398,7 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     const int* orderp = order.data();
     // Rows a task: about four tasks a thread, so the last round leaves few threads idle.  At 6 GB a call has two or
     // three experts on the CPU, which at 32 rows a task were two rounds of 32 threads, the second one mostly idle.
-    const int threads = std::max(workers.threads(), 1);
-    int per = (n_run * n_ff) / (4 * threads);
-    per = std::clamp(per - per % kRowsStep, kRowsStep, kRowsPerTask);
+    const int per = workers.task_shape().gate_rows(n_run, n_ff, workers.threads());
     const int gu_tasks = (n_ff + per - 1) / per;
     // The task that finishes an expert's run quantizes its uses' rows for the down products: a round of the workers
     // less than doing it after all of them.
@@ -489,11 +485,12 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     }, worker_profile);
     stage_time(&CpuExpertTiming::gate_up_activation_ms);
 
-    const int d_tasks = (n_embd + kRowsPerDownTask - 1) / kRowsPerDownTask;
+    const int down_rows = workers.task_shape().down_rows;
+    const int d_tasks = (n_embd + down_rows - 1) / down_rows;
     workers.run(d_tasks, [&](int t) {
         static thread_local std::vector<float> one;   // an output value of every use, for each of up to four rows
         one.resize((size_t) 4 * n);
-        const int r0 = t * kRowsPerDownTask, r1 = std::min(n_embd, r0 + kRowsPerDownTask);
+        const int r0 = t * down_rows, r1 = std::min(n_embd, r0 + down_rows);
         for (int r = r0; r < r1;) {
             const int nr = td.x4 && r + 4 <= r1 ? 4 : 1;   // four rows a call where the format has a four-row kernel
             for (int u = 0; u < n_run; ++u) {
@@ -529,6 +526,10 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
         profile->rows += rows;
         profile->expert_uses += n;
         profile->unique_experts += n_run;
+        profile->gate_tasks += (int64_t) n_run * gu_tasks;
+        profile->gate_weight_rows += (int64_t) n_run * n_ff;
+        profile->down_tasks += d_tasks;
+        profile->down_output_rows += n_embd;
         profile->hidden_quant_calls += n_run;
         for (double ms : hidden_samples) profile->hidden_quant_thread_ms += ms;
         if (late)

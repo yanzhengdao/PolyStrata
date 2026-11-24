@@ -8,6 +8,7 @@
 
 #include "overlap_timing.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -20,17 +21,37 @@
 
 namespace strata::poly {
 
+// Experimental CPU expert task shape. Preserve four-row alignment for the
+// x4 dot kernels; only task boundaries change, never arithmetic or reduction order.
+struct CpuExpertTaskShape {
+    static constexpr int row_step = 4;
+    static constexpr int max_rows = 256;
+    int gate_max_rows = 32;
+    int down_rows = 16;
+
+    static constexpr bool valid_rows(int n) {
+        return n >= row_step && n <= max_rows && n % row_step == 0;
+    }
+    constexpr bool valid() const { return valid_rows(gate_max_rows) && valid_rows(down_rows); }
+    // Keep the upstream target of roughly four Gate/Up tasks per worker.
+    int gate_rows(int unique_runs, int n_ff, int threads) const {
+        const int64_t per = (int64_t) unique_runs * n_ff / (4LL * std::max(threads, 1));
+        return (int) std::clamp<int64_t>(per - per % row_step, row_step, gate_max_rows);
+    }
+};
+
 /// Runs fn(0..n-1) on the workers and the calling thread, and returns when all of them are done.  A call from
 /// inside fn does its work on the thread it is on.
 class Workers {
 public:
-    explicit Workers(int threads, int idle_spins = 20000);
+    explicit Workers(int threads, int idle_spins = 20000, CpuExpertTaskShape task_shape = {});
     ~Workers();
     Workers(const Workers&) = delete;
     Workers& operator=(const Workers&) = delete;
 
     void run(int n, const std::function<void(int)>& fn, WorkerTiming* profile = nullptr);
     int threads() const { return (int) th_.size() + 1; }
+    const CpuExpertTaskShape& task_shape() const { return task_shape_; }
 
 private:
     // Every thread takes tasks from next and counts what it ran down from left once, when it finds no more: with a
@@ -49,6 +70,7 @@ private:
     void loop(int i);
     static bool drain(Batch& b);
 
+    const CpuExpertTaskShape task_shape_;
     const int idle_spins_;                  ///< how long idle workers pause before atomic wait
     std::vector<std::thread> th_;
     std::vector<Busy> busy_;                     ///< a worker's Busy

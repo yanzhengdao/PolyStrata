@@ -93,6 +93,13 @@ void report_cpu_experts(const char* phase, const strata::poly::CpuExpertTiming& 
                  p.total_ms, p.setup_ms, p.input_quant_ms, p.group_ms, p.gate_up_activation_ms,
                  p.down_reduce_ms, p.hidden_quant_thread_ms, (long long) p.hidden_quant_calls,
                  p.late_wait_thread_ms, (long long) p.late_wait_calls);
+    std::fprintf(stderr,
+                 "cpu-task-profile: %s gate tasks %lld, gate weight rows %lld, mean rows/task %.2f; "
+                 "down tasks %lld, down output rows %lld, mean rows/task %.2f\n",
+                 phase, (long long) p.gate_tasks, (long long) p.gate_weight_rows,
+                 p.gate_tasks ? (double) p.gate_weight_rows / p.gate_tasks : 0.0,
+                 (long long) p.down_tasks, (long long) p.down_output_rows,
+                 p.down_tasks ? (double) p.down_output_rows / p.down_tasks : 0.0);
     const auto& w = p.workers;
     std::fprintf(stderr,
                  "cpu-worker-profile: %s batches %lld, serial calls %lld, tasks %lld; "
@@ -1729,6 +1736,8 @@ void usage() {
                  "                         CPUs; all of them in a container with a CPU quota)\n"
                  "  --worker-idle-spins N  CPU expert worker pause-loop iterations before sleeping (0..1000000;\n"
                  "                         default 20000; 0 = sleep immediately; experimental)\n"
+                 "  --cpu-gate-max-rows N  CPU Gate/Up task row cap (dynamic; multiple of 4 in 4..256; default 32)\n"
+                 "  --cpu-down-rows N      CPU Down task rows (multiple of 4 in 4..256; default 16)\n"
                  "  --profile-overlap     report host CPU/GPU submission, mixed-batch wait and overlap timings\n"
                  "  --profile-cpu-experts  extra CPU expert/worker stage timing (implies --profile-overlap)\n"
                  "  --vram-reserve-mib N   VRAM left free beside the expert cache, 256 at least (default: a\n"
@@ -1951,6 +1960,18 @@ int main(int argc, char** argv) {
         else if (a == "--max-context") o.max_context = std::atoi(val());
         else if (a == "--threads") o.threads = std::atoi(val());
         else if (a == "--worker-idle-spins") o.worker_idle_spins = std::atoi(val());
+        else if (a == "--cpu-gate-max-rows" || a == "--cpu-down-rows") {
+            const char* raw = val();
+            char* end = nullptr;
+            const long n = std::strtol(raw, &end, 10);
+            if (end == raw || *end != '\0' || n < 4 || n > 256 ||
+                !strata::poly::CpuExpertTaskShape::valid_rows((int) n)) {
+                std::fprintf(stderr, "strata-poly: %s requires a multiple of 4 in 4..256\n", a.c_str());
+                return 2;
+            }
+            if (a == "--cpu-gate-max-rows") o.cpu_task_shape.gate_max_rows = (int) n;
+            else o.cpu_task_shape.down_rows = (int) n;
+        }
         else if (a == "--profile-overlap") o.profile_overlap = true;
         else if (a == "--profile-cpu-experts") o.profile_cpu_experts = o.profile_overlap = true;
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(val());
