@@ -25,6 +25,20 @@ int main() {
     // Every 100 rounds, leave enough idle time to enter the atomic wait path.
     for (const int spins : {0, 1024, 20000}) {
         Workers pool(8, spins);
+        strata::poly::WorkerTiming timing;
+        std::atomic<int> profiled{0};
+        pool.run(1, [&](int) { profiled.fetch_add(1); }, &timing);
+        pool.run(32, [&](int) { profiled.fetch_add(1); }, &timing);
+        if (profiled.load() != 33 || timing.serial_calls != 1 || timing.batches != 1 ||
+            timing.tasks != 33 || timing.lock_ms < 0 || timing.publish_ms < 0 ||
+            timing.caller_drain_ms < 0 || timing.completion_ms < 0 || timing.retire_ms < 0 ||
+            timing.serial_ms < 0) {
+            std::fprintf(stderr, "FAIL: profiled workers (spins %d)\n", spins);
+            done.store(true);
+            watch.join();
+            return 1;
+        }
+        ++checks;
         for (int round = 0; round < 2000; ++round) {
             if (round % 100 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(2));
             std::atomic<int> outer{0}, inner{0};

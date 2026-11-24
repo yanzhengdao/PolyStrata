@@ -68,6 +68,7 @@ struct Options {
     int threads = 0;              ///< 0: the CPUs this process may use
     int worker_idle_spins = 20000; ///< CPU expert Workers: pause iterations before atomic wait (opt-in tuning)
     bool profile_overlap = false;    ///< opt-in host-side CPU/GPU orchestration timing (no extra CUDA sync)
+    bool profile_cpu_experts = false; ///< extra CPU expert stage/worker detail (also enables overlap logging in CLI)
     int vram_reserve_mib = -1;    ///< left free after the expert cache is filled; below 0: by the card's size
     bool vram_pool = false;       ///< one pool of VRAM claimed at load, kept for the whole run: the expert cache and the
                                   ///< attention caches trade pieces of it and nothing is given back to the card; the

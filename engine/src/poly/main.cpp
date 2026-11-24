@@ -80,6 +80,28 @@ void report_overlap(const OverlapTiming& before, const OverlapTiming& after, dou
                  p.prompt_concurrent_ms, p.prompt_join_ms, router_wait_ms);
 }
 
+// Stage wall times and nested worker/callback times are different views, not additive.
+void report_cpu_experts(const char* phase, const strata::poly::CpuExpertTiming& p) {
+    if (p.calls == 0) return;
+    std::fprintf(stderr,
+                 "cpu-expert-profile: %s calls %lld (bell %lld), rows %lld, uses %lld, unique runs %lld; "
+                 "total %.1f ms, setup %.1f ms, input quant %.1f ms, grouping %.1f ms, "
+                 "gate/up+activation %.1f ms, down+reduce %.1f ms; "
+                 "hidden quant thread-sum %.1f ms (%lld runs), explicit late callback thread-sum %.1f ms (%lld tasks)\n",
+                 phase, (long long) p.calls, (long long) p.bell_calls, (long long) p.rows,
+                 (long long) p.expert_uses, (long long) p.unique_experts,
+                 p.total_ms, p.setup_ms, p.input_quant_ms, p.group_ms, p.gate_up_activation_ms,
+                 p.down_reduce_ms, p.hidden_quant_thread_ms, (long long) p.hidden_quant_calls,
+                 p.late_wait_thread_ms, (long long) p.late_wait_calls);
+    const auto& w = p.workers;
+    std::fprintf(stderr,
+                 "cpu-worker-profile: %s batches %lld, serial calls %lld, tasks %lld; "
+                 "lock %.1f ms, publish %.1f ms, caller drain %.1f ms, completion wait %.1f ms, "
+                 "retire %.1f ms, serial %.1f ms\n",
+                 phase, (long long) w.batches, (long long) w.serial_calls, (long long) w.tasks,
+                 w.lock_ms, w.publish_ms, w.caller_drain_ms, w.completion_ms, w.retire_ms, w.serial_ms);
+}
+
 // Only host-visible synchronization time, not exclusive router kernel time. All layer
 // ids are zero-based, and the values include rejected speculative rows where applicable.
 void report_overlap_phase(const char* phase, const OverlapTiming& p, double wall_ms, int64_t tokens) {
@@ -90,6 +112,7 @@ void report_overlap_phase(const char* phase, const OverlapTiming& p, double wall
                  "mixed CPU work %.1f ms\n",
                  phase, (long long) tokens, wall_ms, wait.ms, (long long) wait.calls,
                  p.small_cpu_ms, p.small_submit_ms, p.small_concurrent_ms, p.small_join_ms, p.prompt_cpu_ms);
+    report_cpu_experts(phase, p.cpu_detail);
     if (wait.calls == 0) return;
     // One compact line per phase, not a log per layer invocation. ms/calls per layer.
     std::fprintf(stderr, "overlap-router-layers: %s [layer=ms/calls]", phase);
@@ -1432,6 +1455,7 @@ int serve(Session& ss) {
                 report_overlap_phase("prefill", r.prefill_overlap, r.prompt_ms, r.read);
                 report_overlap_phase("decode", r.decode_overlap, r.decode_ms, r.produced);
             } else if (!ahead) {
+                report_cpu_experts("request", now.overlap.cpu_detail.minus(before.overlap.cpu_detail));
                 std::fprintf(stderr, "overlap-phase: unavailable for interleaved batch requests\n");
             }
         }
@@ -1706,6 +1730,7 @@ void usage() {
                  "  --worker-idle-spins N  CPU expert worker pause-loop iterations before sleeping (0..1000000;\n"
                  "                         default 20000; 0 = sleep immediately; experimental)\n"
                  "  --profile-overlap     report host CPU/GPU submission, mixed-batch wait and overlap timings\n"
+                 "  --profile-cpu-experts  extra CPU expert/worker stage timing (implies --profile-overlap)\n"
                  "  --vram-reserve-mib N   VRAM left free beside the expert cache, 256 at least (default: a\n"
                  "                         thirty-second of the card, 256 to 768, or a sixteenth, 512 to 1024,\n"
                  "                         when the PC's free RAM is within 4 GiB of the model's files, and then\n"
@@ -1927,6 +1952,7 @@ int main(int argc, char** argv) {
         else if (a == "--threads") o.threads = std::atoi(val());
         else if (a == "--worker-idle-spins") o.worker_idle_spins = std::atoi(val());
         else if (a == "--profile-overlap") o.profile_overlap = true;
+        else if (a == "--profile-cpu-experts") o.profile_cpu_experts = o.profile_overlap = true;
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(val());
         else if (a == "--vram-pool") o.vram_pool = true;
         else if (a == "--expert-profile") o.profile = val();

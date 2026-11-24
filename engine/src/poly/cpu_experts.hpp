@@ -6,6 +6,8 @@
 // in strata/kernels/cpu/pool.hpp is built around the other model's expert blob.
 #pragma once
 
+#include "overlap_timing.hpp"
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -27,7 +29,7 @@ public:
     Workers(const Workers&) = delete;
     Workers& operator=(const Workers&) = delete;
 
-    void run(int n, const std::function<void(int)>& fn);
+    void run(int n, const std::function<void(int)>& fn, WorkerTiming* profile = nullptr);
     int threads() const { return (int) th_.size() + 1; }
 
 private:
@@ -118,6 +120,7 @@ CpuDotX4 cpu_dot_x4(int type);
 void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, int gu_type, int u_type, int d_type,
                  int n_embd, int n_ff, const float* x, float limit, bool gelu, float* out,
                  const std::function<void()>* meanwhile = nullptr, const uint8_t* late = nullptr,
-                 const std::function<void(int)>* wait = nullptr, float situ_beta = 0.f, float situ_lb = 0.f);
+                 const std::function<void(int)>* wait = nullptr, float situ_beta = 0.f, float situ_lb = 0.f,
+                 CpuExpertTiming* profile = nullptr);
 
 }  // namespace strata::poly

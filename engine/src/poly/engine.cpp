@@ -5511,7 +5511,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         try {
             cpu_experts(*workers_, host, n_host, m, (int) L.gu_type, (int) L.u_type, (int) L.d_type, n_embd_, n_ff_exp_,
                         x, limit, gelu_, cpu, aside ? nullptr : meanwhile, any_late ? late : nullptr, &wait,
-                        situ_beta_, situ_lb_);
+                        situ_beta_, situ_lb_, opt_.profile_cpu_experts ? &stats_.overlap.cpu_detail : nullptr);
         } catch (...) {
             if (aside) try {
                     aside_->finish();
@@ -5714,7 +5714,9 @@ void Engine::bell_job() {
     }
     const Clock::time_point t0 = Clock::now();
     cpu_experts(*workers_, host, n, 1, (int) L.gu_type, (int) L.u_type, (int) L.d_type, n_embd_, n_ff_exp_, h_x_,
-                clamp_exp_[(size_t) il], gelu_, h_cpu_, nullptr, nullptr, nullptr, situ_beta_, situ_lb_);
+                clamp_exp_[(size_t) il], gelu_, h_cpu_, nullptr, nullptr, nullptr, situ_beta_, situ_lb_,
+                opt_.profile_cpu_experts ? &stats_.overlap.cpu_detail : nullptr);
+    if (opt_.profile_cpu_experts) ++stats_.overlap.cpu_detail.bell_calls;
     stats_.cpu_ms += ms_since(t0);
     stats_.cpu_experts += n;
     stats_.gpu_experts -= n;   // run() counted every pick of the token as the card's
@@ -6783,7 +6785,8 @@ void Engine::moe_rows(Layer& L, int il, int n) {
         });
         const auto cpu_started = opt_.profile_overlap ? Clock::now() : start;
         cpu_experts(*workers_, host_.data(), (int) host_.size(), n, gt, ut, dt, n_embd_, n_ff_exp_, h_x_, limit, gelu_,
-                    h_cpu_, nullptr, nullptr, nullptr, situ_beta_, situ_lb_);
+                    h_cpu_, nullptr, nullptr, nullptr, situ_beta_, situ_lb_,
+                    opt_.profile_cpu_experts ? &stats_.overlap.cpu_detail : nullptr);
         const auto cpu_done = opt_.profile_overlap ? Clock::now() : start;
         const double cpu = ms_since(start);
         behind.wait();

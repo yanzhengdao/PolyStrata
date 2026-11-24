@@ -209,15 +209,28 @@ void Workers::loop(int i) {
     }
 }
 
-void Workers::run(int n, const std::function<void(int)>& fn) {
+void Workers::run(int n, const std::function<void(int)>& fn, WorkerTiming* profile) {
     if (n <= 0) return;
+    auto mark = profile ? OverlapClock::now() : OverlapClock::time_point{};
     // One task is nothing to share out.  And a task that shares out work of its own does it alone: there is one
     // batch at a time, and a worker that waited below for the others to let go of theirs would wait for itself.
     if (n == 1 || in_task) {
         for (int i = 0; i < n; ++i) fn(i);
+        if (profile) {
+            ++profile->serial_calls;
+            profile->tasks += n;
+            profile->serial_ms += interval_ms(mark, OverlapClock::now());
+        }
         return;
     }
     const std::lock_guard<std::mutex> one(one_);
+    if (profile) {
+        const auto now = OverlapClock::now();
+        ++profile->batches;
+        profile->tasks += n;
+        profile->lock_ms += interval_ms(mark, now);
+        mark = now;
+    }
     Batch b;
     b.fn = &fn;
     b.n = n;
@@ -225,11 +238,27 @@ void Workers::run(int n, const std::function<void(int)>& fn) {
     cur_.store(&b);
     posted_.fetch_add(1);
     if (sleepers_.load() > 0) posted_.notify_all();
+    if (profile) {
+        const auto now = OverlapClock::now();
+        profile->publish_ms += interval_ms(mark, now);
+        mark = now;
+    }
     drain(b);
     cur_.store(nullptr);   // every task is taken: a worker that comes now has nothing to find
+    if (profile) {
+        const auto now = OverlapClock::now();
+        profile->caller_drain_ms += interval_ms(mark, now);
+        mark = now;
+    }
     while (b.left.load(std::memory_order_acquire) != 0) _mm_pause();
+    if (profile) {
+        const auto now = OverlapClock::now();
+        profile->completion_ms += interval_ms(mark, now);
+        mark = now;
+    }
     for (Busy& w : busy_)
         while (w.on.load() != 0) _mm_pause();
+    if (profile) profile->retire_ms += interval_ms(mark, OverlapClock::now());
 }
 
 Aside::Aside() : th_([this] { loop(); }) {}
@@ -304,7 +333,17 @@ bool cpu_expert_types_ok(int gu_type, int d_type, int n_embd, int n_ff, std::str
 void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, int gu_type, int u_type, int d_type,
                  int n_embd, int n_ff, const float* x, float limit, bool gelu, float* out,
                  const std::function<void()>* meanwhile, const uint8_t* late, const std::function<void(int)>* wait,
-                 float situ_beta, float situ_lb) {
+                 float situ_beta, float situ_lb, CpuExpertTiming* profile) {
+    const auto started = profile ? OverlapClock::now() : OverlapClock::time_point{};
+    auto mark = started;
+    WorkerTiming* worker_profile = profile ? &profile->workers : nullptr;
+    const auto stage_time = [&](double CpuExpertTiming::* field) {
+        if (profile) {
+            const auto now = OverlapClock::now();
+            profile->*field += interval_ms(mark, now);
+            mark = now;
+        }
+    };
     const Rows tg = rows_of(gu_type), tu = rows_of(u_type), td = rows_of(d_type);
     const size_t gu_row = Q::row_bytes(gu_type, n_embd);
     const size_t u_row = Q::row_bytes(u_type, n_embd);
@@ -331,10 +370,12 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
         act_from(x + (size_t) t * n_embd, actp + (size_t) t * a_bytes, n_embd);
         if (own_act) au_from(x + (size_t) t * n_embd, actup + (size_t) t * au_bytes, n_embd);
     };
+    stage_time(&CpuExpertTiming::setup_ms);
     if (rows <= kRowsOnCaller)
         for (int t = 0; t < rows; ++t) quantize(t);
     else
-        workers.run(rows, quantize);
+        workers.run(rows, quantize, worker_profile);
+    stage_time(&CpuExpertTiming::input_quant_ms);
     const size_t au_step = own_act ? au_bytes : a_bytes;
 
     // The uses of one expert next to each other (by), and where each expert's run of them starts (run).
@@ -372,11 +413,29 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     for (int u = 0; u < n_run; ++u) left_of[(size_t) u].store(gu_tasks, std::memory_order_relaxed);
     std::atomic<int>* leftp = left_of.data();
     const int first = meanwhile ? 1 : 0;   // task 0, so it is taken at once
+    // Each task owns its late sample; the last task of a run owns its quantization
+    // sample. Workers never update shared timing counters or resize these buffers.
+    struct LateSample { double ms = 0; int calls = 0; };
+    static thread_local std::vector<LateSample> late_samples;
+    static thread_local std::vector<double> hidden_samples;
+    if (profile) {
+        hidden_samples.assign((size_t) n_run, 0.0);
+        if (late) late_samples.assign((size_t) n_run * gu_tasks, LateSample{});
+    }
+    auto* latep = profile && late ? late_samples.data() : nullptr;
+    auto* hiddenp = profile ? hidden_samples.data() : nullptr;
+    stage_time(&CpuExpertTiming::group_ms);
     workers.run(first + n_run * gu_tasks, [&](int t) {
         if (t < first) return (*meanwhile)();
         t -= first;
         const int u = orderp[t / gu_tasks], i0 = runp[u], i1 = runp[u + 1];
-        if (late && late[byp[i0]]) (*wait)(byp[i0]);
+        if (late && late[byp[i0]]) {
+            if (latep) {
+                const auto before = OverlapClock::now();
+                (*wait)(byp[i0]);
+                latep[t] = {interval_ms(before, OverlapClock::now()), 1};
+            } else (*wait)(byp[i0]);
+        }
         const CpuExpert& e = experts[byp[i0]];
         const int r0 = (t % gu_tasks) * per, r1 = std::min(n_ff, r0 + per);
         // Four weight rows at a time (Rows::x4, a format's four-row kernel), the last few one by one.  The expert's
@@ -419,12 +478,16 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
             r += nr;
         }
         // the last of the run's tasks sees every other one's rows (release by each, acquire by the last)
-        if (leftp[u].fetch_sub(1, std::memory_order_acq_rel) == 1)
+        if (leftp[u].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            const auto before = hiddenp ? OverlapClock::now() : OverlapClock::time_point{};
             for (int i = i0; i < i1; ++i) {
                 const int j = byp[i];
                 hq_from(hp + (size_t) j * n_ff, hqp + (size_t) j * h_bytes, n_ff);
             }
-    });
+            if (hiddenp) hiddenp[u] = interval_ms(before, OverlapClock::now());
+        }
+    }, worker_profile);
+    stage_time(&CpuExpertTiming::gate_up_activation_ms);
 
     const int d_tasks = (n_embd + kRowsPerDownTask - 1) / kRowsPerDownTask;
     workers.run(d_tasks, [&](int t) {
@@ -459,7 +522,22 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
             }
             r += nr;
         }
-    });
+    }, worker_profile);
+    stage_time(&CpuExpertTiming::down_reduce_ms);
+    if (profile) {
+        ++profile->calls;
+        profile->rows += rows;
+        profile->expert_uses += n;
+        profile->unique_experts += n_run;
+        profile->hidden_quant_calls += n_run;
+        for (double ms : hidden_samples) profile->hidden_quant_thread_ms += ms;
+        if (late)
+            for (const auto& s : late_samples) {
+                profile->late_wait_thread_ms += s.ms;
+                profile->late_wait_calls += s.calls;
+            }
+        profile->total_ms += interval_ms(started, mark);
+    }
 }
 
 }  // namespace strata::poly

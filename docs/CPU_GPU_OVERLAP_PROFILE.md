@@ -64,3 +64,33 @@ wait can have no layer entries. Layer totals aggregate across devices if
 layer splitting is used, and are not necessarily disjoint wall intervals.
 No new GPU events or synchronizations are inserted. Profiling off leaves
 the router layer vectors empty and does not take phase snapshots.
+
+
+## CPU expert detail (third profiling revision)
+
+Add `--profile-cpu-experts` to enable the additional measurements (it implies
+`--profile-overlap`). The original overlap flag alone does not enable them.
+Normal single-request logs contain `cpu-expert-profile: prefill/decode` and
+`cpu-worker-profile: prefill/decode` when the phase actually ran CPU experts.
+
+- Stage wall times: scratch/setup, input activation quantization, grouping
+  and task setup, fused Gate/Up plus nonlinear activation and hidden
+  quantization, then Down plus weighted reduction. Their sum is the reported
+  CPU expert total (before aggregating diagnostic samples).
+- Worker batch caller times: mutex acquisition, batch publication and
+  notification, caller task drain, waiting for outstanding tasks, retiring
+  worker references, and serial tasks. These are nested within stage times.
+  Completion wait can contain other workers' useful computation; it is not
+  a measurement of pure thread scheduling or barrier overhead.
+- Hidden quantization and explicit late-expert wait/copy callback elapsed
+  times are thread sums from independent per-task/run samples, not wall
+  intervals. They are nested in Gate/Up and must not be added to the total.
+  Mapped-file faults during dot products remain inside the stage times.
+- Expert uses, unique runs and processed rows help normalize changing
+  workloads. Doorbell CPU calls are included, unlike the first overlap
+  revision's small-call timing. Multi-device aggregation sums per-device
+  measurements and is not necessarily a wall-clock decomposition.
+
+The additional clock reads and sample buffers are opt-in. No SIMD kernel,
+task assignment, weight residency policy or synchronization is changed.
+Compare throughput with the flag disabled before drawing conclusions.

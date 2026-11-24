@@ -51,6 +51,31 @@ int main() {
     if (combined.total().ms != all.total().ms || combined.total().calls != all.total().calls ||
         combined.layers[2].calls != 2 || combined.layers[2].ms != 18)
         return std::fprintf(stderr, "overlap_timing_test: bad router layer aggregation\n"), 1;
+    OverlapTiming cpu_a, cpu_b;
+    cpu_a.cpu_detail.calls = 2;
+    cpu_a.cpu_detail.rows = 3;
+    cpu_a.cpu_detail.expert_uses = 8;
+    cpu_a.cpu_detail.unique_experts = 5;
+    cpu_a.cpu_detail.bell_calls = 1;
+    cpu_a.cpu_detail.total_ms = 32;
+    cpu_a.cpu_detail.gate_up_activation_ms = 20;
+    cpu_a.cpu_detail.down_reduce_ms = 10;
+    cpu_a.cpu_detail.hidden_quant_thread_ms = 4;
+    cpu_a.cpu_detail.hidden_quant_calls = 5;
+    cpu_a.cpu_detail.late_wait_calls = 3;
+    cpu_a.cpu_detail.late_wait_thread_ms = 7;
+    cpu_a.cpu_detail.workers.batches = 4;
+    cpu_a.cpu_detail.workers.tasks = 160;
+    cpu_a.cpu_detail.workers.completion_ms = 6;
+    cpu_b.add(cpu_a);
+    cpu_b.add(cpu_a);
+    const auto cd = cpu_b.minus(cpu_a).cpu_detail;
+    if (cd.calls != 2 || cd.rows != 3 || cd.expert_uses != 8 || cd.unique_experts != 5 ||
+        cd.bell_calls != 1 || cd.total_ms != 32 || cd.gate_up_activation_ms != 20 ||
+        cd.down_reduce_ms != 10 || cd.hidden_quant_thread_ms != 4 || cd.hidden_quant_calls != 5 ||
+        cd.late_wait_calls != 3 || cd.late_wait_thread_ms != 7 || cd.workers.batches != 4 ||
+        cd.workers.tasks != 160 || cd.workers.completion_ms != 6)
+        return std::fprintf(stderr, "overlap_timing_test: bad CPU detail aggregate/delta\n"), 1;
     std::puts("overlap_timing_test: passed");
     return 0;
 }

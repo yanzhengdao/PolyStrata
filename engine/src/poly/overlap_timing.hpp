@@ -58,11 +58,92 @@ struct RouterTiming {
     }
 };
 
+// Caller-side wall times at the existing worker batch boundaries.
+// completion_ms can contain useful work on other workers, not just scheduling overhead.
+struct WorkerTiming {
+    int64_t batches = 0, serial_calls = 0, tasks = 0;
+    double lock_ms = 0, publish_ms = 0, caller_drain_ms = 0, completion_ms = 0, retire_ms = 0, serial_ms = 0;
+
+    void add(const WorkerTiming& v) {
+        batches += v.batches;
+        serial_calls += v.serial_calls;
+        tasks += v.tasks;
+        lock_ms += v.lock_ms;
+        publish_ms += v.publish_ms;
+        caller_drain_ms += v.caller_drain_ms;
+        completion_ms += v.completion_ms;
+        retire_ms += v.retire_ms;
+        serial_ms += v.serial_ms;
+    }
+    WorkerTiming minus(const WorkerTiming& b) const {
+        WorkerTiming d = *this;
+        d.batches -= b.batches;
+        d.serial_calls -= b.serial_calls;
+        d.tasks -= b.tasks;
+        d.lock_ms -= b.lock_ms;
+        d.publish_ms -= b.publish_ms;
+        d.caller_drain_ms -= b.caller_drain_ms;
+        d.completion_ms -= b.completion_ms;
+        d.retire_ms -= b.retire_ms;
+        d.serial_ms -= b.serial_ms;
+        return d;
+    }
+};
+
+// The CPU expert stage wall times are disjoint within a call. Thread times
+// for hidden quantization and explicit late callbacks are nested in Gate/Up,
+// may overlap one another, and must NOT be added to the wall times.
+struct CpuExpertTiming {
+    int64_t calls = 0, rows = 0, expert_uses = 0, unique_experts = 0, late_wait_calls = 0, hidden_quant_calls = 0, bell_calls = 0;
+    double total_ms = 0, setup_ms = 0, input_quant_ms = 0, group_ms = 0, gate_up_activation_ms = 0, down_reduce_ms = 0, hidden_quant_thread_ms = 0, late_wait_thread_ms = 0;
+    WorkerTiming workers;
+
+    void add(const CpuExpertTiming& v) {
+        calls += v.calls;
+        rows += v.rows;
+        expert_uses += v.expert_uses;
+        unique_experts += v.unique_experts;
+        late_wait_calls += v.late_wait_calls;
+        hidden_quant_calls += v.hidden_quant_calls;
+        bell_calls += v.bell_calls;
+        total_ms += v.total_ms;
+        setup_ms += v.setup_ms;
+        input_quant_ms += v.input_quant_ms;
+        group_ms += v.group_ms;
+        gate_up_activation_ms += v.gate_up_activation_ms;
+        down_reduce_ms += v.down_reduce_ms;
+        hidden_quant_thread_ms += v.hidden_quant_thread_ms;
+        late_wait_thread_ms += v.late_wait_thread_ms;
+        workers.add(v.workers);
+    }
+    CpuExpertTiming minus(const CpuExpertTiming& b) const {
+        CpuExpertTiming d = *this;
+        d.calls -= b.calls;
+        d.rows -= b.rows;
+        d.expert_uses -= b.expert_uses;
+        d.unique_experts -= b.unique_experts;
+        d.late_wait_calls -= b.late_wait_calls;
+        d.hidden_quant_calls -= b.hidden_quant_calls;
+        d.bell_calls -= b.bell_calls;
+        d.total_ms -= b.total_ms;
+        d.setup_ms -= b.setup_ms;
+        d.input_quant_ms -= b.input_quant_ms;
+        d.group_ms -= b.group_ms;
+        d.gate_up_activation_ms -= b.gate_up_activation_ms;
+        d.down_reduce_ms -= b.down_reduce_ms;
+        d.hidden_quant_thread_ms -= b.hidden_quant_thread_ms;
+        d.late_wait_thread_ms -= b.late_wait_thread_ms;
+        d.workers = workers.minus(b.workers);
+        return d;
+    }
+};
+
 struct OverlapTiming {
     int64_t small_calls = 0, small_submits = 0, prompt_calls = 0;
     double small_cpu_ms = 0, small_submit_ms = 0, small_concurrent_ms = 0, small_join_ms = 0;
     double prompt_cpu_ms = 0, prompt_gpu_path_ms = 0, prompt_concurrent_ms = 0, prompt_join_ms = 0;
     RouterTiming router;
+    CpuExpertTiming cpu_detail;
 
     void add(const OverlapTiming& v) {
         small_calls += v.small_calls;
@@ -77,6 +158,7 @@ struct OverlapTiming {
         prompt_concurrent_ms += v.prompt_concurrent_ms;
         prompt_join_ms += v.prompt_join_ms;
         router.add(v.router);
+        cpu_detail.add(v.cpu_detail);
     }
 
     OverlapTiming minus(const OverlapTiming& b) const {
@@ -93,6 +175,7 @@ struct OverlapTiming {
         d.prompt_concurrent_ms = prompt_concurrent_ms - b.prompt_concurrent_ms;
         d.prompt_join_ms = prompt_join_ms - b.prompt_join_ms;
         d.router = router.minus(b.router);
+        d.cpu_detail = cpu_detail.minus(b.cpu_detail);
         return d;
     }
 };
