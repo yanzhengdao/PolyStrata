@@ -17,6 +17,9 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <vector>
+#if defined(_MSC_VER) || defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 #if defined(__linux__)
 #include <cctype>
 #include <climits>
@@ -43,7 +46,8 @@ struct Meta {                           // one block, uploaded with one copy per
     int32_t out_row[CAP];               // multi-GPU: compact row -> entry row in the host `out`
 };
 
-/// Switches the calling thread to `dev` and back.  The engine's own thread lives on device 0.
+/// Switches the calling thread to `dev` and back.  It asks the runtime for the thread's device: a thread can be on
+/// any device here (STRATA_PRIMARY_DEVICE puts the engine's own thread on another one).
 struct On {
     int prev = 0;
     explicit On(int dev) { cudaGetDevice(&prev); if (prev != dev) cudaSetDevice(dev); }
@@ -166,14 +170,15 @@ void PeerExperts::close() {
         cache_.close();
         if (d_x_) cudaFree(d_x_);
         if (d_out_) cudaFree(d_out_);
-        if (d_meta_) cudaFree(d_meta_);
         if (d_q8_) cudaFree(d_q8_);
         if (d_scratch_) cudaFree(d_scratch_);
+        if (d_blocks_finished_) cudaFree(d_blocks_finished_);
         if (h_x_) cudaFreeHost(h_x_);
         if (h_out_) cudaFreeHost(h_out_);
         if (h_meta_) cudaFreeHost(h_meta_);
         if (d_gate_vals_) cudaFree(d_gate_vals_);
         if (h_gate_) cudaFreeHost((void*) h_gate_);
+        if (h_done_seq_) cudaFreeHost((void*) h_done_seq_);
         if (refill_ev_) cudaEventDestroy(refill_ev_);
         if (stream_) cudaStreamDestroy(stream_);
         if (refill_) cudaStreamDestroy(refill_);
@@ -184,6 +189,10 @@ void PeerExperts::close() {
     d_sx_ = d_sh_ = nullptr;
     d_gate_vals_ = nullptr;
     h_gate_ = nullptr;
+    h_done_seq_ = nullptr;
+    d_done_seq_ = nullptr;
+    d_blocks_finished_ = nullptr;
+    seq_ = 0;
     stream_ = refill_ = nullptr;
     refill_ev_ = nullptr;
     device_ = -1;
@@ -250,12 +259,25 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
         ck(cudaHostAlloc((void**) &h_x_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "input staging", err) &&
         ck(cudaHostAlloc((void**) &h_out_, (size_t) CAP * H * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "result staging", err) &&
         ck(cudaHostAlloc(&h_meta_, sizeof(Meta), cudaHostAllocPortable | cudaHostAllocMapped), "plan staging", err) &&
+        ck(cudaHostGetDevicePointer(&d_meta_, h_meta_, 0), "plan dev ptr", err) &&
         ck(cudaMalloc((void**) &d_x_, (size_t) CAP * H * sizeof(float)), "input", err) &&
         ck(cudaMalloc((void**) &d_out_, (size_t) CAP * H * sizeof(float)), "result", err) &&
-        ck(cudaMalloc(&d_meta_, sizeof(Meta)), "plan", err) &&
         ck(cudaMalloc((void**) &d_q8_, (size_t) CAP * (H / 32) * 36), "activations", err) &&
-        ck(cudaMalloc(&d_scratch_, scratch), "scratch", err);
+        ck(cudaMalloc(&d_scratch_, scratch), "scratch", err) &&
+        ck(cudaMalloc(&d_blocks_finished_, sizeof(int)), "blocks counter", err) &&
+        ck(cudaMemset(d_blocks_finished_, 0, sizeof(int)), "blocks counter zero", err);
     if (!alloc_ok) { close(); return false; }
+    void* hp_done = nullptr;
+    if (cudaHostAlloc(&hp_done, 64, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess &&
+        cudaHostGetDevicePointer((void**) &d_done_seq_, hp_done, 0) == cudaSuccess) {
+        h_done_seq_ = (volatile uint32_t*) hp_done;
+        *h_done_seq_ = 0;
+        seq_ = 0;
+    } else {
+        (void) cudaGetLastError();
+        h_done_seq_ = nullptr;
+        d_done_seq_ = nullptr;
+    }
     if (strata::kernels::cpu::hadamard_spec().any()) {   // APR: this device's copies of the sign vectors
         d_sx_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) H), (int) H);
         d_sh_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) ff), (int) ff);
@@ -364,8 +386,7 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * H) * sizeof(float));
     On on(device_);
     const cudaStream_t s = stream_;
-    if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * H) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err) ||
-        !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
+    if (!ck(cudaMemcpyAsync(d_x_, direct ? x : h_x_, (size_t) (n_tok * H) * sizeof(float), cudaMemcpyHostToDevice, s), "input", err))
         return false;
     Meta* dm = (Meta*) d_meta_;
     const auto& lay = strata::kernels::cpu::expert_layout();
@@ -382,26 +403,43 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         err = "peer experts: only native packs are supported";
         return false;
     }
+    ++seq_;
     if (direct) {   // the rows straight into the host `out` (zero-copy, coalesced float4 writes)
         try {
-            strata::kernels::scatter_rows_f32(d_out_, out, dm->out_row, rows, H, s);
+            if (d_done_seq_ != nullptr && d_blocks_finished_ != nullptr) {
+                strata::kernels::scatter_rows_and_signal_f32(d_out_, out, dm->out_row, rows, H, d_done_seq_, seq_, d_blocks_finished_, s);
+            } else {
+                strata::kernels::scatter_rows_f32(d_out_, out, dm->out_row, rows, H, s);
+                if (d_done_seq_ != nullptr) strata::kernels::signal_stream_done(d_done_seq_, seq_, s);
+            }
         } catch (const std::exception& e) { err = std::string("peer experts: scatter: ") + e.what(); return false; }
         launched_direct_ = true;
-        return true;
+    } else {
+        if (!ck(cudaMemcpyAsync(h_out_, d_out_, (size_t) rows * H * sizeof(float), cudaMemcpyDeviceToHost, s), "results", err))
+            return false;
+        if (d_done_seq_ != nullptr) strata::kernels::signal_stream_done(d_done_seq_, seq_, s);
     }
-    return ck(cudaMemcpyAsync(h_out_, d_out_, (size_t) rows * H * sizeof(float), cudaMemcpyDeviceToHost, s),
-              "results", err);
+    return true;
 }
 
 bool PeerExperts::finish(float* out, std::string& err) {
     if (launched_rows_ == 0) return true;
     ++launches;
     const auto t0 = std::chrono::steady_clock::now();
-    {
+    if (d_done_seq_ != nullptr) {
+        const uint32_t target = seq_;
+        while (*h_done_seq_ < target) {
+#if defined(_MSC_VER) || defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+#endif
+        }
+    } else {
         On on(device_);
-        // spin on the stream (a blocking sync would sleep the pool thread and wake it late)
         cudaError_t e;
         while ((e = cudaStreamQuery(stream_)) == cudaErrorNotReady) {
+#if defined(_MSC_VER) || defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+#endif
         }
         if (!ck(e, "finish", err)) return false;
     }

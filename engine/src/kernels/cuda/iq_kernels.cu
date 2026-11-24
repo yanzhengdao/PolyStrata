@@ -5936,6 +5936,49 @@ __global__ void __launch_bounds__(128) mmvq_slots_iq3_kernel(S slots, size_t row
 }
 #endif
 
+#if !defined(__HIPCC__)
+// mmvq_slots_kernel for MmvqSlots::lanes / MmvqIds::lanes (Inkling 2's cached experts, CUDA) in the formats whose
+// codebook stage_iq_grid puts in shared memory (IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S, IQ1_M).  mmvq_slots_kernel reads the
+// codebook from global memory and gives a block 4 rows; here a block of 4 warps stages it once and each warp takes
+// kLaneRows rows, so the copy is paid for 32 rows.  A row is row_dot_multi's for one column, which is row_dot's
+// arithmetic in its order (the same calls, lane-strided the same way, the same warp_sum), and the staged words are the
+// table's: mmvq_slots_kernel's bits.  STRATA_IQ_SLOT_LANES=0, STRATA_OLD_IQ_MMVQ=1 or STRATA_IQ_STAGE_GRID=0 keep
+// mmvq_slots_kernel (and so do the cards slot_lanes_on() has not been checked on).  Ported from our PR 200's a4fa51021 / 2b5363d88.
+constexpr int kLaneRows = 8;
+template<int TY, typename S>
+__global__ void __launch_bounds__(128) mmvq_slots_staged_kernel(S slots, size_t row_bytes, int n_in, int n_out) {
+    STRATA_SHARED_ALIGN16_U32(s_grid_buf, IqGridWords<TY, true>::value);
+    const uint32_t* s_grid = stage_iq_grid<TY, true>(s_grid_buf, threadIdx.y * 32 + threadIdx.x, 128);
+    const SlotPtrs at = slot_ptrs(slots, int(blockIdx.y));
+    const int lane = threadIdx.x, nb = n_in / Fmt<TY>::qk;
+    const int off[1] = {0};
+    for (int r = 0; r < kLaneRows; ++r) {
+        const int row = (blockIdx.x * 4 + threadIdx.y) * kLaneRows + r;
+        if (row >= n_out) return;   // whole warps, and no barrier after the staging
+        float s[1];
+        row_dot_multi<TY, 1, true, true>((const uint8_t*) at.w + (size_t) row * row_bytes, (const block_q8_1*) at.x,
+                                         off, 1, nb, lane, s, s_grid);
+        if (lane == 0) at.y[row] = s[0];
+    }
+}
+// The same bits are shown on sm_75 (Turing; poly_iq_slot_lanes_test), so unset it is on there only, and the other
+// cards keep mmvq_slots_kernel until they are checked, as iq3_lanes_on() does for the IQ3 kernels.
+// STRATA_IQ_SLOT_LANES=0 keeps mmvq_slots_kernel on every card, =1 takes the lane kernel on every card.
+// Decided once a process, by the card current at the first launch.
+bool slot_lanes_on() {
+    static const bool on = [] {
+        if (const char* v = std::getenv("STRATA_IQ_SLOT_LANES"); v && *v) return v[0] != '0';
+        int dev = 0, major = 0, minor = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess)
+            return false;
+        return major == 7 && minor == 5;
+    }();
+    return on;
+}
+#endif
+
 template<typename S>
 void slots_of(int t, const S& slots, int count, int n_in, int n_out, void* stream) {
     const size_t rb = iq_row_bytes(t, n_in);
@@ -5946,6 +5989,22 @@ void slots_of(int t, const S& slots, int count, int n_in, int n_out, void* strea
         const dim3 g4((unsigned) ((n_out + 4 * R - 1) / (4 * R)), (unsigned) count);
         if (t == 21) mmvq_slots_iq3_kernel<21, R, S><<<g4, block, 0, (cudaStream_t) stream>>>(slots, rb, n_in, n_out);
         else mmvq_slots_iq3_kernel<18, R, S><<<g4, block, 0, (cudaStream_t) stream>>>(slots, rb, n_in, n_out);
+        check("iq_mmvq_slots");
+        return;
+    }
+#endif
+#if !defined(__HIPCC__)
+    if ((t == 16 || t == 17 || t == 22 || t == 29 || t == 19) && slots.lanes && !g_old_kernels && g_stage_grid &&
+        slot_lanes_on()) {
+        const dim3 g8((unsigned) ((n_out + 4 * kLaneRows - 1) / (4 * kLaneRows)), (unsigned) count);
+        const cudaStream_t s = (cudaStream_t) stream;
+        switch (t) {
+        case 16: mmvq_slots_staged_kernel<16, S><<<g8, block, 0, s>>>(slots, rb, n_in, n_out); break;
+        case 17: mmvq_slots_staged_kernel<17, S><<<g8, block, 0, s>>>(slots, rb, n_in, n_out); break;
+        case 22: mmvq_slots_staged_kernel<22, S><<<g8, block, 0, s>>>(slots, rb, n_in, n_out); break;
+        case 29: mmvq_slots_staged_kernel<29, S><<<g8, block, 0, s>>>(slots, rb, n_in, n_out); break;
+        default: mmvq_slots_staged_kernel<19, S><<<g8, block, 0, s>>>(slots, rb, n_in, n_out); break;
+        }
         check("iq_mmvq_slots");
         return;
     }

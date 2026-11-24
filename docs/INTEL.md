@@ -153,7 +153,7 @@ with Coder IQ1_M 1,024 MiB fits all 12,288 experts with 2 GB of VRAM free.
   (for example `sudo xpu-smi` from a fan/temperature logger or dashboard) submits a render job that forces running compute
   kernels to yield within `preempt_timeout_us` (default `640000`, 640 ms). If a long prefill or verify kernel cannot yield
   in time, GuC resets the compute engine (`Engine reset: engine_class=ccs`) and Level Zero returns
-  `UR_RESULT_ERROR_DEVICE_LOST`. Run `xpu-smi` unprivileged (or stop root GPU polling while Strata is running), and
+  `UR_RESULT_ERROR_DEVICE_LOST`. Run `xpu-smi` unprivileged (or stop root GPU polling while PolyStrata is running), and
   optionally raise the compute preemption timeout before starting the engine:
   `echo 10000000 > /sys/class/drm/cardN/device/tile0/gt0/engines/ccs/preempt_timeout_us`.
 - **JIT builds** add `-ze-opt-greater-than-4GB-buffer-required` so kernels keep 64-bit addresses past 4 GiB into an allocation.

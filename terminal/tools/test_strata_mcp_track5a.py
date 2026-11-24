@@ -1,6 +1,6 @@
 """Regression tests for Track 5A MCP/Control fixes in `terminal/tools/strata_mcp.py`:
 - Issue #6518: `files_here()` falls back to `S.file_pin(S.model_hf(fam, model) + path.name)` for families without a `sha256` table (`qwen`, `swift`, `coder`, `nvfp4`) while keeping `S.fam_pin()` first, exact-size checks, `.part` rejection, and unknown-pin rejection.
-- Issue #6475: `Strata.ports()` stops endlessly probing `127.0.0.1:8080` when Strata models use other ports or once 8080 answered as non-Strata, and honors `STRATA_MODEL_PORT` and `STRATA_NO_DEFAULT_PORT`.
+- Issue #6475: `Strata.ports()` stops endlessly probing `127.0.0.1:8080` when PolyStrata models use other ports or once 8080 answered as non-PolyStrata, and honors `STRATA_MODEL_PORT` and `STRATA_NO_DEFAULT_PORT`.
 """
 
 from __future__ import annotations
@@ -159,14 +159,14 @@ class PortsNo8080Spam6475(unittest.TestCase):
                 mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("STRATA_MODEL_PORT", None)
             os.environ.pop("STRATA_NO_DEFAULT_PORT", None)
-            # First status poll sees the non-Strata listener once and caches it.
+            # First status poll sees the non-PolyStrata listener once and caches it.
             st1 = self.tools.strata_status(hardware=False)
             self.assertEqual(st1["ports_used_by_other_programs"][0]["port"], fake_default)
             self.assertEqual(hits["count"], 1)
-            # Subsequent status polls do NOT hit the non-Strata listener again.
+            # Subsequent status polls do NOT hit the non-PolyStrata listener again.
             st2 = self.tools.strata_status(hardware=False)
             st3 = self.tools.strata_status(hardware=False)
-            self.assertEqual(hits["count"], 1, "must stop re-probing non-Strata fallback port")
+            self.assertEqual(hits["count"], 1, "must stop re-probing non-PolyStrata fallback port")
             self.assertNotIn("ports_used_by_other_programs", st2)
             self.assertNotIn("ports_used_by_other_programs", st3)
             # Explicit port=... still probes it.

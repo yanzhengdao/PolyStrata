@@ -208,6 +208,9 @@ struct Layer {
     std::vector<void*> card_moe;       ///< the routed experts, routed on the card (moe_card())
     /// the head of step()'s rows in one call (Engine::batch_heads()): by the rows, their sequences and head keys
     std::map<std::vector<int>, void*> rows_heads;
+    /// the tail of step()'s rows in one call, where it reads them too (Engine::tail_by_rows()): by the rows, their
+    /// sequences and the tail key
+    std::map<std::vector<int>, void*> rows_tails;
 };
 
 /// A routed expert is run from the VRAM cache or on the CPU when tokens come a few at a time, as an answer's do
@@ -360,7 +363,11 @@ public:
     int32_t picked(int i) const;
     /// The same for the next eval() of one token with its logits: picked(0) is its most likely token, and logits()
     /// are not copied to the host (Inkling 2's 201,024 scores are 0.8 MB to copy and to search a token).
-    void eval_picks() { eval_picks_ = !next_; }
+    /// On a layer split the last card picks: it has the logits.
+    void eval_picks() {
+        if (next_) next_->eval_picks();
+        else eval_picks_ = true;
+    }
     void keep(int n);
 
     /// Some files carry a block that guesses ahead: one layer that takes a token and the model's output for the
@@ -535,6 +542,9 @@ protected:
     /// buffers of them at a call's: carry_rows() blocks of rows_ rows each from `at`, or back at its own with null.
     virtual int carry_rows() const { return 0; }
     virtual void carry_at(float* at) { (void) at; }
+    /// The architecture's block i of those rows as they are now (carry_at()), rows_ rows.  On a layer split they cross
+    /// to the next card beside the rows of r_ (carry_out(), carry_in()).
+    virtual float* carried(int i) { (void) i; return nullptr; }
     /// A token's experts outside VRAM may go to the host's threads through the doorbell (h_bell_): the architecture
     /// routes on the card (route_card()) and sums a token's experts in moe_card() when moe_sum_later() is false.
     virtual bool bells() const { return false; }
@@ -625,6 +635,10 @@ protected:
     /// state and attention rows from its own sequence (rows_of_, seq_state(), seq_buf()), its position from at_.
     /// Otherwise step() runs the head a row at a time, with the row's sequence bound.
     virtual bool batch_heads() const { return false; }
+    /// With batch_heads(): layer_tail() takes step()'s rows too (rows_of_ set), for a recurrent state of each row's
+    /// own sequence after the experts (Inkling 2's convolution of the experts' sum).  step() then records a tail by
+    /// its rows' sequences, as a head, and does not split the rows into halves.
+    virtual bool tail_by_rows() const { return false; }
     /// The architecture's step() rows leave the recurrent state after a row at Row::snap (step() with guesses).
     virtual bool rows_snaps() const { return false; }
     /// While step() runs a head in one call: each row's sequence and position, row after row; else null.  snap: for
@@ -663,6 +677,10 @@ protected:
     /// The rows a call of n tokens leaves in r_, to h (pinned) for the next card's engine, which goes on from them.
     void hand_on(int64_t pos, int n, float* h);
     float* pass_rows(int n);
+    /// The carried rows (carry_rows()) of a call's n tokens to h, behind their rows of r_ there, for the next card;
+    /// and on that card, the ones of its call of n tokens from row `from` of what the card before handed on.
+    void carry_out(float* h, int n);
+    void carry_in(int64_t from, int n);
     /// kGuessMat: quantized again to guess_type_ (Q4_0, Q5_0 or IQ4_NL), for a matrix only guesses are made with: a
     /// guess is checked, so a less exact one costs a wrong guess now and then and no token.  (Inkling 2 reads its
     /// attention's matrices so with --attn-requant: inkling2.cpp.)
@@ -728,6 +746,13 @@ protected:
     void moe_add(int n);
     template <class F>
     void* record(F&& work);
+    // step()'s recordings where the tails take the rows (tail_by_rows(): Inkling 2).  They are keyed by the rows'
+    // sequences and rooms, so slots that come and go make more of them for as long as the engine runs: at most
+    // step_cap_ are held, the least recently launched dropped first (trim_step_graphs()), and a recording the card has
+    // no memory for runs unrecorded (record_step()).  The other families' step() records as before.
+    bool step_replay(std::map<std::vector<int>, void*>& in, const std::vector<int>& key, const std::function<void()>& work);
+    void* record_step(const std::function<void()>& work);
+    void trim_step_graphs(size_t keep, bool all);
     void moe_rows(Layer& L, int il, int n);
     void stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone = false);
     void stage_rest(const Layer& L, const int32_t* experts, const std::vector<int>& which, int m, void* stream,
@@ -752,6 +777,7 @@ protected:
     GatherPiece* gather_slot();
     void vram_ahead(int j, int n, size_t part);
     const uint8_t* ahead_of(int il, int e, unsigned& read);
+    bool up_busy() const;   ///< up_ has uploads ahead still to copy (up_last_)
     void mind_memory();
     void follow(int written);
     void follow_loop();
@@ -867,6 +893,7 @@ protected:
     int64_t read_draft_calls_ = 0;               ///< read_draft_calls_for_test()
     const float* pass_ = nullptr;
     int64_t pass_at_ = 0;
+    int pass_n_ = 0;                      ///< the rows the card before handed on at pass_ (carry_in())
     float* h_pass_ = nullptr;             ///< pinned; h_pass_rows_ tokens' rows
     int h_pass_rows_ = 0;
     mutable Stats all_stats_;             ///< stats() of every card's engine together
@@ -912,6 +939,7 @@ protected:
     static constexpr int kAheadGroups = 6, kAheadGuesses = 4;
     Ahead ahead_[kAheadGroups + 1];   ///< and last, the misses a call uploads for itself (moe())
     int ahead_turn_ = 0, ahead_slots_ = 0;
+    void* up_last_ = nullptr;   ///< the `up` of the last uploads ahead put on up_
     size_t ahead_stride_ = 0;
     std::atomic<bool> map_quit_{false};
     /// Options::lock_experts without the mirror: the experts whose pages are locked (layer * n_expert + expert), first
@@ -935,6 +963,15 @@ protected:
                                                  ///< every layer's head_key()
     /// step()'s layers and logits recorded as one: by its rows, each row's sequence, guess and head_key()s
     std::map<std::vector<int>, void*> step_passes_;
+    /// step_replay()'s recordings: the step that last launched each one (step_no_)
+    std::map<void*, uint64_t> step_used_;
+    uint64_t step_no_ = 0;          ///< step()s so far
+    uint64_t step_rec_retry_ = 0;   ///< after a recording the card had no memory for: none before this step
+    uint64_t step_tries_ = 0;       ///< record_step()'s instantiations (STRATA_POLY_STEP_RECORD_FAIL)
+    size_t step_cap_ = 0;           ///< the most step_used_ holds (STRATA_POLY_STEP_GRAPHS; 0 until the first)
+    size_t step_bytes_ = 0;         ///< what cudaMemGetInfo() lost to them before the first drop (for the log)
+    size_t step_made_ = 0, step_dropped_ = 0, step_unrecorded_ = 0, step_logged_ = 0;
+    bool in_step_ = false;          ///< inside step(): record() keeps this step's step recordings
     void* tail_ = nullptr;        ///< one token's launches from the last layer to the logits, recorded
     void* tail_picks_ = nullptr;  ///< the same, the most likely token in place of the logits (eval_picks())
     // A recorded launch cannot be given the position as an argument: it reads it here when it runs.  eval() writes
@@ -992,6 +1029,11 @@ protected:
     /// a prompt batch's products go through guard_half_sums(): the model's activations can sum past a half's range
     /// in a block.  Off for the models whose sums stay in range: it cost LFM2.5 4% of a 30K prompt's read on a 5090.
     bool half_sum_guard_ = false;
+    /// In a read of several calls, moe_rows() hands the card a call's row tables by a kernel that reads them from
+    /// pinned memory (copy2()), not by a copy: the copies to the card go one after the other, and a call's tables
+    /// (about 100 KB) waited behind the layer's experts on their way to the staging buffer.  Inkling 2's on CUDA
+    /// unless STRATA_INK_KERNEL_TABLES=0, else off.
+    bool kernel_tables_ = false;
 
     std::vector<Layer> layers_;   ///< the model's, and after them the draft block
     Dev out_norm_, output_;
@@ -1138,6 +1180,9 @@ protected:
     int32_t* d_ids_ = nullptr;                    ///< a batch's experts and weights when it routes on the card
     float* d_wts_ = nullptr;
     int32_t* h_ids_ = nullptr;                    ///< pinned: the experts, back from the card
+    float* h_wts_ = nullptr;                      ///< pinned: their weights, for step()'s rows (bells(), --batch)
+    /// While moe() takes step()'s rows: their picks from the card (h_ids_, h_wts_), as a token alone routes there
+    const int32_t* step_ids_ = nullptr;
     void** d_slots_ = nullptr;                    ///< every layer's L.slot on the card, n_expert_ a layer (moe_card())
     std::vector<void*> h_slots_;                  ///< what d_slots_ holds
     // card_far_: with most experts cached, a few tokens route on the card even so (card_moe()), and a call's experts

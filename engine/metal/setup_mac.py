@@ -256,7 +256,7 @@ VISION_EXE = ROOT / "build-vision" / "bin" / "strata-vision"
 
 
 def build_vision(llama: Path) -> Path:
-    """strata-vision (terminal/tools/vision: Strata's own vision towers, no llama.cpp or ggml), with the towers' Metal
+    """strata-vision (terminal/tools/vision: the Strata project's own vision towers, no llama.cpp or ggml), with the towers' Metal
     kernels: --gpu reads the picture on the GPU, and without it the same program reads on the CPU."""
     stamp = ROOT / "build-vision" / "BUILD.json"
     src = source_digest()

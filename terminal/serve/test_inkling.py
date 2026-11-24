@@ -126,6 +126,16 @@ class Blocks(unittest.TestCase):
                 self.assertEqual([e.call.arguments for e in evs if e.kind == "tool_call"], [{"code": code}] * 2)
                 self.assertEqual(said(evs, "content"), "Rome")
 
+    def test_text_written_right_after_the_block_start_shows_no_tags(self):
+        # #283: after the budget's wrap-up opened a block, the model wrote its answer with no <|content_text|>
+        for step in (1, 3, 1000):
+            with self.subTest(step=step):
+                evs = read(THINK + "<|message_model|> there! Happy to help.\nMore." + END + STOP, step)
+                self.assertEqual(said(evs, "content"), " there! Happy to help.\nMore.")
+                self.assertEqual(said(evs, "content") + said(evs, "reasoning"),
+                                 said(evs, "content").replace("<|", "") + said(evs, "reasoning"))
+                self.assertEqual(said(read("<|message_model|>Rome" + END, step), "content"), "Rome")
+
     def test_a_reply_whose_text_block_the_prompt_opened(self):
         evs = read("Rome" + END + STOP, 3, opened=True)
         self.assertEqual((said(evs, "reasoning"), said(evs, "content")), ("", "Rome"))
@@ -237,6 +247,21 @@ class ServiceForInkling(unittest.TestCase):
         self.assertEqual((p.state, p.clean), ("content", True))     # between blocks
         p.feed("<|message_model|><|content_text|>y")
         self.assertEqual(p.state, "text")                            # not inside a text block
+
+    def test_the_thinking_budget_closes_the_thinking_block(self):
+        # #273: the budget used to be dropped for Inkling 2, so a model that thought in circles wrote until max_tokens
+        # and the reply had no answer.  At the budget the server ends the thinking block as the model would and opens
+        # the next one; the model writes the text block.
+        ids = self.svc.encode_prompt(self.chat, None, {})
+        self.svc.engine = MockEngine(self.tok, ["<|message_model|><|content_thinking|>" + "round and round " * 20,
+                                                "<|content_text|>Rome" + END + STOP])
+        evs = [e for kind, e in self.svc.run(ids, True, None, 512, {"reasoning_budget_tokens": 40}, threading.Event())
+               if kind == "event"]
+        written = self.tok.decode(self.svc.engine.last_prompt[len(ids):])
+        self.assertTrue(written.endswith(END + "<|message_model|>"), written[-80:])
+        self.assertNotIn("</think>", written)
+        self.assertEqual(said(evs, "content"), "Rome")
+        self.assertNotIn("</think>", said(evs, "reasoning"))
 
     def test_reasoning_tokens_are_the_thinking_block_s(self):
         # PR 212: the text block's tokens are not thinking tokens (usage's reasoning_tokens)

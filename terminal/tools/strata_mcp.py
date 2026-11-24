@@ -734,7 +734,7 @@ class Strata:
         # tests: the interpreter that runs setup / the server. The app's Control runs the installer on its own Python.
         self.python_override: str | None = sys.executable if CONTROL else None
         self.health_timeout = 2.0
-        self._non_strata_ports: set[int] = set()        # #6475: unconfigured fallback ports that already answered as non-Strata
+        self._non_strata_ports: set[int] = set()        # #6475: unconfigured fallback ports that already answered as non-PolyStrata
 
     # ---- setup.py's own tables and logic
     def setup_module(self):
@@ -1710,8 +1710,8 @@ class Strata:
             if explicit not in ps and explicit not in self._non_strata_ports:
                 ps.append(explicit)
         elif not ps and not self.no_default_port():
-            # #6475: only probe DEFAULT_PORT (8080) as a fallback when no Strata configs/servers name other ports,
-            # STRATA_NO_DEFAULT_PORT is not set, and 8080 has not already answered as a non-Strata listener.
+            # #6475: only probe DEFAULT_PORT (8080) as a fallback when no PolyStrata configs/servers name other ports,
+            # STRATA_NO_DEFAULT_PORT is not set, and 8080 has not already answered as a non-PolyStrata listener.
             if DEFAULT_PORT not in self._non_strata_ports:
                 ps.append(DEFAULT_PORT)
         return list(dict.fromkeys(int(p) for p in ps))

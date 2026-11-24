@@ -3523,12 +3523,17 @@ class InklingOutputParser(OutputParser):
                 continue
             if self.mode == "header":
                 found = [(s.find(tag), tag) for tag in INK_KINDS if s.find(tag) >= 0]
+                # #283: a header is a tool's name, with no space and no block end in it.  A model that writes its
+                # answer right after <|message_model|> (the thinking budget's wrap-up opens the next block and leaves
+                # its kind to the model) is writing a text block: read it as one, so no tag reaches the reply.
+                cut = min((i for i in (next((i for i, c in enumerate(s) if c.isspace()), -1), s.find(INK_END),
+                                       s.find(INK_STOP)) if i >= 0), default=-1)
+                if cut >= 0 and (not found or cut < min(found)[0]):
+                    self.mode, self.header = "content", ""
+                    continue
                 if not found:
-                    if final or len(s) > INK_HEADER_MAX:       # no block follows: the text as it was written
-                        out.append(Event("content", INK_MSG + s))
-                        self.ink, self.mode = "", "between"
-                        if final:
-                            return out
+                    if final or len(s) > INK_HEADER_MAX:       # no block follows: the text of a text block
+                        self.mode, self.header = "content", ""
                         continue
                     return out
                 at, tag = min(found)

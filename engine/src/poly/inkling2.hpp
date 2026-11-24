@@ -58,11 +58,17 @@ protected:
     bool whole_pdl() const override { return true; }
     int head_key(int il, int n) const override;
     int tail_key(int il, int n) const override;
+    // step()'s rows in one head: the products, mixes, norms, controllers and router for all of them, and what reads or
+    // writes a sequence's convolution states, attention caches or position a row at a time, the row's own sequence's
+    // (run_slot()).  The tail's convolution of the experts' sum is a row's own state too.
+    bool batch_heads() const override { return true; }
+    bool tail_by_rows() const override { return true; }
     bool reads_by_layer() const override { return false; }
     // A call's residual streams and the core's bank from one layer run to the next: read() takes the calls through
     // the runs a group at a time.  Not with the drafter, whose taps of three runs are a call's too.
     int carry_rows() const override { return ds_file_ ? 0 : kBlocks + 2; }
     void carry_at(float* at) override;
+    float* carried(int i) override;
     void save_run(int il, int64_t pos, uint8_t* dst) override;
     void output_rows(int first, int rows, float* h) override;
     void finish_logits(float* logits, int rows) override;
@@ -121,6 +127,9 @@ private:
     /// Where a window's first snapshot of the state at `past` goes (snap_at_ at its place in state_), or null.
     float* snap_of(const float* past) const { return snap_bits_ ? snap_at_ + (past - state_) : nullptr; }
     InkStates streams_of(int blocks, size_t at) const;
+    /// The slot of layer il's application under way: row i's own sequence's among step()'s rows (rows_of_), else the
+    /// bound sequence's.
+    Slot run_slot(int il, int i) const;
     /// Launches on side_ from here run beside the stream's, after what the stream has so far.
     void fork();
     /// The stream waits for what side_ has.
@@ -128,7 +137,7 @@ private:
     void control(const float* cur, const float* msg, const Ctrl& c, float* out, int n);
     bool control3(const float* const* cur, float* const* msg, const Ctrl* c, float* const* out, int n);
     bool project(const Block& B, const float* const* x, int n, bool quantized = false, bool* extras = nullptr);
-    bool control_ffn(const float* msg, const Ctrl& c, const Block& B);
+    bool control_ffn(const float* msg, const Ctrl& c, const Block& B, int row = 0);
     void guess_block(int32_t token) override;
     bool own_blocks() const override { return ds_file_ != nullptr; }
     // only where moe_card() and layer_tail() are recorded together (whole_rec_), and not with the doorbell, whose

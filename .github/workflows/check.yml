@@ -123,8 +123,9 @@ jobs:
       - name: Python packages
         run: python -m pip install -r terminal/requirements.txt -r terminal/requirements-dev.txt -r terminal/requirements-build.txt
       # tools/check finds Visual Studio's compiler itself (vcvars64.bat)
+      # --timeout-scale 1.5: tests/ took 59m28s of its 60 minutes here on 2026-11-23 and timed out on the next run
       - name: tools/check
-        run: python tools/check --only "${{ matrix.only }}" --keep --scratch "$env:RUNNER_TEMP\check" --json "$env:RUNNER_TEMP\check\result.json"
+        run: python tools/check --only "${{ matrix.only }}" --timeout-scale 1.5 --keep --scratch "$env:RUNNER_TEMP\check" --json "$env:RUNNER_TEMP\check\result.json"
       - name: Logs
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4

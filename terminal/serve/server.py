@@ -316,7 +316,7 @@ from serve.server_parts.openai_api import (  # noqa: F401  (moved unchanged, fil
     openai_collect,
 )
 from serve.frontend import (CALL_END, CALL_START, FUNC_END, FUNC_START, THINK_END, ChatTemplate, Event, OutputParser,  # noqa: E402
-                            InklingOutputParser, INK_TEXT_OPEN, inkling_forced_call,
+                            InklingOutputParser, INK_END, INK_MSG, INK_TEXT_OPEN, inkling_forced_call,
                             parser_for_template, anthropic_to_messages, anthropic_tools,
                             forced_call, gemma_model_turn, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)
@@ -5075,7 +5075,7 @@ class Service:
     )
 
     def check_model(self, req) -> dict | None:
-        """#6621: reject mismatched Strata catalog model IDs (e.g. requesting `inkling-2-mini-sq-10` while Qwen is
+        """#6621: reject mismatched PolyStrata catalog model IDs (e.g. requesting `inkling-2-mini-sq-10` while Qwen is
         loaded) and, when strict_model is enabled (--strict-model / strict_model: true / STRATA_STRICT_MODEL=1), any
         unrecognized model ID.  Generic client placeholders ('gpt-4', 'x', etc.) stay accepted by default (#297)."""
         asked = req.get("model") if isinstance(req, dict) else None
@@ -6401,7 +6401,6 @@ class Service:
         opened = bool(self.think_open_ids) and ids[-len(self.think_open_ids):] == self.think_open_ids
         if self.text_open_ids:                          # Inkling 2: the prompt opened the reply's text block
             opened = ids[-len(self.text_open_ids):] == self.text_open_ids
-            budget = None                               # its thinking is a block of its own: no </think> to close it with
         parser = self.parser_cls(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
                                  recover=self.tool_call_recovery, declared_only=declared_only,
                                  deferred=deferred or self.undeclared_tool_calls == "call",   # #4622: opt-in, as for a deferred tool
@@ -6576,7 +6575,8 @@ class Service:
                     if (budget and getattr(self.engine, "can_hold", False) is True
                             and (not getattr(self.engine, "batch", 0) or getattr(self.engine, "can_hold_batch", False) is True)
                             and getattr(self.engine, "split_engine", False) is not True
-                            and getattr(self.engine, "hy4_engine", False) is not True):   # (the split & Hy4 parsers refuse hold=)
+                            and getattr(self.engine, "hy4_engine", False) is not True     # (the split & Hy4 parsers refuse hold=)
+                            and self.call_format != "inkling"):     # Inkling 2's thinking ends with no </think> to hold on
                         te = self.tok.encode(THINK_END, parse_special=True)
                         hold_end = te[0] if len(te) == 1 else None
                     for ev in opening:
@@ -6835,7 +6835,14 @@ class Service:
                         # thinking ended, after the blank line the template puts before a call.
                         if wrap:
                             budget = st["thinking_budget"] = None
-                            text = closed_with(REASONING_WRAP_UP, parser.think_end) + (force or "")
+                            if self.call_format == "inkling":
+                                # #273: Inkling 2's thinking is a block of its own.  End it as the model does and open
+                                # the next one, whose kind (text, or a call's tool name) the model writes; a forced
+                                # call's opening starts with that INK_MSG itself.
+                                text = (REASONING_WRAP_UP.partition("\n" + THINK_END)[0] + INK_END
+                                        + (force or INK_MSG))
+                            else:
+                                text = closed_with(REASONING_WRAP_UP, parser.think_end) + (force or "")
                         elif self.call_format == "inkling":     # a block of its own: no blank line before it
                             text = force
                         else:

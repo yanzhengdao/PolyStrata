@@ -1,7 +1,7 @@
 """The Hy4-Flash engine as serve sees it: another engine program (`strata-hy4`) behind the same `--serve` line protocol, with its own short list of arguments.
 
 Everything serve adds to a Flash-Next start (the drafter's flags, the card-fit rules, `--vram-reserve-mib`, `--resident-budget-gib`, `--pool-workers`, `--batch`, the expert profile,
-the saved tuning) is a flag of the Strata engine that strata-hy4 does not have, and it refuses a flag it does not know.  So for this engine `engine_args` returns the config's own
+the saved tuning) is a flag of the Strata project's Flash-Next engine that strata-hy4 does not have, and it refuses a flag it does not know.  So for this engine `engine_args` returns the config's own
 arguments plus the few it owns, and every step that would rewrite them is skipped by one test, `is_hy4(cfg)`: a config of any other engine takes exactly the path it took before.
 """
 from __future__ import annotations
@@ -47,7 +47,7 @@ def is_hy4_model_path(path) -> bool:
 
 NO_DRAFTER_NOTE = "Hy4-Flash: this engine has no drafter (DFly2) yet, so it starts without it"
 NO_IMAGES_NOTE = "Hy4-Flash: this engine does not read images yet, so it starts without the image reader"
-NO_IMAGES_REPLY = ("this Hy4-Flash engine does not read images yet; send the text of the picture, or update Strata (an engine that reads images says images=1 at its start)")
+NO_IMAGES_REPLY = ("this Hy4-Flash engine does not read images yet; send the text of the picture, or update PolyStrata (an engine that reads images says images=1 at its start)")
 _PROBES: dict = {}
 
 

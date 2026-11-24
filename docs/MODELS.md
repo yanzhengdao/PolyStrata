@@ -245,8 +245,8 @@ START-HERE.bat --setup --family qwen36-strata --model UD-Q4_K_XL        # Linux 
 
 ## Tencent Hy4-Flash
 
-[Tencent Hy4-Flash](https://huggingface.co/tencent/Hy4-flash) runs on its dedicated Strata shape engine (`strata-hy4`) using
-[Strata's native `.strata` quantizations](https://huggingface.co/strata-engine/Hy4-Flash-Strata). It includes the built-in DFly2
+[Tencent Hy4-Flash](https://huggingface.co/tencent/Hy4-flash) runs on the Strata project's dedicated shape engine (`strata-hy4`) using
+[its native `.strata` quantizations](https://huggingface.co/strata-engine/Hy4-Flash-Strata). It includes the built-in DFly2
 drafter, reads pictures (`Hy4-Flash-Vision.strata`, 0.93 GB), and streams its 67.6 GB Engram lookup shard (`Hy4-Flash-Engram-Q8.strata`)
 directly from the SSD.
 

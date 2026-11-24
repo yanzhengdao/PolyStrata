@@ -863,13 +863,10 @@ __global__ void ink_head_rms_kernel(float* x, int dim, int heads, float eps) {
     rms_head(x + size_t(blockIdx.x) * dim, dim, eps, part);
 }
 
-__global__ void ink_conv_add_kernel(const float* x, float* state, const float* __restrict__ w,
-                                    float* __restrict__ out, float* acc, float* keep, float a, int mode, int channels,
-                                    int taps, float norm) {
-    pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
-    pdl_wait();
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= channels) return;
+// ink_conv_add()'s channel c of one token
+__device__ __forceinline__ void conv_add_at(const float* x, float* state, const float* __restrict__ w,
+                                            float* __restrict__ out, float* acc, float* keep, float a, int mode,
+                                            int channels, int taps, float norm, int c) {
     const float y = conv_value(x, state, w, nullptr, channels, 1, taps, 0, c, norm);
     out[c] = y;
     conv_state_at(x, state, channels, taps, 1, c);
@@ -879,6 +876,29 @@ __global__ void ink_conv_add_kernel(const float* x, float* state, const float* _
         if (mode == 1) keep[c] = acc[c];
         acc[c] = y;
     }
+}
+
+__global__ void ink_conv_add_kernel(const float* x, float* state, const float* __restrict__ w,
+                                    float* __restrict__ out, float* acc, float* keep, float a, int mode, int channels,
+                                    int taps, float norm) {
+    pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    conv_add_at(x, state, w, out, acc, keep, a, mode, channels, taps, norm, c);
+}
+
+// ink_conv_add_rows(): token blockIdx.y's channels, a row of them on, with its own state
+__global__ void ink_conv_add_rows_kernel(const float* x, InkStateRows state, const float* __restrict__ w,
+                                         float* __restrict__ out, float* acc, float* keep, float a, int mode,
+                                         int channels, int taps, float norm) {
+    pdl_trigger();
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const size_t t = size_t(blockIdx.y) * channels;
+    conv_add_at(x + t, state.p[blockIdx.y], w, out + t, acc + t, keep ? keep + t : nullptr, a, mode, channels, taps,
+                norm, c);
 }
 
 __global__ void ink_moe_conv_add_kernel(const float* x, const float* w, const float* __restrict__ scale,
@@ -908,11 +928,7 @@ struct QkvArgs {
 
 // ink_qkv(): blocks [0, n_head) Q's heads, then K's n_kv, V's n_kv, and the relative positions' n_head; 128 threads.
 template <int KV>
-__global__ void ink_qkv_kernel(QkvArgs g) {
-    pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
-    pdl_wait();
-    __shared__ float part[128 / WARP];
-    const InkQkv& a = g.a;
+__device__ __forceinline__ void qkv_block(const InkQkv& a, float k_norm, float v_norm, float* part) {
     const long long p = a.at ? a.at[0] : (long long) a.pos;
     int b = blockIdx.x;
     if (b < a.n_head) {
@@ -930,7 +946,7 @@ __global__ void ink_qkv_kernel(QkvArgs g) {
         if (i < a.dim) {
             const int c = h * a.dim + i;
             out[c] = conv_value(x, state, is_v ? a.vw : a.kw, is_v ? a.vdyn : a.kdyn, channels, a.n_kv, a.taps, 0, c,
-                                is_v ? g.v_norm : g.k_norm);
+                                is_v ? v_norm : k_norm);
             conv_state_at(x, state, channels, a.taps, 1, c);
         }
         float* head = out + size_t(h) * a.dim;
@@ -945,6 +961,39 @@ __global__ void ink_qkv_kernel(QkvArgs g) {
     b -= 2 * a.n_kv;
     clip_head(a.r + size_t(b) * a.n_rel, a.r_scale ? a.r_scale + size_t(b) * a.n_rel : nullptr, a.rel_thr, a.n_rel,
               a.alpha, a.floor, p, part);
+}
+
+template <int KV>
+__global__ void ink_qkv_kernel(QkvArgs g) {
+    pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
+    pdl_wait();
+    __shared__ float part[128 / WARP];
+    qkv_block<KV>(g.a, g.k_norm, g.v_norm, part);
+}
+
+// ink_qkv_rows(): token blockIdx.y's blocks, its rows of the products and outputs, its states, caches and position
+template <int KV>
+__global__ void ink_qkv_rows_kernel(QkvArgs g, InkQkvRows r) {
+    pdl_trigger();
+    pdl_wait();
+    __shared__ float part[128 / WARP];
+    const int t = blockIdx.y;
+    InkQkv a = g.a;
+    const size_t kv = size_t(a.n_kv) * a.dim, dyn = size_t(a.taps) * a.n_kv;
+    a.q += size_t(t) * a.n_head * a.dim;
+    a.r += size_t(t) * a.n_head * a.n_rel;
+    a.kraw += t * kv;
+    a.vraw += t * kv;
+    if (a.kdyn) a.kdyn += t * dyn;
+    if (a.vdyn) a.vdyn += t * dyn;
+    a.k += t * kv;
+    a.v += t * kv;
+    a.kstate = r.kstate[t];
+    a.vstate = r.vstate[t];
+    a.keys = r.keys[t];
+    a.vals = r.vals[t];
+    a.at += 2 * t;
+    qkv_block<KV>(a, g.k_norm, g.v_norm, part);
 }
 
 __global__ void ink_mul_sigmoid_kernel(float* x, const float* __restrict__ gate, size_t n) {
@@ -1017,6 +1066,70 @@ __device__ __forceinline__ void lane_halves(const __half* head, int lane, int n,
         if (2 * c < n) f = __half22float2(p[c]);
         out[2 * c] = f.x;
         out[2 * c + 1] = f.y;
+    }
+}
+
+// The scores of a token's heads on one key head (blockIdx.x) against a block of keys (blockIdx.y).  A warp has
+// kScoreKeys keys, one at a time: its lanes read the key side by side, once for all of the group's heads, and
+// their products with the queries are summed across the warp.  The bias's products are the first n_rel lanes'.
+// t0 is the launch's first token among the call's, nk_max the scores a head has room for.  ink_attend_rows()'s path
+// (ink_score_rows_kernel); ink_attend() takes ink_score_kernel below, the same bits a key in fewer instructions.
+template <int KV>
+__device__ __forceinline__ void score_block(const InkAttn& a, const void* keys, int t0, int nk_max) {
+    __shared__ float qs[kMaxPer * 128];
+    __shared__ float rs[kMaxPer * 32];
+    __shared__ float sinks[kMaxPer];
+    const int per = a.n_head / a.n_kv, lh = a.dim / 32;
+    const int tt = blockIdx.x / a.n_kv, g = blockIdx.x % a.n_kv, t = t0 + tt;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const long long p = a.at ? a.at[2 * t] : a.pos + t;
+    const long long lo = a.window > 0 ? (p - a.window + 1 > 0 ? p - a.window + 1 : 0) : 0;
+    const int nk = (int) (p - lo + 1);
+    if ((int) (blockIdx.y * kScoreWarps * kScoreKeys) >= nk) return;   // (the whole block)
+    const size_t head0 = size_t(t) * a.n_head + size_t(g) * per;       // the group's heads lie together
+    for (int i = tid; i < per * a.dim; i += blockDim.x) qs[i] = a.q[head0 * a.dim + i] * a.scale;
+    for (int i = tid; i < per * a.n_rel; i += blockDim.x) rs[i] = a.r[head0 * a.n_rel + i];
+    if (tid < per) sinks[tid] = a.sink[head0 + tid];
+    __syncthreads();
+    const int j0 = (blockIdx.y * kScoreWarps + warp) * kScoreKeys, j1 = j0 + kScoreKeys < nk ? j0 + kScoreKeys : nk;
+    if (j0 >= nk) return;   // (a whole warp)
+    float q[kMaxPer][kLaneHalves], r[kMaxPer];
+#pragma unroll
+    for (int hp = 0; hp < kMaxPer; ++hp) {
+#pragma unroll
+        for (int c = 0; c < kLaneHalves; ++c) q[hp][c] = hp < per && c < lh ? qs[hp * a.dim + lane * lh + c] : 0.0f;
+        r[hp] = hp < per && lane < a.n_rel ? rs[hp * a.n_rel + lane] : 0.0f;
+    }
+    float* s = a.score + (size_t(tt) * a.n_head + size_t(g) * per) * nk_max;
+    // the warp's keys and their bias values first, so that their reads are on their way together (the scores'
+    // stores between them could be to the same memory, as far as the compiler knows)
+    float k[kScoreKeys][kLaneHalves], rb[kScoreKeys];
+    long long row = a.ring > 0 ? (lo + j0) % a.ring : lo + j0;
+#pragma unroll
+    for (int u = 0; u < kScoreKeys; ++u) {
+        if (j0 + u < j1) {
+            if (KV == kKvFp8) lane_fp8(keys, row, a.n_kv, a.dim, g, lane, lh, k[u]);
+            else if (KV == kKvQ8) lane_q8(keys, row, a.n_kv, a.dim, g, lane, lh, k[u]);
+            else lane_halves((const __half*) keys + (size_t(row) * a.n_kv + g) * a.dim, lane, lh, k[u]);
+            const long long dist = p - (lo + j0 + u);
+            rb[u] = lane < a.n_rel && dist < a.extent ? a.rel_bias[size_t(dist) * a.n_rel + lane] : 0.0f;
+            if (++row == a.ring) row = 0;
+        }
+    }
+#pragma unroll
+    for (int u = 0; u < kScoreKeys; ++u) {
+        if (j0 + u < j1) {
+#pragma unroll
+            for (int hp = 0; hp < kMaxPer; ++hp) {
+                if (hp < per) {
+                    float d = rb[u] * r[hp];
+#pragma unroll
+                    for (int c = 0; c < kLaneHalves; ++c) d += q[hp][c] * k[u][c];
+                    d = warp_sum(d);
+                    if (lane == 0) s[size_t(hp) * nk_max + j0 + u] = d - sinks[hp];
+                }
+            }
+        }
     }
 }
 
@@ -1208,6 +1321,14 @@ __global__ void __launch_bounds__(kScoreWarps * 32) ink_score_kernel(InkAttn a, 
     }
 }
 
+// ink_attend_rows(): the score kernel's blocks of token t0 + blockIdx.x / n_kv over that token's own keys
+template <int KV>
+__global__ void ink_score_rows_kernel(InkAttn a, int t0, int nk_max, InkAttnRows c) {
+    pdl_trigger();
+    pdl_wait();
+    score_block<KV>(a, c.keys[t0 + blockIdx.x / a.n_kv], t0, nk_max);
+}
+
 // A token's head a block: the scores' softmax with its extra term of score 0.  The scores become the weights'
 // numerators (exp against the largest), and norm gets what they are divided by, a token's head each.
 __global__ void ink_softmax_kernel(InkAttn a, int t0, int nk_max, float* norm) {
@@ -1237,9 +1358,8 @@ __global__ void ink_softmax_kernel(InkAttn a, int t0, int nk_max, float* norm) {
 // sums are added in their order.  value_warps() launches up to 32 warps, so the registers must fit 1,024 threads on
 // every card: sm_86 and sm_89 gave this kernel 66 a thread without the bound, and the launch failed there.
 template <int KV>
-__global__ void __launch_bounds__(1024) ink_value_kernel(InkAttn a, int t0, int nk_max, float* parts, int n_parts) {
-    pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
-    pdl_wait();
+__device__ __forceinline__ void value_block(const InkAttn& a, const void* vals, int t0, int nk_max, float* parts,
+                                            int n_parts) {
     extern __shared__ float sums[];   // a warp's, a head of the group: dim
     const int per = a.n_head / a.n_kv, lh = a.dim / 32;
     const int tt = blockIdx.x / a.n_kv, g = blockIdx.x % a.n_kv, t = t0 + tt;
@@ -1264,9 +1384,9 @@ __global__ void __launch_bounds__(1024) ink_value_kernel(InkAttn a, int t0, int 
 #pragma unroll
     for (int u = 0; u < kValueKeys; ++u) {
         if (j0 + u < j1) {
-            if (KV == kKvFp8) lane_fp8(a.vals, row, a.n_kv, a.dim, g, lane, lh, v[u]);
-            else if (KV == kKvQ8) lane_q8(a.vals, row, a.n_kv, a.dim, g, lane, lh, v[u]);
-            else lane_halves((const __half*) a.vals + (size_t(row) * a.n_kv + g) * a.dim, lane, lh, v[u]);
+            if (KV == kKvFp8) lane_fp8(vals, row, a.n_kv, a.dim, g, lane, lh, v[u]);
+            else if (KV == kKvQ8) lane_q8(vals, row, a.n_kv, a.dim, g, lane, lh, v[u]);
+            else lane_halves((const __half*) vals + (size_t(row) * a.n_kv + g) * a.dim, lane, lh, v[u]);
             if (++row == a.ring) row = 0;
         }
     }
@@ -1298,22 +1418,52 @@ __global__ void __launch_bounds__(1024) ink_value_kernel(InkAttn a, int t0, int 
     }
 }
 
-// A token's head a block: its parts added in their order, over its softmax's norm.
-__global__ void ink_join_kernel(InkAttn a, int t0, const float* parts, int n_parts, const float* norm) {
+template <int KV>
+__global__ void __launch_bounds__(1024) ink_value_kernel(InkAttn a, int t0, int nk_max, float* parts, int n_parts) {
     pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
     pdl_wait();
+    value_block<KV>(a, a.vals, t0, nk_max, parts, n_parts);
+}
+
+// ink_attend_rows(): the value kernel's blocks of token t0 + blockIdx.x / n_kv over that token's own values
+template <int KV>
+__global__ void __launch_bounds__(1024) ink_value_rows_kernel(InkAttn a, int t0, int nk_max, float* parts, int n_parts,
+                                                              InkAttnRows c) {
+    pdl_trigger();
+    pdl_wait();
+    value_block<KV>(a, c.vals[t0 + blockIdx.x / a.n_kv], t0, nk_max, parts, n_parts);
+}
+
+// A token's head a block: its first `mine` parts added in their order (of n_parts a head in parts), over its
+// softmax's norm.
+__device__ __forceinline__ void join_block(const InkAttn& a, int t0, const float* parts, int n_parts, int mine,
+                                           const float* norm) {
     const int tt = blockIdx.x / a.n_head, h = blockIdx.x % a.n_head, t = t0 + tt;
     const float inv = 1.0f / norm[blockIdx.x];
     const float* pt = parts + size_t(blockIdx.x) * n_parts * a.dim;
     for (int i = threadIdx.x; i < a.dim; i += blockDim.x) {
         float total = 0.0f;
-        for (int k = 0; k < n_parts; ++k) total += pt[size_t(k) * a.dim + i];
+        for (int k = 0; k < mine; ++k) total += pt[size_t(k) * a.dim + i];
         const size_t at = (size_t(t) * a.n_head + h) * a.dim + i;
         float v = total * inv;
         if (a.gate) v *= 1.0f / (1.0f + expf(-a.gate[at]));   // ink_mul_sigmoid_kernel's
         a.out[at] = v;
         if (a.q8) q8_put((QB*) a.q8, (int) at, v);   // one token's row, for the output product
     }
+}
+
+__global__ void ink_join_kernel(InkAttn a, int t0, const float* parts, int n_parts, const float* norm) {
+    pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
+    pdl_wait();
+    join_block(a, t0, parts, n_parts, n_parts, norm);
+}
+
+// ink_attend_rows(): a token's head adds the parts it has alone (InkAttnRows::parts)
+__global__ void ink_join_rows_kernel(InkAttn a, int t0, const float* parts, int n_parts, const float* norm,
+                                     InkAttnRows c) {
+    pdl_trigger();
+    pdl_wait();
+    join_block(a, t0, parts, n_parts, c.parts[t0 + blockIdx.x / a.n_head], norm);
 }
 
 // The tensor cores' m16n8k16 step, ldmatrix and the copies into shared memory, as kernels.cu has them for its
@@ -1378,7 +1528,7 @@ template <int ahead> __device__ __forceinline__ void ink_cp_wait() {
 #endif
 
 // ink_attend() of a prompt batch on the tensor cores (ink_attend_batch()), FlashAttention-2's way, as kernels.cu's
-// attn_flash128_kernel goes: a launch block takes 64 tokens of a key head (32 when LEAN), a warp 16 tokens of one of the
+// attn_flash128_kernel goes: a launch block takes TOKENS tokens of a key head (32 when LEAN), a warp 16 tokens of one of the
 // head's G query heads, and the keys go kFlashKeys at a time, two buffers of keys and values in turn, each row's
 // softmax kept as it goes, so no score leaves the registers.  A score is what attend_batch() with an AttnBias makes
 // of it: the query rounded to halves, its product with the key summed in floats and times the scale, plus the bias
@@ -1395,21 +1545,25 @@ template <int ahead> __device__ __forceinline__ void ink_cp_wait() {
 // would add weights of 0 and scale by 1, every tile still starts at a multiple of kFlashKeys, and a row's tiles and
 // the order of its sums are the same.  On the other cards (sm_86, sm_89, sm_120) it was slower per layer, so they
 // keep the kernel without LEAN.
+// TOKENS without LEAN (64, 48 or 32; ink_flash_tokens() picks it by how the blocks fill the card's last wave): a
+// block's rows.  A row's scores, weights and sums are the same whatever block it is in: its tiles of keys still start
+// at multiples of kFlashKeys and go in the same order, and a tile none of whose keys the row sees (the block's wider
+// span) adds weights of 0 and scales by 1, or keeps the zeros before the row's first key, so TOKENS changes no bit.
 constexpr int kFlashKeys = 64, kFlashRow = 128 + 8, kFlashRel = 16;
-constexpr int flash_tokens(bool lean) { return lean ? 32 : 64; }   // the kernel's TOKENS
+constexpr int flash_tokens(bool lean) { return lean ? 32 : 64; }   // the kernel's default TOKENS
 constexpr size_t kFlashKv = size_t(4) * kFlashKeys * kFlashRow * sizeof(__half);
-// the shared memory of ink_flash_kernel<G, LEAN>: keys and values, the table's columns (LEAN, G < 4), r
-constexpr size_t flash_smem(int g, bool lean) {
-    return kFlashKv +
-           (lean && g < 4 ? size_t(2) * (flash_tokens(lean) + kFlashKeys) * kFlashRel * sizeof(float) : 0) +
-           size_t(flash_tokens(lean)) * g * kFlashRel * sizeof(float);
+// the shared memory of ink_flash_kernel<G, LEAN, TOKENS>: keys and values, the table's columns (LEAN, G < 4), r
+constexpr size_t flash_smem(int g, bool lean, int tokens) {
+    return kFlashKv + (lean && g < 4 ? size_t(2) * (tokens + kFlashKeys) * kFlashRel * sizeof(float) : 0) +
+           size_t(tokens) * g * kFlashRel * sizeof(float);
 }
 
-template <int G, bool LEAN>
-__global__ void __launch_bounds__((LEAN ? 32 : 64) / 16 * G * 32, 1) ink_flash_kernel(InkAttn a) {
+template <int G, bool LEAN, int TOKENS = flash_tokens(LEAN)>
+__global__ void __launch_bounds__(TOKENS / 16 * G * 32, 1) ink_flash_kernel(InkAttn a) {
+    static_assert(!LEAN || TOKENS == 32, "LEAN takes 32 tokens a block");
+    static_assert(TOKENS % 16 == 0, "a warp takes 16 tokens");
 #if INK_FLASH
-    constexpr int TOKENS = LEAN ? 32 : 64, DIM = 128, KEYS = kFlashKeys, ROW = kFlashRow, NR = kFlashRel,
-                  THREADS = TOKENS / 16 * G * 32;
+    constexpr int DIM = 128, KEYS = kFlashKeys, ROW = kFlashRow, NR = kFlashRel, THREADS = TOKENS / 16 * G * 32;
     constexpr int SPAN = TOKENS + KEYS;   // a tile's distances (one more than it spans, for 16 bytes)
     extern __shared__ __align__(16) __half ink_flash_sm[];
     __half(*ks)[KEYS][ROW] = reinterpret_cast<__half(*)[KEYS][ROW]>(ink_flash_sm);
@@ -2305,6 +2459,205 @@ __global__ void __launch_bounds__(kFastThreads, 2) ink_fast_kernel(InkAttn a) {
 #endif
 }
 
+// The same attention on Turing in the shape of attn_mma_kernel from our earlier Inkling engine (#200's 7f3f4574f,
+// 16f3585bd): a launch block is 4 warps of 16 query rows, row r of the block token r / G and query head r % G of the
+// key head (16 * 4 / G tokens, a row unused for G = 3), keys go 32 at a time through one buffer.  It differs from
+// ink_flash75_kernel in what costs it time: the relative-position bias is a product on the tensor cores too, the
+// warp's R (in log2 units) times the table's rows of the distances the tile spans, each split into a half and the
+// half of what that leaves (hi*hi + lo*hi + hi*lo, summed in floats: about a float product's rounding), a warp's 16
+// rows by mma75_bias(G) distances in shared memory as floats, each score reading its one float; the softmax runs in
+// log2 units (exp2f); and a tile that every row of a warp attends whole skips the masks.  A score is the query rounded
+// to halves times the key summed in floats, times the scale, plus the bias, less the sink; a weight is rounded to a
+// half for the values' product and summed as that half; the softmax has one more term of score 0, then the gate.  The
+// tiles are counted from position 0 and a row's sums read nothing of the block's other rows, so a token's result does
+// not depend on the call it is in (ink_flash_test's split calls).
+constexpr int kMma75Warps = 4, kMma75Keys = 32;
+
+__host__ __device__ constexpr int mma75_tokens(int g) { return 16 * kMma75Warps / g; }
+// a warp's distances a tile: its rows' tokens (at most 15 / G + 2) and the keys, in blocks of 8
+__host__ __device__ constexpr int mma75_bias(int g) { return (15 / g + 2 + kMma75Keys - 1 + 7) / 8 * 8; }
+
+template <int G>
+__global__ void __launch_bounds__(kMma75Warps * 32) ink_mma75_kernel(InkAttn a) {
+#if INK_MMA && !INK_FLASH
+    constexpr int DIM = 128, KEYS = kMma75Keys, ROW = kFlashRow, NR = kFlashRel, W = kMma75Warps, THREADS = W * 32;
+    constexpr int TOKENS = mma75_tokens(G), BIAS = mma75_bias(G);
+    constexpr float LOG2E = 1.44269504f;
+    static_assert(NR == 16, "the bias product is one k = 16 step");
+    __shared__ __align__(16) __half ks[KEYS][ROW], vs[KEYS][ROW];
+    __shared__ __align__(16) float bias[W][16][BIAS];
+    const int lane = threadIdx.x % 32, w = threadIdx.x / 32, gid = lane / 4, tig = lane % 4;
+    const int g = blockIdx.y, t0 = (gridDim.x - 1 - blockIdx.x) * TOKENS;   // the longest blocks first
+    const int nt = min(TOKENS, a.rows - t0), wt0 = 16 * w / G, wt1 = min((16 * w + 15) / G, TOKENS - 1);
+    const long long p0 = a.pos + t0;
+    int tok[2];
+    bool ok[2];
+    size_t th[2];   // the thread's rows gid and gid + 8 of the warp's: token, and its head's place in q, r, out
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int r = 16 * w + gid + 8 * i;
+        tok[i] = r / G;
+        ok[i] = tok[i] < nt;
+        th[i] = ok[i] ? size_t(t0 + tok[i]) * a.n_head + g * G + r % G : 0;
+    }
+    uint32_t qa[8][4], ra[4], rl[4];   // a block of 16 values a step; R in log2 units, and what its halves leave
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int u = 0; u < 2; ++u) {
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                float2 x = make_float2(0.0f, 0.0f);
+                if (ok[i]) x = *reinterpret_cast<const float2*>(a.q + th[i] * DIM + 16 * k + 8 * u + 2 * tig);
+                qa[k][i + 2 * u] = ink_h2(x.x, x.y);
+            }
+            float2 x = make_float2(0.0f, 0.0f);
+            if (ok[i]) x = *reinterpret_cast<const float2*>(a.r + th[i] * NR + 8 * u + 2 * tig);
+            const float2 y = make_float2(x.x * LOG2E, x.y * LOG2E);
+            const __half2 h = __floats2half2_rn(y.x, y.y);
+            ra[i + 2 * u] = *reinterpret_cast<const uint32_t*>(&h);
+            rl[i + 2 * u] = ink_h2(y.x - __low2float(h), y.y - __high2float(h));
+        }
+    float sink[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) sink[i] = ok[i] ? a.sink[th[i]] * LOG2E : 0.0f;
+    const float sl = a.scale * LOG2E;
+    float o[16][4], m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int n = 0; n < 16; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+    // the block's tokens attend positions [lo, hi): from the first one's window to the last one
+    const long long hi = p0 + nt, lo = a.window > 0 ? max(0LL, p0 - a.window + 1) : 0;
+    const bool wfull = wt1 < nt;   // every row of the warp is a token of the call
+    const __half* kc = reinterpret_cast<const __half*>(a.keys);
+    const __half* vc = reinterpret_cast<const __half*>(a.vals);
+    for (long long k0 = lo / KEYS * KEYS; k0 < hi; k0 += KEYS) {
+        __syncthreads();   // the last tile's keys, values and table rows are read
+        for (int i = threadIdx.x; i < KEYS * DIM / 8; i += THREADS) {
+            const int r = i / (DIM / 8), c = 8 * (i % (DIM / 8));
+            const long long key = k0 + r;
+            uint4 kx = make_uint4(0, 0, 0, 0), vx = kx;   // zeros outside [lo, hi), which no weight reads
+            if (key >= lo && key < hi) {
+                const size_t at = (size_t(a.ring > 0 ? key % a.ring : key) * a.n_kv + g) * DIM + c;
+                kx = *reinterpret_cast<const uint4*>(kc + at);
+                vx = *reinterpret_cast<const uint4*>(vc + at);
+            }
+            *reinterpret_cast<uint4*>(&ks[r][c]) = kx;
+            *reinterpret_cast<uint4*>(&vs[r][c]) = vx;
+        }
+        // the block's distances own - key are d0 .. ; a tile with one below the extent has a bias
+        const long long d0 = p0 - (k0 + KEYS - 1);
+        const bool near = d0 < a.extent;
+        __syncthreads();
+        float s[KEYS / 8][4];
+#pragma unroll
+        for (int n = 0; n < KEYS / 8; ++n) {
+            s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 8; k += 2) {
+                uint32_t b[4];   // keys 8 n.., values 16 k.. and 16 (k + 1)..
+                ink_ldsm4(b, &ks[8 * n + lane % 8][16 * k + 8 * (lane / 8)], false);
+                ink_mma(s[n], qa[k], b);
+                ink_mma(s[n], qa[k + 1], b + 2);
+            }
+        }
+        if (near) {   // the warp's rows times its distances: column e is distance d0 + wt0 + e
+#pragma unroll
+            for (int n = 0; n < BIAS / 8; ++n) {
+                // the B fragment: the table's row of distance d0 + wt0 + 8 n + gid, values 2 tig.. and 8 + 2 tig..,
+                // zeros before 0 and from the extent on; as halves, and the halves of what they leave
+                const long long d = d0 + wt0 + 8 * n + gid;
+                float2 x0 = make_float2(0.0f, 0.0f), x1 = x0;
+                if (d >= 0 && d < a.extent) {
+                    x0 = __ldg(reinterpret_cast<const float2*>(a.rel_bias + size_t(d) * NR + 2 * tig));
+                    x1 = __ldg(reinterpret_cast<const float2*>(a.rel_bias + size_t(d) * NR + 8 + 2 * tig));
+                }
+                const __half2 h0 = __floats2half2_rn(x0.x, x0.y), h1 = __floats2half2_rn(x1.x, x1.y);
+                const uint32_t b[2] = {*reinterpret_cast<const uint32_t*>(&h0), *reinterpret_cast<const uint32_t*>(&h1)};
+                float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                const uint32_t bl[2] = {ink_h2(x0.x - __low2float(h0), x0.y - __high2float(h0)),
+                                        ink_h2(x1.x - __low2float(h1), x1.y - __high2float(h1))};
+                ink_mma(c, ra, b);    // hi * hi
+                ink_mma(c, rl, b);    // + lo * hi
+                ink_mma(c, ra, bl);   // + hi * lo: about what the products in floats give
+                *reinterpret_cast<float2*>(&bias[w][gid][8 * n + 2 * tig]) = make_float2(c[0], c[1]);
+                *reinterpret_cast<float2*>(&bias[w][gid + 8][8 * n + 2 * tig]) = make_float2(c[2], c[3]);
+            }
+            __syncwarp();
+        }
+        // whether every row of the warp attends every key of the tile: then no score needs its mask
+        const bool whole = wfull && k0 + KEYS - 1 <= p0 + wt0 && (a.window <= 0 || k0 > p0 + wt1 - a.window);
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            // the row's token attends positions (own - window, own]: columns c of the tile with lo_c < c <= hi_c
+            const long long own = p0 + tok[i];
+            const int hi_c = ok[i] ? (int) min(own - k0, (long long) KEYS) : -1;
+            const int lo_c = a.window > 0 ? (int) max(own - a.window - k0, -1LL) : -1;
+            const int e0 = tok[i] - wt0 + KEYS - 1;
+            float mx = -INFINITY;
+#pragma unroll
+            for (int n = 0; n < KEYS / 8; ++n)
+#pragma unroll
+                for (int j = 2 * i; j < 2 * i + 2; ++j) {
+                    const int c = 8 * n + 2 * tig + j % 2;
+                    const float b = near ? bias[w][gid + 8 * i][e0 - c] : 0.0f;
+                    float v = fmaf(s[n][j], sl, b) - sink[i];
+                    if (!whole && (c > hi_c || c <= lo_c)) v = -INFINITY;
+                    s[n][j] = v;
+                    mx = fmaxf(mx, v);
+                }
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+            const float now = fmaxf(m[i], mx), base = now == -INFINITY ? 0.0f : now;
+            const float f = exp2f(m[i] - base);
+            m[i] = now;
+            l[i] *= f;
+#pragma unroll
+            for (int n = 0; n < 16; ++n) {
+                o[n][2 * i] *= f;
+                o[n][2 * i + 1] *= f;
+            }
+#pragma unroll
+            for (int n = 0; n < KEYS / 8; ++n)
+#pragma unroll
+                for (int j = 2 * i; j < 2 * i + 2; ++j) {
+                    s[n][j] = __half2float(__float2half(exp2f(s[n][j] - base)));   // the weight the values get
+                    l[i] += s[n][j];
+                }
+        }
+#pragma unroll
+        for (int k = 0; k < KEYS / 16; ++k) {   // keys 16 k..: the weights as an A fragment
+            const uint32_t pa[4] = {ink_h2(s[2 * k][0], s[2 * k][1]), ink_h2(s[2 * k][2], s[2 * k][3]),
+                                    ink_h2(s[2 * k + 1][0], s[2 * k + 1][1]), ink_h2(s[2 * k + 1][2], s[2 * k + 1][3])};
+#pragma unroll
+            for (int n = 0; n < 16; n += 2) {
+                uint32_t b[4];   // keys 16 k.., values 8 n.. and 8 (n + 1)..
+                ink_ldsm4(b, &vs[16 * k + lane % 8 + 8 * (lane / 8 % 2)][8 * n + 8 * (lane / 16)], true);
+                ink_mma(o[n], pa, b);
+                ink_mma(o[n + 1], pa, b + 2);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 2);
+        if (!ok[i]) continue;
+        const float inv = 1.0f / (l[i] + exp2f(0.0f - m[i]));   // the term of score 0, against the row's top
+        const size_t at = th[i] * DIM + 2 * tig;
+#pragma unroll
+        for (int n = 0; n < 16; ++n)
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                float v = o[n][2 * i + e] * inv;
+                if (a.gate) v *= 1.0f / (1.0f + expf(-a.gate[at + 8 * n + e]));   // ink_mul_sigmoid_kernel's
+                a.out[at + 8 * n + e] = v;
+            }
+    }
+#else
+    (void) a;   // ink_attend_batch() launches it only where the PTX has the steps
+#endif
+}
+
 __device__ __forceinline__ float2 situ_scales(const ExpertScales& s, int row) {
     if (!s.gate && !s.up) return make_float2(1.0f, 1.0f);
     const int e = s.ids ? s.ids[row] : s.e[row];
@@ -2637,6 +2990,16 @@ void ink_conv_add(const float* x, float* state, const float* w, float* out, floa
     launched("ink_conv_add");
 }
 
+void ink_conv_add_rows(const float* x, const InkStateRows& state, const float* w, float* out, float* acc, float* keep,
+                       float a, int mode, int channels, int taps, int rows, void* stream) {
+    if (taps < 2 || taps > 8) throw std::invalid_argument("ink_conv_add_rows: 2 to 8 taps");
+    if (rows < 1 || rows > kInkRows) throw std::invalid_argument("ink_conv_add_rows: 1 to kInkRows tokens");
+    const float norm = 1.0f / std::sqrt((float) (taps + 1));   // ink_conv_add()'s
+    launch_pdl(ink_conv_add_rows_kernel, dim3(grid((size_t) channels, 256), rows), dim3(256), 0, cs(stream), x, state,
+               w, out, acc, keep, a, mode, channels, taps, norm);
+    launched("ink_conv_add_rows");
+}
+
 void ink_moe_conv_add(const float* x, const float* w, const float* scale, const int* ids, int n_used, float* fo,
                       float* state, const float* cw, float* out, float* acc, float a, int channels, int taps,
                       void* stream) {
@@ -2727,6 +3090,17 @@ void ink_qkv(const InkQkv& a, void* stream) {
 #endif
 }
 
+void ink_qkv_rows(const InkQkv& a, const InkQkvRows& r, int rows, void* stream) {
+    if (a.dim > 128 || a.n_rel > 128 || a.taps < 2 || a.taps > 8 || a.n_kv < 1)
+        throw std::invalid_argument("ink_qkv_rows: heads of up to 128 values, 2 to 8 taps");
+    if (rows < 1 || rows > kInkRows || !a.at) throw std::invalid_argument("ink_qkv_rows: 1 to kInkRows tokens, positions on the card");
+    QkvArgs g{a, 1.0f / std::sqrt((float) ((a.kdyn ? 2 : 1) * a.taps + 1)),   // ink_qkv()'s
+              1.0f / std::sqrt((float) ((a.vdyn ? 2 : 1) * a.taps + 1))};
+    launch_pdl(a.kv8 ? ink_qkv_rows_kernel<kKvFp8> : ink_qkv_rows_kernel<kKvF16>, dim3(2 * a.n_head + 2 * a.n_kv, rows),
+               dim3(128), 0, cs(stream), g, r);
+    launched("ink_qkv_rows");
+}
+
 void ink_clip(float* x, const float* scale, float thr, int dim, int heads, int rows, int64_t pos, float alpha,
               float floor, void* stream, const long long* at) {
     if (rows <= 0) return;
@@ -2813,7 +3187,14 @@ size_t ink_attend_floats(int n_head, int n_kv, int dim, int64_t keys) {
     return (size_t) n_head * ((size_t) keys + 1 + (size_t) ((keys + block - 1) / block) * dim);
 }
 
-void ink_attend(const InkAttn& a, void* stream) {
+int ink_attend_parts(int n_head, int n_kv, int dim, int window, int64_t last) {
+    const int nk_max = (int) (window > 0 ? std::min<int64_t>(window, last) : last);
+    const int warps = value_warps(n_head, n_kv, dim);
+    return (nk_max + warps * kValueKeys - 1) / (warps * kValueKeys);
+}
+
+// ink_attend(), or with rows ink_attend_rows()'s tokens over their own caches
+static void attend(const InkAttn& a, const InkAttnRows* rows, void* stream) {
     if (a.rows <= 0) return;
     if (a.n_kv < 1 || a.n_head % a.n_kv != 0 || a.n_head / a.n_kv > kMaxPer || (a.dim != 64 && a.dim != 128) ||
         a.n_rel < 1 || a.n_rel > 32)
@@ -2824,34 +3205,67 @@ void ink_attend(const InkAttn& a, void* stream) {
     if (a.at && a.room < 1) throw std::invalid_argument("ink_attend: positions on the card need the rows to size for");
     const int nk_max = (int) (a.window > 0 ? std::min<int64_t>(a.window, last) : last);
     const int group = a.n_head / a.n_kv, warps = value_warps(a.n_head, a.n_kv, a.dim);
-    const int n_parts = (nk_max + warps * kValueKeys - 1) / (warps * kValueKeys);
+    const int n_parts = ink_attend_parts(a.n_head, a.n_kv, a.dim, a.window, last);
+    const int score_blocks = (nk_max + kScoreWarps * kScoreKeys - 1) / (kScoreWarps * kScoreKeys);
     const size_t per = ink_attend_floats(a.n_head, a.n_kv, a.dim, nk_max);
     if (a.score_n < per) throw std::logic_error("ink_attend: the scores of one token do not fit the scratch");
     const int chunk = (int) std::min<size_t>(a.score_n / per, (size_t) a.rows);
     float* norm = a.score + (size_t) chunk * a.n_head * nk_max;
     float* parts = norm + (size_t) chunk * a.n_head;
+    const size_t value_shared = (size_t) warps * group * a.dim * sizeof(float);
     for (int t0 = 0; t0 < a.rows; t0 += chunk) {
         const int m = std::min(chunk, a.rows - t0);
-        const int steps = score_steps(m * a.n_kv, nk_max), keys = kScoreWarps * kScoreKeys * steps;
-        launch_pdl(score_kernel(a), dim3(m * a.n_kv, (nk_max + keys - 1) / keys), dim3(kScoreWarps * 32), 0,
-                   cs(stream), a, t0, nk_max, steps);
+        if (rows)
+            launch_pdl(a.kv8 ? ink_score_rows_kernel<kKvFp8> : ink_score_rows_kernel<kKvF16>,
+                       dim3(m * a.n_kv, score_blocks), dim3(kScoreWarps * 32), 0, cs(stream), a, t0, nk_max, *rows);
+        else {
+            const int steps = score_steps(m * a.n_kv, nk_max), keys = kScoreWarps * kScoreKeys * steps;
+            launch_pdl(score_kernel(a), dim3(m * a.n_kv, (nk_max + keys - 1) / keys), dim3(kScoreWarps * 32), 0,
+                       cs(stream), a, t0, nk_max, steps);
+        }
         launched("ink_score");
         launch_pdl(ink_softmax_kernel, dim3(m * a.n_head), dim3(kAttnThreads), 0, cs(stream), a, t0, nk_max, norm);
         launched("ink_softmax");
-        launch_pdl(a.kvq8  ? ink_value_kernel<kKvQ8>
-                   : a.kv8 ? ink_value_kernel<kKvFp8>
-                           : ink_value_kernel<kKvF16>, dim3(m * a.n_kv, n_parts),
-                   dim3(warps * 32), (size_t) warps * group * a.dim * sizeof(float), cs(stream), a, t0, nk_max, parts,
-                   n_parts);
+        if (rows)
+            launch_pdl(a.kv8 ? ink_value_rows_kernel<kKvFp8> : ink_value_rows_kernel<kKvF16>, dim3(m * a.n_kv, n_parts),
+                       dim3(warps * 32), value_shared, cs(stream), a, t0, nk_max, parts, n_parts, *rows);
+        else
+            launch_pdl(a.kvq8  ? ink_value_kernel<kKvQ8>
+                       : a.kv8 ? ink_value_kernel<kKvFp8>
+                               : ink_value_kernel<kKvF16>, dim3(m * a.n_kv, n_parts),
+                       dim3(warps * 32), value_shared, cs(stream), a, t0, nk_max, parts, n_parts);
         launched("ink_value");
-        launch_pdl(ink_join_kernel, dim3(m * a.n_head), dim3(128), 0, cs(stream), a, t0, parts, n_parts, norm);
+        if (rows)
+            launch_pdl(ink_join_rows_kernel, dim3(m * a.n_head), dim3(128), 0, cs(stream), a, t0, parts, n_parts, norm,
+                       *rows);
+        else
+            launch_pdl(ink_join_kernel, dim3(m * a.n_head), dim3(128), 0, cs(stream), a, t0, parts, n_parts, norm);
         launched("ink_join");
     }
 }
 
 #if !defined(__HIPCC__)
-// ink_attend_batch() on Turing: ink_flash75_kernel, fp16 caches
+// ink_attend_batch() on Turing, fp16 caches: ink_mma75_kernel, or ink_flash75_kernel with STRATA_INK_MMA75=0.  On
+// upstream's accuracy check (3 prompts of 302 to 8,192 tokens, 64 tokens, 3 files) ink_mma75_kernel's most likely
+// token is ink_flash75_kernel's greedy answer at 98.3% of the steps and attend_batch()'s at 98.4%.
 static bool flash75(const InkAttn& a, int per, void* stream) {
+    static const bool mma = [] {
+        const char* v = std::getenv("STRATA_INK_MMA75");
+        return !(v && v[0] == '0');
+    }();
+    if (mma) {
+        const auto launch = [&](auto kernel, int g) {
+            kernel<<<dim3(grid((size_t) a.rows, mma75_tokens(g)), a.n_kv), kMma75Warps * 32, 0, cs(stream)>>>(a);
+        };
+        switch (per) {
+            case 1: launch(ink_mma75_kernel<1>, 1); break;
+            case 2: launch(ink_mma75_kernel<2>, 2); break;
+            case 3: launch(ink_mma75_kernel<3>, 3); break;
+            default: launch(ink_mma75_kernel<4>, 4); break;
+        }
+        launched("ink_mma75");
+        return true;
+    }
     const auto launch = [&](auto kernel, size_t smem, int g) {
         const cudaError_t e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
         if (e != cudaSuccess) throw std::runtime_error(std::string("ink_attend_batch: shared memory: ") + cudaGetErrorString(e));
@@ -2867,6 +3281,16 @@ static bool flash75(const InkAttn& a, int per, void* stream) {
     return true;
 }
 #endif
+
+void ink_attend(const InkAttn& a, void* stream) { attend(a, nullptr, stream); }
+
+void ink_attend_rows(const InkAttn& a, const InkAttnRows& c, void* stream) {
+    if (a.rows > kInkRows || !a.at || a.q8) throw std::invalid_argument("ink_attend_rows: 1 to kInkRows tokens, positions on the card, no q8");
+    for (int t = 0; t < a.rows; ++t)
+        if (c.parts[t] < 1 || c.parts[t] > ink_attend_parts(a.n_head, a.n_kv, a.dim, a.window, a.room))
+            throw std::invalid_argument("ink_attend_rows: a token's parts are more than the launch's");
+    attend(a, &c, stream);
+}
 
 #if defined(__HIPCC__)
 // Whether the current card is gfx12, whose instructions ink_wmma_kernel has.  The arch macros are the device pass's
@@ -2907,41 +3331,161 @@ bool ink_attend_batch(const InkAttn& a, void* stream) {
     launched("ink_wmma");
     return true;
 #else
-    if (a.rows <= 0) return true;
-    static const bool off = [] {   // STRATA_INK_FLASH=0: attend_batch()'s path
-        const char* v = std::getenv("STRATA_INK_FLASH");
-        return v && v[0] == '0';
-    }();
-    const int per = a.n_kv > 0 && a.n_head % a.n_kv == 0 ? a.n_head / a.n_kv : 0;
-    if (off) return false;
-    if (a.dim != 128 || a.n_rel != kFlashRel || per < 1 || per > kMaxPer || a.at || a.q8) return false;
+    return ink_attend_batch_rows(a, stream, 0);
+#endif
+}
+
+#if !defined(__HIPCC__)
+namespace {
+
+int flash_ptx() {
     static const int ptx = [] {
         cudaFuncAttributes f{};
         return cudaFuncGetAttributes(&f, ink_flash_kernel<1, false>) == cudaSuccess ? f.ptxVersion : 0;
     }();
-    // Turing: ink_flash75_kernel reads fp16 caches only (FP8 and Q8_0 rows go to attend_batch())
-    if (ptx < 80) return ptx >= 75 && !a.kv8 && !a.kvq8 && flash75(a, per, stream);
-    static const bool lean = [] {   // ink_flash_kernel's LEAN on sm_80 (A100 class) only: the card it was faster on
+    return ptx;
+}
+
+bool flash_lean() {   // ink_flash_kernel's LEAN on sm_80 (A100 class) only: the card it was faster on
+    static const bool lean = [] {
         int dev = 0, major = 0, minor = 0;
         return cudaGetDevice(&dev) == cudaSuccess &&
                cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
                cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess && major == 8 &&
                minor == 0;
     }();
-    const auto launch = [&](auto kernel, int g, bool ln) {
-        const size_t smem = flash_smem(g, ln);
-        const int tokens = flash_tokens(ln);
-        const cudaError_t e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
-        if (e != cudaSuccess) throw std::runtime_error(std::string("ink_attend_batch: shared memory: ") + cudaGetErrorString(e));
-        kernel<<<dim3(grid((size_t) a.rows, tokens), a.n_kv), tokens / 16 * g * 32, smem, cs(stream)>>>(a);
-    };
-    static const bool fast = [] {   // STRATA_FAST_ATTN=1: ink_fast_kernel for full layers (opt-in, other bits)
+    return lean;
+}
+
+bool flash_fast() {   // STRATA_FAST_ATTN=1: ink_fast_kernel for full layers (opt-in, other bits)
+    static const bool fast = [] {
         const char* v = std::getenv("STRATA_FAST_ATTN");
         const bool on = v && v[0] == '1';
         if (on) std::fprintf(stderr, "strata: STRATA_FAST_ATTN=1: Inkling 2's full layers read prompts on ink_fast_kernel (other bits)\n");
         return on;
     }();
-    if (fast && a.window <= 0 && !a.kvq8) {   // ink_fast_kernel reads fp16 and FP8 caches
+    return fast;
+}
+
+// the query heads on a key head when ink_attend_batch() takes the call at all, else 0
+int flash_per(const InkAttn& a) {
+    static const bool off = [] {   // STRATA_INK_FLASH=0: attend_batch()'s path
+        const char* v = std::getenv("STRATA_INK_FLASH");
+        return v && v[0] == '0';
+    }();
+    const int per = a.n_kv > 0 && a.n_head % a.n_kv == 0 ? a.n_head / a.n_kv : 0;
+    if (off || a.dim != 128 || a.n_rel != kFlashRel || per < 1 || per > kMaxPer || a.at || a.q8) return 0;
+    return per;
+}
+
+constexpr int kFlashSizes[] = {64, 48, 32};   // ink_flash_kernel's TOKENS without LEAN, main's first
+
+int flash_size_index(int tokens) { return tokens == 64 ? 0 : tokens == 48 ? 1 : 2; }
+
+template <int G, int T> void* flash_fn() { return reinterpret_cast<void*>(ink_flash_kernel<G, false, T>); }
+
+void* flash_kernel(int g, int tokens) {   // ink_flash_kernel<g, false, tokens>
+    static void* const fns[4][3] = {{flash_fn<1, 64>(), flash_fn<1, 48>(), flash_fn<1, 32>()},
+                                    {flash_fn<2, 64>(), flash_fn<2, 48>(), flash_fn<2, 32>()},
+                                    {flash_fn<3, 64>(), flash_fn<3, 48>(), flash_fn<3, 32>()},
+                                    {flash_fn<4, 64>(), flash_fn<4, 48>(), flash_fn<4, 32>()}};
+    return fns[g - 1][flash_size_index(tokens)];
+}
+
+// The kernel's shared memory set (once a kernel and device), and its blocks a multiprocessor
+int flash_resident(int g, int tokens) {
+    constexpr int kDevs = 16;
+    static std::atomic<int> cache[kDevs][4][3] = {};   // 0: not asked yet; else 1 + blocks
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) dev = 0;
+    std::atomic<int>* c = dev >= 0 && dev < kDevs ? &cache[dev][g - 1][flash_size_index(tokens)] : nullptr;
+    if (c && c->load(std::memory_order_relaxed) > 0) return c->load(std::memory_order_relaxed) - 1;
+    void* fn = flash_kernel(g, tokens);
+    const size_t smem = flash_smem(g, false, tokens);
+    const cudaError_t e = cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+    if (e != cudaSuccess) throw std::runtime_error(std::string("ink_attend_batch: shared memory: ") + cudaGetErrorString(e));
+    int n = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, fn, tokens / 16 * g * 32, smem) != cudaSuccess) n = 0;
+    if (c) c->store(1 + n, std::memory_order_relaxed);
+    return n;
+}
+
+int flash_sms() {
+    int dev = 0, n = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+    return cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess ? n : 0;
+}
+
+// The rows a block for a call ink_flash_kernel without LEAN takes: STRATA_INK_FLASH_TOKENS=64/48/32 fixes them (64:
+// main's shape); else the size whose launch ends soonest by its waves: blocks over the multiprocessors' resident
+// slots, rounded up, times a block's time against one of 64 rows (kFlashCost, measured on an RTX 5080 Laptop at 2K to
+// 32K keys: a block of 48 takes 0.9 of one of 64, as nvcc gives both 168 registers, and one of 32 0.65).  Another size
+// than 64 is taken only when that is at least kFlashGain less, so a card whose last wave is full or nearly so keeps
+// 64.  Inkling 2 Mini's 1,024-row calls (128 blocks of 64, one a multiprocessor) move to 48 on 59 to 63
+// multiprocessors (a third wave of 64 nearly empty), 88 to 127 and 176 to 199, and keep 64 elsewhere.
+int flash_pick(const InkAttn& a, int per) {
+    static const int fixed = [] {
+        const char* v = std::getenv("STRATA_INK_FLASH_TOKENS");
+        const int t = v ? std::atoi(v) : 0;
+        return t == 64 || t == 48 || t == 32 ? t : 0;
+    }();
+    if (fixed) return fixed;
+    constexpr double kFlashCost[] = {1.0, 0.9, 0.65}, kFlashGain = 0.05;   // kFlashSizes' blocks
+    const int sms = flash_sms();
+    if (sms < 1 || a.rows <= 0) return 64;
+    double best = 0.0, main_cost = 0.0;
+    int pick = 64;
+    for (int i = 0; i < 3; ++i) {
+        const int t = kFlashSizes[i], res = flash_resident(per, t);
+        if (res < 1) continue;
+        const long long blocks = (long long) grid((size_t) a.rows, t) * a.n_kv, slots = (long long) sms * res;
+        const double cost = (double) ((blocks + slots - 1) / slots) * res * kFlashCost[i];
+        if (t == 64) {
+            main_cost = best = cost;
+        } else if (main_cost > 0.0 && cost < best && cost <= main_cost * (1.0 - kFlashGain)) {
+            best = cost;
+            pick = t;
+        }
+    }
+    return pick;
+}
+
+// whether the call goes to ink_flash_kernel without LEAN (not Turing's kernel, LEAN's or ink_fast_kernel)
+bool flash_sized(const InkAttn& a, int per) {
+    return per > 0 && flash_ptx() >= 80 && !flash_lean() && !(flash_fast() && a.window <= 0 && !a.kvq8);
+}
+
+}  // namespace
+
+int ink_flash_tokens(const InkAttn& a) {
+    if (a.rows <= 0) return 0;
+    const int per = flash_per(a);
+    return flash_sized(a, per) ? flash_pick(a, per) : 0;
+}
+#else
+int ink_flash_tokens(const InkAttn&) { return 0; }
+#endif
+
+bool ink_attend_batch_rows(const InkAttn& a, void* stream, int tokens) {
+#if defined(__HIPCC__)
+    if (tokens == 64 || tokens == 48 || tokens == 32) return false;   // no ink_flash_kernel on HIP
+    return ink_attend_batch(a, stream);
+#else
+    if (a.rows <= 0) return true;
+    const int per = flash_per(a);
+    if (per == 0) return false;
+    const int ptx = flash_ptx();
+    // Turing: ink_flash75_kernel reads fp16 caches only (FP8 and Q8_0 rows go to attend_batch())
+    if (ptx < 80) return ptx >= 75 && !a.kv8 && !a.kvq8 && flash75(a, per, stream);
+    const bool lean = flash_lean();
+    const auto launch = [&](auto kernel, int g, bool ln) {
+        const int t = flash_tokens(ln);
+        const size_t smem = flash_smem(g, ln, t);
+        const cudaError_t e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        if (e != cudaSuccess) throw std::runtime_error(std::string("ink_attend_batch: shared memory: ") + cudaGetErrorString(e));
+        kernel<<<dim3(grid((size_t) a.rows, t), a.n_kv), t / 16 * g * 32, smem, cs(stream)>>>(a);
+    };
+    if (flash_fast() && a.window <= 0 && !a.kvq8) {   // ink_fast_kernel reads fp16 and FP8 caches
         // HACC where the tensor cores sum fp16 products into floats at half rate: all but sm_80, sm_90 and sm_100,
         // whose whitepapers give the same dense FP16 TFLOPS with FP32 accumulation as with FP16
         static const bool hacc = [] {
@@ -2968,20 +3512,24 @@ bool ink_attend_batch(const InkAttn& a, void* stream) {
         launched("ink_fast");
         return true;
     }
-    if (lean)
+    if (lean) {
         switch (per) {
             case 1: launch(ink_flash_kernel<1, true>, 1, true); break;
             case 2: launch(ink_flash_kernel<2, true>, 2, true); break;
             case 3: launch(ink_flash_kernel<3, true>, 3, true); break;
             default: launch(ink_flash_kernel<4, true>, 4, true); break;
         }
-    else
-        switch (per) {
-            case 1: launch(ink_flash_kernel<1, false>, 1, false); break;
-            case 2: launch(ink_flash_kernel<2, false>, 2, false); break;
-            case 3: launch(ink_flash_kernel<3, false>, 3, false); break;
-            default: launch(ink_flash_kernel<4, false>, 4, false); break;
-        }
+        launched("ink_flash");
+        return true;
+    }
+    // without LEAN: the rows a block by the card's last wave (flash_pick()), or `tokens`; the same bits each way
+    if (tokens != 64 && tokens != 48 && tokens != 32) tokens = flash_pick(a, per);
+    flash_resident(per, tokens);   // sets the kernel's shared memory
+    InkAttn arg = a;
+    void* args[] = {&arg};
+    (void) cudaLaunchKernel(flash_kernel(per, tokens), dim3(grid((size_t) a.rows, tokens), a.n_kv),
+                            dim3(tokens / 16 * per * 32), args, flash_smem(per, false, tokens),
+                            cs(stream));   // as a <<<>>> launch: an error shows at the next check
     launched("ink_flash");
     return true;
 #endif

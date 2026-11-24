@@ -164,8 +164,9 @@ struct MmvqSlots {
     const void* w[kMmvqSlotsMax];
     const void* x[kMmvqSlotsMax];
     float* y[kMmvqSlotsMax];
-    /// the launch may take kernels that keep more lanes busy, with the same bits: today IQ3_S and IQ3_XXS on CUDA
-    /// (iq_kernels.cu).  Set by Inkling 2 only (Engine::lane_slots_).
+    /// the launch may take kernels that keep more lanes busy, with the same bits: today IQ3_S and IQ3_XXS, and IQ2_XXS,
+    /// IQ2_XS, IQ2_S, IQ1_S and IQ1_M (their codebook staged once for 32 rows), on CUDA (iq_kernels.cu).  Set by
+    /// Inkling 2 only (Engine::lane_slots_).
     bool lanes = false;
 };
 bool native_mmvq_slots(int ggml_type, const MmvqSlots& slots, int count, int n_in, int n_out, void* stream);

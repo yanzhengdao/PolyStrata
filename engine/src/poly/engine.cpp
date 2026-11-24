@@ -17,6 +17,7 @@
 #include "mmq.hpp"
 #include "qwen35.hpp"
 #include "runtime.hpp"
+#include "split_plan.hpp"
 #include "strata/poly/kernels.hpp"
 #if defined(STRATA_GPU_METAL)
 #include "strata/core/conversation_memory.hpp"
@@ -47,6 +48,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <thread>
+#include <set>
 #include <unordered_map>
 
 #ifdef __linux__
@@ -604,12 +606,39 @@ private:
     std::exception_ptr err_;
 };
 
+// A card's memory bandwidth in GB/s for split_plan.hpp, from its peak memory clock and bus width; 0 where it is not
+// known (Metal; HIP, whose clocks are not read this way yet).  STRATA_POLY_CARD_GBS=a,b,... gives each card's.
+double card_gbs(int d) {
+    if (const char* v = std::getenv("STRATA_POLY_CARD_GBS"); v && *v) {
+        const char* at = v;
+        for (int k = 0; k < d && at; ++k) at = std::strchr(at, ',') ? std::strchr(at, ',') + 1 : nullptr;
+        return at ? std::max(0.0, std::atof(at)) : 0.0;
+    }
+#if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP)
+    return 0;
+#else
+    int khz = 0, bits = 0;
+    if (cudaDeviceGetAttribute(&khz, cudaDevAttrMemoryClockRate, d) != cudaSuccess ||
+        cudaDeviceGetAttribute(&bits, cudaDevAttrGlobalMemoryBusWidth, d) != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
+    }
+    return 2.0 * khz * 1e3 * (bits / 8.0) / 1e9;   // double data rate
+#endif
+}
+
 // The first layer of each card's share of n_layer layers, for Options::layer_split on `cards` cards; empty: no
 // split.  "auto" shares the layers' bytes out by each card's free VRAM, less what every card's engine takes beside
 // its layers and, on the last card, the output and the draft block.  Then every card caches about the same share
-// of its layers' experts, which is where a byte of VRAM on one is worth as much as on another.
-std::vector<int> layer_starts(const std::string& split, const Shards& file, int n_layer, int cards) {
+// of its layers' experts, which is where a byte of VRAM on one is worth as much as on another.  No card starts
+// inside [keep_lo, keep_hi) but at keep_lo: those layers run on one card (Inkling 2's loop); "auto" takes the
+// nearer of keep_lo and keep_hi by the layers' bytes.  With such a range run `loop_runs` times a token on two cards
+// of different speeds, "auto" may take another start and swap the cards (*swap: the second device takes the first
+// layers) where split_plan.hpp estimates that clearly faster: the loop on the faster card.
+std::vector<int> layer_starts(const std::string& split, const Shards& file, int n_layer, int cards, int keep_lo = 0,
+                              int keep_hi = 0, int loop_runs = 1, bool* swap = nullptr) {
     if (split.empty() || cards < 2) return {};
+    const auto inside = [&](int il) { return il > keep_lo && il < keep_hi; };
     std::vector<int> starts{0};
     if (split != "auto") {
         for (size_t at = 0; at < split.size();) {
@@ -622,6 +651,11 @@ std::vector<int> layer_starts(const std::string& split, const Shards& file, int 
                 throw std::runtime_error("--layer-split " + split + ": the first layer of each later card, rising, "
                                          "between 1 and " + std::to_string(n_layer - 2) + " (\"auto\" shares them "
                                          "out by each card's free VRAM)");
+            if (inside((int) v))
+                throw std::runtime_error("--layer-split " + split + ": layers " + std::to_string(keep_lo) + " to " +
+                                         std::to_string(keep_hi - 1) + " run on one card, so a card starts at layer " +
+                                         std::to_string(keep_lo) + " or " + std::to_string(keep_hi) +
+                                         ", or outside them");
             starts.push_back((int) v);
             at = comma + 1;
         }
@@ -632,11 +666,15 @@ std::vector<int> layer_starts(const std::string& split, const Shards& file, int 
     }
     if (n_layer < 2 * cards) throw std::runtime_error("the model has too few layers to split them on " + std::to_string(cards) + " cards");
     std::vector<double> before((size_t) n_layer + 1, 0.0);   // the bytes of the layers before each one
+    std::vector<SplitLayer> layers((size_t) n_layer);         // split_plan.hpp's
     double head = 0;
     file.each([&](const TensorInfo& t) {
         int il = -1;
-        if (std::sscanf(t.name.c_str(), "blk.%d.", &il) == 1 && il >= 0 && il < n_layer)
+        if (std::sscanf(t.name.c_str(), "blk.%d.", &il) == 1 && il >= 0 && il < n_layer) {
             before[(size_t) il + 1] += (double) file.payload(t);
+            (t.name.find("_exps.") != std::string::npos ? layers[(size_t) il].experts : layers[(size_t) il].dense) +=
+                (double) file.payload(t);
+        }
         else if (il >= n_layer || t.name == "output.weight")   // the draft block, the output
             head += (double) file.payload(t);
     });
@@ -645,20 +683,55 @@ std::vector<int> layer_starts(const std::string& split, const Shards& file, int 
     for (int il = 0; il < n_layer; ++il) before[(size_t) il + 1] += before[(size_t) il];
     constexpr double kBeside = 1.5 * double(1ull << 30);   // scratch, the staging buffer and the reserve, about
     std::vector<double> room((size_t) cards);
+    SplitCard two[2];
     double all_room = 0;
-    for (int d = 0; d < cards; ++d) {
+    int devices = 1;
+    ck(cudaGetDeviceCount(&devices), "cudaGetDeviceCount");
+    for (int d = 0; d < cards; ++d) {   // (STRATA_POLY_CARDS: parts on the devices there are, in turn)
         size_t free_b = 0, total_b = 0;
-        ck(cudaSetDevice(d), "cudaSetDevice");
+        ck(cudaSetDevice(d % devices), "cudaSetDevice");
         ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
         room[(size_t) d] = std::max((double) free_b - kBeside - (d == cards - 1 ? head : 0.0), double(1ull << 28));
         all_room += room[(size_t) d];
+        if (d < 2) two[d] = SplitCard{std::max((double) free_b - kBeside, 0.0), card_gbs(d)};
     }
     double share = 0;
     for (int d = 1; d < cards; ++d) {
         share += room[(size_t) d - 1] / all_room;
         int il = starts.back() + 1;   // card d starts where the layers before it pass the cards before it's share
-        while (il < n_layer - 2 * (cards - d) && before[(size_t) il] < share * before[(size_t) n_layer]) ++il;
+        const int most = n_layer - 2 * (cards - d);
+        while (il < most && before[(size_t) il] < share * before[(size_t) n_layer]) ++il;
+        if (inside(il)) {
+            const double want = share * before[(size_t) n_layer];
+            const bool lo_ok = keep_lo > starts.back(), hi_ok = keep_hi <= most;
+            if (!lo_ok && !hi_ok)
+                throw std::runtime_error("layers " + std::to_string(keep_lo) + " to " + std::to_string(keep_hi - 1) +
+                                         " run on one card: there is no place for card " + std::to_string(d) +
+                                         " to start");
+            il = !hi_ok || (lo_ok && want - before[(size_t) keep_lo] <= before[(size_t) keep_hi] - want) ? keep_lo
+                                                                                                          : keep_hi;
+        }
         starts.push_back(il);
+    }
+    if (swap && cards == 2 && keep_hi > keep_lo && loop_runs > 1) {   // Inkling 2's loop on the faster card
+        for (int il = keep_lo; il < keep_hi; ++il) layers[(size_t) il].runs = loop_runs;
+        const std::string arch = file.get("general.architecture") ? file.get("general.architecture")->s : "";
+        const MetaValue* used = file.get(arch + ".expert_used_count");
+        const MetaValue* all = file.get(arch + ".expert_count");
+        const double reads = used && all && all->u > 0 ? double(used->u) / double(all->u) : 1.0 / 16;
+        const SplitPlan plan = loop_split(layers, head, two, keep_lo, keep_hi, starts[1], reads);
+        if (plan.cut != starts[1] || plan.swap) {
+            const bool first = plan.cut >= keep_hi;   // the first part has the loop
+            std::fprintf(stderr,
+                         "strata-poly: layer split auto: the loop (layers %d to %d, %d runs a token) on the faster "
+                         "card, device %d (%.0f GB/s, the other %.0f): the second part from layer %d%s, %.1f ms a "
+                         "token estimated where %d in the devices' order is %.1f\n",
+                         keep_lo, keep_hi - 1, loop_runs, first != plan.swap ? 0 : 1, two[first != plan.swap ? 0 : 1].gbs,
+                         two[first != plan.swap ? 1 : 0].gbs, plan.cut, plan.swap ? ", the devices swapped" : "",
+                         plan.ms, starts[1], split_ms(layers, head, two, starts[1], false, reads));
+        }
+        starts[1] = plan.cut;
+        *swap = plan.swap;
     }
     return starts;
 }
@@ -1262,10 +1335,12 @@ void Engine::metal_invalidate_graphs() {
     graphs_.clear();
     for (Layer& l : layers_) {
         l.heads.clear(); l.shared.clear(); l.tail.clear(); l.card_moe.clear(); l.rows_heads.clear();
+        l.rows_tails.clear();
         l.card = -1;
     }
     passes_.clear();
     step_passes_.clear();
+    step_used_.clear();   // (destroyed with graphs_ above)
     tail_ = tail_picks_ = nullptr;
     for (Seq& q : seqs_) {
         q.heads.clear(); q.passes.clear(); q.tail = q.tail_picks = nullptr;
@@ -1988,13 +2063,26 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
     // STRATA_POLY_CARDS=N: a split's N parts on the devices there are, in turn, so that a split is tried on one card
     if (const char* v = std::getenv("STRATA_POLY_CARDS"); v && !o.layer_split.empty()) cards = std::max(1, std::atoi(v));
     std::vector<int> starts;
+    bool swap = false;   // "auto" put the first layers on the second device (layer_starts())
     if (cards > 1) {
         const MetaValue* blocks = file.get(name + ".block_count");
         const MetaValue* nextn = file.get(name + ".nextn_predict_layers");
         if (!blocks) throw std::runtime_error("the GGUF has no " + name + ".block_count");
+        // Inkling 2's loop runs on one card: a later pass of it runs the core's layers again (Inkling2::next_layer())
+        int keep_lo = 0, keep_hi = 0, loop_runs = 1;
+        if (name == "inkling2_loop") {
+            const MetaValue* lo = file.get(name + ".loop.start");
+            const MetaValue* hi = file.get(name + ".loop.end");
+            const MetaValue* count = file.get(name + ".loop.count");
+            if (!lo || !hi) throw std::runtime_error("unsupported model: no " + name + ".loop.start and .loop.end");
+            keep_lo = (int) lo->u;
+            keep_hi = (int) hi->u;
+            loop_runs = count ? (int) count->u : 1;
+        }
         int was = 0;
         ck(cudaGetDevice(&was), "cudaGetDevice");
-        starts = layer_starts(o.layer_split, file, (int) blocks->u - (nextn ? (int) nextn->u : 0), cards);
+        starts = layer_starts(o.layer_split, file, (int) blocks->u - (nextn ? (int) nextn->u : 0), cards, keep_lo,
+                              keep_hi, loop_runs, &swap);
         ck(cudaSetDevice(was), "cudaSetDevice");
     }
     if (starts.empty()) {
@@ -2021,7 +2109,7 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
         e->lo_ = starts[k];
         e->end_ = last ? -1 : starts[k + 1];
         e->split_ = true;
-        ck(cudaSetDevice((int) k % devices), "cudaSetDevice");
+        ck(cudaSetDevice((swap ? 1 - (int) k : (int) k) % devices), "cudaSetDevice");
         try {
             e->load(so);
         } catch (const std::runtime_error& err) {
@@ -2036,7 +2124,8 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
     int k = 0;
     for (const Engine* e = first.get(); e; e = e->next_.get(), ++k)
         std::fprintf(stderr, "strata-poly: layers %d to %d on card %d: %d of %d routed experts in VRAM (%.1f GiB)\n",
-                     e->lo_, e->hi_ - 1, k, e->cached_, e->n_moe_ * e->n_expert_, double(e->exp_at_) / double(1ull << 30));
+                     e->lo_, e->hi_ - 1, swap ? e->device_ : k, e->cached_, e->n_moe_ * e->n_expert_,
+                     double(e->exp_at_) / double(1ull << 30));
     return first;
 }
 
@@ -3895,6 +3984,8 @@ void Engine::alloc() {
         d_ids_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
         d_wts_ = (float*) dmalloc(rr * sizeof(float), "scratch");
         h_ids_ = (int32_t*) hmalloc(rr * sizeof(int32_t), "pinned memory");
+        // the weights of step()'s rows, back from the card where a token alone routes there (the doorbell)
+        if (bells() && opt_.batch > 0) h_wts_ = (float*) hmalloc(rr * sizeof(float), "pinned memory");
         d_slots_ = (void**) dmalloc((size_t) n_layer_ * n_expert_ * sizeof(void*), "scratch");
 #if !defined(STRATA_GPU_METAL)
         d_far_ = (void**) dmalloc((size_t) n_layer_ * n_expert_ * sizeof(void*), "scratch");
@@ -4638,6 +4729,11 @@ void Engine::pool_ahead(int j, int n, size_t part, int k) {
 // with 6 the card took 84% of the experts in place of 81%, but more uploads were late and the answer slower; with
 // 8 a third of them went unused.
 void Engine::vram_ahead(int j, int n, size_t part) {
+    // up_ copies in order: guesses put behind uploads it has not finished land after their layer has run, and a
+    // call's own miss (moe()) waits behind them with the card.  A bus that keeps up is done before the next layer.
+    // Qwen3.6 UD-Q4_K_M on a 4090 D held to 11 GiB, PCIe 4.0 x8: the first answer after a load wrote 102-109
+    // tokens/s with them queued, 173-185 without; UD-Q3_K_M on the PRO 6000, PCIe 5.0 x16: 300-358 and 334-347.
+    if (up_busy()) return;
     const Layer& L = layers_[(size_t) j];
     const size_t ne = (size_t) n_expert_;
     constexpr int k = kAheadGuesses;
@@ -4685,10 +4781,13 @@ void Engine::vram_ahead(int j, int n, size_t part) {
         ck(cudaEventRecord((cudaEvent_t) g.arrived[i], cs(up_)), "upload ahead");   // usable on its own
     }
     ck(cudaEventRecord((cudaEvent_t) g.up, cs(up_)), "upload ahead");
+    up_last_ = g.up;
     g.here = 0;
     g.il = j;
     stats_.ahead_sent += g.n;
 }
+
+bool Engine::up_busy() const { return up_last_ && cudaEventQuery((cudaEvent_t) up_last_) == cudaErrorNotReady; }
 
 // Expert e of layer il in a group vram_ahead() uploaded, once it has arrived, or null.  `read` gets the group's bit:
 // moe() marks the group's last reader after its launches.
@@ -5128,6 +5227,12 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         const auto route_row = [&](int t) {
             int* ids = ids_of[t];
             float* w = w_of[t];
+            if (step_ids_) {   // step()'s rows: the card's picks and weights (step_ids_)
+                const size_t from = (size_t) (at + t) * n_used_;
+                std::copy(step_ids_ + from, step_ids_ + from + n_used_, ids);
+                std::copy(h_wts_ + from, h_wts_ + from + n_used_, w);
+                return;
+            }
             const float* scores = h_rl_ + (size_t) (at + t) * n_expert_;
             float* tmp = route_tmp_.data() + (size_t) (spread ? t : 0) * 2 * n_expert_;
             if (opt_.cache_bias > 0.f) route_cached(L, il, scores, tok_ ? tok_[at + t] : -1, ids, w, tmp);
@@ -5215,8 +5320,9 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         // the card waits for one upload less than the CPU takes for it.  At 6 GB (vram_ahead()) 85% of the experts
         // went to the card in place of 81%, 182-189 tokens/s in place of 175-187; two or three a call left the card
         // waiting for their uploads, and were slower than none.
+        // Not while up_ still copies the guesses for this layer or earlier ones: the card would wait for all of them.
         int own = -1;   // that expert, which launch() uploads; -1: none
-        if (aheads && n_host > 0 && at == 0) {
+        if (aheads && n_host > 0 && at == 0 && !up_busy()) {
             int best = 0, most = 0;
             for (int i = 0; i < n_host; ++i) {
                 if (host[i].gate != mirror(il, host_e[i])) continue;
@@ -5271,6 +5377,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                                    L.gu2() + L.d_bytes, cudaMemcpyHostToDevice, cs(up_)),
                    "upload ahead");
                 ck(cudaEventRecord((cudaEvent_t) g.up, cs(up_)), "upload ahead");
+                up_last_ = g.up;
             }
             // The upload's uses come last in cached: the experts before them go at once, and only the launches with
             // its uses wait for it.  When every launch waited for it, the card was still busy after the CPU's experts
@@ -6451,13 +6558,19 @@ void Engine::moe_rows(Layer& L, int il, int n) {
         }
         b[n_chan] = at;
     }
-    ck(cudaMemcpyAsync(tab_, h_tab_,
-                       (3 * cap + 3 * (size_t) n_expert_ + 3 + kClasses * cb_row + 2 * n_tile * tile_row * (n_tile > 1)) *
-                           sizeof(int32_t),
-                       cudaMemcpyHostToDevice, cs(st_)),
-       "expert rows");
-    if ((es.gate || es.up) && rg > 0)
-        ck(cudaMemcpyAsync(d_ex_, h_ex_, (size_t) rg * sizeof(int32_t), cudaMemcpyHostToDevice, cs(st_)), "expert rows");
+    const size_t n_tab =
+        3 * cap + 3 * (size_t) n_expert_ + 3 + kClasses * cb_row + 2 * n_tile * tile_row * (n_tile > 1);
+    const int n_ex = (es.gate || es.up) && rg > 0 ? rg : 0;
+    // A read of several calls copies each layer's experts outside the cache ahead (up_), and a copy of the tables
+    // would wait behind them: there a kernel reads them from pinned memory.  A call alone keeps the copy.
+    if (kernel_tables_ && opt_.stage_ahead > 0 && shared_ahead_) {
+        copy2(h_tab_, tab_, (int) n_tab, h_ex_, d_ex_, n_ex, st_);
+    } else {
+        ck(cudaMemcpyAsync(tab_, h_tab_, n_tab * sizeof(int32_t), cudaMemcpyHostToDevice, cs(st_)), "expert rows");
+        if (n_ex > 0)
+            ck(cudaMemcpyAsync(d_ex_, h_ex_, (size_t) n_ex * sizeof(int32_t), cudaMemcpyHostToDevice, cs(st_)),
+               "expert rows");
+    }
 
     const int rc = bounds[n_cached];   // the rows of the cached experts
     stats_.batch_cached += rc;
@@ -6496,10 +6609,9 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             h_slot_at_[g] = L.slot[(size_t) group_[(size_t) g]] - slot0;
             by_at = by_at && h_slot_at_[g] % 16 == 0;
         }
-        if (by_at)
-            ck(cudaMemcpyAsync(d_slot_at_, h_slot_at_, (size_t) n_cached * sizeof(int64_t), cudaMemcpyHostToDevice,
-                               cs(st_)),
-               "expert offsets");
+        // by a kernel that reads them from pinned memory, as the tables: a copy would wait behind the experts the
+        // copy engine is taking to the card, and the cached experts' launches behind it
+        if (by_at) copy2(h_slot_at_, d_slot_at_, 2 * n_cached, nullptr, nullptr, 0, st_);
     }
     // the cached experts lie class after class in group_: a launch for each class with rows, over all of its experts
     // (Metal's Mmq has no mul_at(): by_at is never set there)
@@ -6727,11 +6839,143 @@ void* Engine::record(F&& work) {
     recording_ = false;
     ck(cudaStreamEndCapture(cs(st_), &g), "cudaStreamEndCapture");
     cudaGraphExec_t exec = nullptr;
-    const cudaError_t made = cudaGraphInstantiateWithFlags(&exec, g, 0);
+    cudaError_t made = cudaGraphInstantiateWithFlags(&exec, g, 0);
+    if (made == cudaErrorMemoryAllocation && !step_used_.empty()) {
+        // Inkling 2's step recordings (step_replay(): only where tail_by_rows()) give their place to this one: run()'s
+        // and step()'s other recordings.  Every family else has none, and fails here as before.
+        cudaGetLastError();
+        trim_step_graphs(0, !in_step_);
+        exec = nullptr;
+        made = cudaGraphInstantiateWithFlags(&exec, g, 0);
+    }
     cudaGraphDestroy(g);
     ck(made, "cudaGraphInstantiate");
     graphs_.push_back(exec);
     return exec;
+}
+
+// step()'s recording `in[key]` launched, made first if it is not there; false when `work` ran unrecorded instead.  A
+// recording that fails for memory has already run `work` on the host once (its launches captured, nothing run on the
+// card), so `work` runs again unrecorded: a step's host side is the same each time it is recorded or run (layer_head()
+// and layer_tail() keep no host state across a call: moe_left_ is never set in step(), whose whole_rec_ is false, and
+// next_layer() brings pass_ back to 0).  STRATA_POLY_STEP_RECORD_FAIL=N (tests) fails every Nth recording that way.
+bool Engine::step_replay(std::map<std::vector<int>, void*>& in, const std::vector<int>& key,
+                         const std::function<void()>& work) {
+    const auto it = in.find(key);
+    void* g = it != in.end() ? it->second : nullptr;
+    if (!g && step_no_ >= step_rec_retry_) {
+        g = record_step(work);
+        if (g) in[key] = g;
+    }
+    if (!g) {
+        work();
+        ++step_unrecorded_;
+        return false;
+    }
+    ck(cudaGraphLaunch((cudaGraphExec_t) g, cs(st_)), "layer graph");
+    step_used_[g] = step_no_;
+    return true;
+}
+
+// record() for step_replay(), with the step recordings held to a count (step_cap_).  The count, not the VRAM they
+// seem to take: cudaGraphExecDestroy() gives the driver's memory back to no cudaMemGetInfo(), and the recordings
+// made after a drop take the memory it kept, so a fixed number held keeps the VRAM flat where a sum of what
+// cudaMemGetInfo() showed would not.  A recording the card has no memory for drops every step recording but this
+// step's and tries again; failing still, it is not made (null), and no step records for the next 256 steps.
+void* Engine::record_step(const std::function<void()>& work) {
+    if (step_cap_ == 0) {
+        // the cap: a recording is 220-250 KiB (an Inkling 2 layer's head or tail, RTX 2070 and 2080 Ti); 4 a MiB of a
+        // 64th of the card, 256 to 1,024 recordings (512, 128 MiB, on an 8 GB card), or STRATA_POLY_STEP_GRAPHS
+        size_t free_b = 0, total_b = 0;
+        ck(cudaMemGetInfo(&free_b, &total_b), "cudaMemGetInfo");
+        step_cap_ = std::clamp<size_t>((total_b >> 26) * 4, 256, 1024);
+        if (const char* v = std::getenv("STRATA_POLY_STEP_GRAPHS"); v && std::atoi(v) > 0) step_cap_ = (size_t) std::atoi(v);
+    }
+    static const int fail_every = [] {
+        const char* v = std::getenv("STRATA_POLY_STEP_RECORD_FAIL");
+        return v ? std::max(0, std::atoi(v)) : 0;
+    }();
+    cudaGraph_t g = nullptr;
+    ck(cudaStreamBeginCapture(cs(st_), cudaStreamCaptureModeThreadLocal), "cudaStreamBeginCapture");
+    recording_ = recorded_ = true;
+    try {
+        work();
+    } catch (...) {
+        recording_ = false;
+        if (cudaStreamEndCapture(cs(st_), &g) == cudaSuccess && g) cudaGraphDestroy(g);
+        cudaGetLastError();
+        throw;
+    }
+    recording_ = false;
+    ck(cudaStreamEndCapture(cs(st_), &g), "cudaStreamEndCapture");
+    const bool forced = fail_every > 0 && ++step_tries_ % (uint64_t) fail_every == 0;
+    size_t f0 = 0, f1 = 0, total = 0;
+    ck(cudaMemGetInfo(&f0, &total), "cudaMemGetInfo");
+    cudaGraphExec_t exec = nullptr;
+    cudaError_t made = forced ? cudaErrorMemoryAllocation : cudaGraphInstantiateWithFlags(&exec, g, 0);
+    if (made == cudaErrorMemoryAllocation) {
+        cudaGetLastError();
+        trim_step_graphs(0, false);
+        ck(cudaMemGetInfo(&f0, &total), "cudaMemGetInfo");
+        exec = nullptr;
+        made = forced ? cudaErrorMemoryAllocation : cudaGraphInstantiateWithFlags(&exec, g, 0);
+    }
+    cudaGraphDestroy(g);
+    if (made == cudaErrorMemoryAllocation) {
+        cudaGetLastError();
+        step_rec_retry_ = step_no_ + (forced ? 1 : 256);
+        if (!forced)
+            std::fprintf(stderr, "strata-poly: no VRAM for a step's recording: the steps run unrecorded for a while\n");
+        return nullptr;
+    }
+    ck(made, "cudaGraphInstantiate");
+    ck(cudaMemGetInfo(&f1, &total), "cudaMemGetInfo");
+    if (step_dropped_ == 0) step_bytes_ += f0 > f1 ? f0 - f1 : 0;   // (for the log: right only until the first drop)
+    graphs_.push_back(exec);
+    step_used_[exec] = step_no_;
+    ++step_made_;
+    if (step_used_.size() > step_cap_) trim_step_graphs(step_cap_ / 4 * 3, false);
+    if (step_dropped_ == 0 && step_used_.size() >= 2 * std::max<size_t>(step_logged_, 128)) {   // the size, for the cap
+        step_logged_ = step_used_.size();
+        std::fprintf(stderr, "strata-poly: step recordings: %zu held, %.1f MiB (%.0f KiB each), cap %zu\n",
+                     step_used_.size(), step_bytes_ / 1048576.0, step_bytes_ / 1024.0 / (double) step_used_.size(),
+                     step_cap_);
+    }
+    return exec;
+}
+
+// The step recordings launched longest ago go until `keep` are held: never this step's own (`all`: every one, from
+// outside step(), where none is under way).  Those are done on the card: step() waits for the step before it first.
+void Engine::trim_step_graphs(size_t keep, bool all) {
+    if (step_used_.size() <= keep) return;
+    std::vector<std::pair<uint64_t, void*>> old;
+    for (const auto& [g, used] : step_used_)
+        if (all || used != step_no_) old.push_back({used, g});
+    std::sort(old.begin(), old.end());
+    std::set<void*> gone;
+    for (const auto& [used, g] : old) {
+        if (step_used_.size() - gone.size() <= keep) break;
+        gone.insert(g);
+    }
+    if (gone.empty()) return;
+    const auto drop = [&](std::map<std::vector<int>, void*>& in) {
+        for (auto it = in.begin(); it != in.end();) it = gone.count(it->second) ? in.erase(it) : std::next(it);
+    };
+    for (Layer& L : layers_) {
+        drop(L.rows_heads);
+        drop(L.rows_tails);
+    }
+    drop(step_passes_);
+    graphs_.erase(std::remove_if(graphs_.begin(), graphs_.end(), [&](void* g) { return gone.count(g) > 0; }),
+                  graphs_.end());
+    for (void* g : gone) {
+        ck(cudaGraphExecDestroy((cudaGraphExec_t) g), "a step's recording");
+        step_used_.erase(g);
+    }
+    step_dropped_ += gone.size();
+    std::fprintf(stderr, "strata-poly: step recordings: dropped %zu, %zu held (cap %zu); %zu made, %zu dropped, %zu runs "
+                         "unrecorded in all\n",
+                 gone.size(), step_used_.size(), step_cap_, step_made_, step_dropped_, step_unrecorded_);
 }
 
 // n tokens from pos() through every layer.  The sequence is not longer for it: the caller says by how much.
@@ -6768,6 +7012,7 @@ void Engine::run(const int32_t* tokens, int n) {
         embed_rows(tokens, pos_, n, h_r_);
     if (n < kStageRows) copy2(h_r_, r_, n * (int) r_row, nullptr, nullptr, 0, st_);
     else ck(cudaMemcpyAsync(r_, h_r_, (size_t) n * r_row * sizeof(float), cudaMemcpyHostToDevice, cs(st_)), "embed");
+    carry_in(pos_ - pass_at_, n);
 
     // A token alone, or a window of guessed ones, hands the card the same launches every time, some thirty a
     // layer up to the router, and they cost this thread more than the card.  They are recorded once, a graph a
@@ -7026,6 +7271,11 @@ int Engine::step_rows_alone() const { return std::min(rows_, kStageRows - 1); }
 void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* guesses) {
     // step_picks() asks this step only: taken first, so a step that throws (KvFull below) leaves no ask for the next
     const bool picks = std::exchange(step_picks_, false) && d_picks_;
+    ++step_no_;   // (step_replay()'s clock)
+    struct InStep {
+        bool& on;
+        ~InStep() { on = false; }
+    } in_step{in_step_ = true};
     if (n < 1 || n > std::min(rows_, sequences())) throw std::logic_error("step takes 1 to sequences() tokens");
     if (guesses && !steps_guesses()) throw std::logic_error("step: guesses need --batch-mtp, a draft block and one card");
     if (!step_seqs_.empty()) throw std::logic_error("step: the rows of the step before are not kept yet (keep_step())");
@@ -7077,6 +7327,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
         h_at_[2 * i + 1] = turn(at[(size_t) i]);
     }
     copy2(h_r_, r_, R * (int) r_row, nullptr, nullptr, 0, st_);
+    carry_in(0, R);
     copy2(h_at_, at_, R * 2 * (int) (sizeof(long long) / 4), nullptr, nullptr, 0, st_);
 
     const size_t wn = (size_t) opt_.window, recs = 3 * wn + (size_t) opt_.batch + 1, rec = (size_t) R - 1;
@@ -7086,7 +7337,25 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
         if (!made[key]) made[key] = record(work);
         ck(cudaGraphLaunch((cudaGraphExec_t) made[key], cs(st_)), "layer graph");
     };
+    // A step of one row rings the doorbell as run() rings it for a token (bell_on(): card_moe() routes such a row on
+    // the card for it): its misses go to this thread's workers from inside the launches, which bell_serve() answers
+    // once they are handed to the card.  Without the ring, moe_card() would read the mirror's table that card_moe()
+    // did not fill for it.
+    bell_ = bell_on(R);
+    bell_counts_ |= bell_;
+    struct BellOff {
+        bool& on;
+        ~BellOff() { on = false; }
+    } bell_off{bell_};
     const bool card = R < kStageRows && card_moe(R);
+    // a token alone is routed on the card (the doorbell, bell_on()), so the rows the host takes are too (below)
+    // (card_moe(1)'s test without its side effects: the doorbell, the card's slot table, no --expert-gpu; a layer that
+    // card_moe() found it cannot route, L.card == 0, is routed on the host alone too: below)
+    bool picks_like_alone = h_wts_ && bell_on(1) && d_slots_ && n_used_ <= card_rows() && !opt_.dump && R > 1 &&
+                            !guesses && opt_.cache_bias <= 0.f;
+#if !defined(STRATA_GPU_METAL)
+    picks_like_alone = picks_like_alone && !ecard_;
+#endif
     // an architecture that takes the rows in one head: their sequences and positions while it does
     std::vector<Row> rows;
     if (batch_heads())
@@ -7134,7 +7403,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
     }
     if (whole) {
         const int64_t keep = pos_;
-        std::vector<int> wkey{R, picks ? 1 : 0};
+        std::vector<int> wkey{R, picks ? 1 : 0, bell_ ? 1 : 0};
         for (int i = 0; i < R; ++i) {
             pos_ = at[(size_t) i];
             wkey.push_back(rseq[(size_t) i]);
@@ -7143,25 +7412,33 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
             for (int il = lo_; il < hi_; ++il) wkey.push_back(head_key(il, 1));
         }
         pos_ = keep;
-        void*& pass = step_passes_[wkey];
-        if (!pass)
-            pass = record([&] {
-                for (int il = lo_; il < hi_; ++il) {
+        const auto whole_work = [&] {
+                // the layers' runs in next_layer()'s order (a looped core's layers run more than once a token)
+                for (int il = lo_; il < hi_; il = next_layer(il)) {
                     Layer& L = layers_[(size_t) il];
                     rows_of_ = rows.data();
                     n_rows_of_ = R;
                     layer_head(L, il, R);
-                    rows_of_ = nullptr;
+                    if (!tail_by_rows() || !L.moe) rows_of_ = nullptr;
                     if (!L.moe) continue;
                     moe_shared(L, il, R);
                     moe_card(L, il, R);
                     layer_tail(L, il, R);
+                    rows_of_ = nullptr;
                 }
                 logits_rows(0, R);
-            });
-        ck(cudaGraphLaunch((cudaGraphExec_t) pass, cs(st_)), "layer graph");
-        for (int il = lo_; il < hi_; ++il) stats_.gpu_experts += layers_[(size_t) il].moe ? R * n_used_ : 0;
+            };
+        if (tail_by_rows()) {
+            step_replay(step_passes_, wkey, whole_work);
+        } else {
+            void*& pass = step_passes_[wkey];
+            if (!pass) pass = record(whole_work);
+            ck(cudaGraphLaunch((cudaGraphExec_t) pass, cs(st_)), "layer graph");
+        }
+        for (int il = lo_; il < hi_; il = next_layer(il))
+            stats_.gpu_experts += layers_[(size_t) il].moe ? R * n_used_ : 0;
         out_done[0] = out_done[1] = true;
+        if (bell_) bell_serve();
     }
     // With experts on the CPU, the rows go through the layers in two halves, a sequence's rows in one, as a window's
     // tokens do (run()): this thread routes a half and computes its CPU experts, and meanwhile the thread that hands
@@ -7174,8 +7451,9 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
     }();
     int mid = R / 2;
     while (mid < R && mid > 0 && rseq[(size_t) mid] == rseq[(size_t) mid - 1]) ++mid;
-    const bool halved = halves_on && !card && batch_heads() && !all_cached() && R >= 4 && mid > 0 && mid < R &&
-                        !batched(layers_[(size_t) first_moe_layer()], R);
+    // (not where the tails take the rows: a half's tail is recorded by its place in the buffers, not by sequence)
+    const bool halved = halves_on && !card && batch_heads() && !tail_by_rows() && !all_cached() && R >= 4 && mid > 0 &&
+                        mid < R && !batched(layers_[(size_t) first_moe_layer()], R);
     if (halved) {
         const int first[3] = {0, mid, R};
         int at0 = 0;
@@ -7273,7 +7551,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
         }
         back();
     }
-    for (int il = lo_; il < hi_ && !halved && !whole; ++il) {
+    for (int il = lo_; il < hi_ && !halved && !whole; il = next_layer(il)) {
         Layer& L = layers_[(size_t) il];
         if (batch_heads()) {
             const int64_t keep = pos_;
@@ -7287,7 +7565,9 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
             pos_ = keep;
             rows_of_ = rows.data();
             n_rows_of_ = R;
-            if (replay && L.fixed) {
+            if (replay && L.fixed && tail_by_rows()) {
+                step_replay(L.rows_heads, key, [&] { layer_head(L, il, R); });
+            } else if (replay && L.fixed) {
                 void*& made = L.rows_heads[key];
                 if (!made) made = record([&] { layer_head(L, il, R); });
                 ck(cudaGraphLaunch((cudaGraphExec_t) made, cs(st_)), "layer graph");
@@ -7311,25 +7591,57 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
         if (batched(L, R)) {
             moe_rows(L, il, R);
         } else {
+            // Rows the host takes, where a token alone is routed on the card (the doorbell's route_card()): they take
+            // the card's picks too (moe(), step_ids_).  The host's route() computes the gates' sigmoid with its own
+            // exp, which can differ from the card's in the last bit, and a row would not get the weights, or now
+            // and then the experts, it gets alone.
+            // (a layer card_moe() has not tried yet, L.card == -1, counts as the card's only where its types have the
+            // card's pick kernels, as moe_card() would find: else a token alone would be routed on the host)
+            const bool layer_card = L.card == 1 || (L.card == -1 && kernels::native_mmvq_ids_supported((int) L.gu_type) &&
+                                                    kernels::native_mmvq_ids_supported((int) L.u_type) &&
+                                                    kernels::native_mmvq_ids_supported((int) L.d_type));
+            const bool card_picks = !card && picks_like_alone && layer_card && route_card(il, R, d_ids_, d_wts_);
+            if (card_picks) copy2(d_ids_, h_ids_, R * n_used_, d_wts_, h_wts_, R * n_used_, st_);
             ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
             if (replay && shared_recorded()) replayed(L.shared, rec, [&] { moe_shared(L, il, R); });
             else moe_shared(L, il, R);
-            if (card && L.card == 1 && replay) {
-                replayed(L.card_moe, rec, [&] { moe_card(L, il, R); });
+            bool on_card = true;
+            if (card && L.card == 1 && replay) replayed(L.card_moe, rec, [&] { moe_card(L, il, R); });
+            else on_card = card && moe_card(L, il, R);
+            if (on_card) {
                 stats_.gpu_experts += R * n_used_;
-            } else if (card && moe_card(L, il, R)) {
-                stats_.gpu_experts += R * n_used_;
-            } else if (moe(L, il, R)) {
-                moe_add(R);
+                if (bell_) bell_serve();   // as run() layer by layer: what this thread does next may wait for the card
+            } else {
+                struct Picks {
+                    const int32_t*& ids;
+                    ~Picks() { ids = nullptr; }
+                } picks_off{step_ids_};
+                step_ids_ = card_picks ? h_ids_ : nullptr;
+                if (moe(L, il, R)) moe_add(R);
             }
         }
-        if (replay && L.fixed) replayed(L.tail, rec, [&] { layer_tail(L, il, R); });
-        else layer_tail(L, il, R);
+        if (tail_by_rows()) {   // the rows' own states: recorded by their sequences
+            std::vector<int> tkey{R, tail_key(il, R)};
+            for (int i = 0; i < R; ++i) tkey.push_back(rseq[(size_t) i]);
+            rows_of_ = rows.data();
+            n_rows_of_ = R;
+            if (replay && L.fixed) {
+                step_replay(L.rows_tails, tkey, [&] { layer_tail(L, il, R); });
+            } else {
+                layer_tail(L, il, R);
+            }
+            rows_of_ = nullptr;
+        } else if (replay && L.fixed) {
+            replayed(L.tail, rec, [&] { layer_tail(L, il, R); });
+        } else {
+            layer_tail(L, il, R);
+        }
     }
 
     if (next_) {
         float* h = pass_rows(R);
         ck(cudaMemcpyAsync(h, r_, (size_t) R * r_row * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)), "the next card");
+        carry_out(h, R);
         ck(cudaStreamSynchronize(cs(st_)), "the next card");
         next_->pass_ = h;
         next_->step(seqs, tokens, n);
@@ -7359,6 +7671,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
 }
 
 int32_t Engine::picked(int i) const {
+    if (next_) return next_->picked(i);   // a layer split: the last card's pick, or its logits
     return picks_ ? h_picks_[i].token : most_likely(logits_of(i), n_vocab_);
 }
 
@@ -7520,7 +7833,8 @@ float* Engine::pass_rows(int n) {
         hfree(h_pass_);
         h_pass_ = nullptr;
         h_pass_rows_ = std::max(n, rows_);
-        h_pass_ = (float*) hmalloc((size_t) h_pass_rows_ * streams() * n_embd_ * sizeof(float), "pinned memory");
+        h_pass_ = (float*) hmalloc((size_t) h_pass_rows_ * (streams() + carry_rows()) * n_embd_ * sizeof(float),
+                                   "pinned memory");
     }
     return h_pass_;
 }
@@ -7529,9 +7843,34 @@ float* Engine::pass_rows(int n) {
 void Engine::hand_on(int64_t pos, int n, float* h) {
     ck(cudaMemcpyAsync(h, r_, (size_t) n * streams() * n_embd_ * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)),
        "the next card");
+    carry_out(h, n);
     ck(cudaStreamSynchronize(cs(st_)), "the next card");
     next_->pass_ = h;
     next_->pass_at_ = pos;
+}
+
+// Inkling 2's residual streams and the loop's bank, which its calls keep beside r_ (carry_rows()): after the n rows of
+// r_ at h, block after block, n rows each.
+void Engine::carry_out(float* h, int n) {
+    const size_t e = (size_t) n_embd_, at = (size_t) n * streams() * e;
+    for (int i = 0; i < carry_rows(); ++i)
+        ck(cudaMemcpyAsync(h + at + (size_t) i * n * e, carried(i), (size_t) n * e * sizeof(float),
+                           cudaMemcpyDeviceToHost, cs(st_)),
+           "the next card");
+    next_->pass_n_ = n;
+}
+
+// A later card's carried rows for its call of n tokens, from row `from` of the card before's hand-off; the hand-off's
+// memory is that card's again when this returns.
+void Engine::carry_in(int64_t from, int n) {
+    if (!pass_ || carry_rows() == 0) return;
+    const size_t e = (size_t) n_embd_;
+    const float* c = pass_ + (size_t) pass_n_ * streams() * e;
+    for (int i = 0; i < carry_rows(); ++i)
+        ck(cudaMemcpyAsync(carried(i), c + ((size_t) i * pass_n_ + (size_t) from) * e, (size_t) n * e * sizeof(float),
+                           cudaMemcpyHostToDevice, cs(st_)),
+           "the card before");
+    ck(cudaStreamSynchronize(cs(st_)), "the card before");
 }
 
 void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
@@ -7748,6 +8087,8 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     // An architecture whose calls keep rows of their own between layer runs takes them through the runs a group at a
     // time (read_groups()), where the staging buffer can grow for the read.
     const bool groups = carry_rows() > 0 && n_co == 0 && !next_ && !draft_ && stage_wide_ > stage_narrow_;
+    // a call's carried rows reach a later card through eval(), which the card before takes such calls through below
+    if (pass_ && carry_rows() > 0) throw std::logic_error("read: a later card's carried rows come through eval()");
     // co-reads go through the layers in packs whatever the experts: one by one their calls would wait as long
     if (n_co == 0 &&
         (n_calls == 1 || !mmq_ || all_cached() || all < opt_.stage_ahead || !(reads_by_layer() || groups))) {
@@ -8140,7 +8481,11 @@ void Engine::window(const int32_t* tokens, int t) {
     // experts with the card's layer, and there is little of the CPU's left to overlap, while each half reads the
     // layer's weights again and guesses ahead for fewer tokens.  At 6 GB the tokens together wrote 181 tokens/s
     // where the timed choice wrote 172 (12 GB: 275 and 252), four runs each.
-    if (timed && !freeze_experts_) halves_ = ahead_slots_ == 0 && pick_way(t);
+    //
+    // The halves go through the layers one after the other in order, each at its own rows of r_ (run()), so not
+    // where the layers keep rows of their own or do not run in order (reads_by_layer()): Inkling 2's looped core
+    // ran once a token in halves, and its answers lost words.
+    if (timed && !freeze_experts_) halves_ = ahead_slots_ == 0 && reads_by_layer() && pick_way(t);
     const Clock::time_point t0 = Clock::now();
     windowed_ = true;
     snap_bits_ = snap_tokens(t);

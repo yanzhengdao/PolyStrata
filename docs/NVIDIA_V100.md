@@ -56,7 +56,7 @@ Every single-GPU or uniform-`sm_70` run enables 21 bit-exact switches by default
 
 - `STRATA_ADAPT_OVERLAP=1`, `STRATA_SM70_TABLE=1`, `STRATA_B6_MMVQ_ROWS=1`, `STRATA_TSUM=1`, `STRATA_SMALL_UNR=3`, `STRATA_GR_NORM_FAST=1`, `STRATA_SIDE_MIXER=2`, `STRATA_ARGMAX_ROWS_SM70=1`, `STRATA_LFUSE=1`, `STRATA_GDN_SPLIT=1`, `STRATA_SH_STREAM=1`, `STRATA_Q80_ROWS1=1`, `STRATA_NO_MMVQ_ROWS2=1`, `STRATA_CPU_IQ_ALL_EXACT1=1`, `STRATA_GR_Q8_DOWN_MODE=2`, `STRATA_GR_Q8_UP_COLS=16`, `STRATA_GR_Q8_UP_MODE=2`, `STRATA_SCORES_HALVE=1`, `STRATA_SCORES_THREAD=1`, `STRATA_TOPK_SAMPLE=1`, `STRATA_SELECT_LONG=1`.
 
-When running under CUDA 13 via [nbald/volta-forever](https://github.com/nbald/volta-forever), Strata probes `volta_forever_version` in `libcuda.so.1`, remaps emulated `7.5` reporting back to Volta `(7, 0)` for defaults and kernel selection, and keeps `CUDA_MODULE_LOADING=LAZY` so cuBLAS initialization does not exhaust heap memory.
+When running under CUDA 13 via [nbald/volta-forever](https://github.com/nbald/volta-forever), PolyStrata probes `volta_forever_version` in `libcuda.so.1`, remaps emulated `7.5` reporting back to Volta `(7, 0)` for defaults and kernel selection, and keeps `CUDA_MODULE_LOADING=LAZY` so cuBLAS initialization does not exhaust heap memory.
 
 ## Opt-in switches
 

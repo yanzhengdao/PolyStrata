@@ -261,7 +261,7 @@ class InstalledModelsNeedNoNetwork(unittest.TestCase):
         # the rule exact for everything else.
         # strata_control/pictures.py names the host for the picture-reader files that Load fetches when Read pictures is on and the files
         # are missing: its download calls acquisition.require first (refused under STRATA_NO_ACQUIRE, so a start or a server never reaches it).
-        # strata_control/transfer.py names the hosts only to decide whether a download it was given gets the HF_TOKEN header (Strata 0.2.19):
+        # strata_control/transfer.py names the hosts only to decide whether a download it was given gets the HF_TOKEN header (the Strata project's 0.2.19):
         # it opens no address of its own.
         harmless = ('MODEL_CARD_URL = "https://huggingface.co/Qwen/Qwen3.8-Flash-Next"',
                     'BASE_URL = f"https://huggingface.co/{REPO}/resolve/{REVISION}/"',

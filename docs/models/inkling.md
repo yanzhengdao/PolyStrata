@@ -3,7 +3,7 @@
 Back to [README.md](../../README.md)
 
 **Inkling 2 Mini** by Thinking Machines: a file of 9 to 18 GB. It is experimental here. It has run on Linux with an
-RTX 5090, on Windows with an 8 GB laptop card and on a Mac with an M5 Ultra (a beta there), one request at a time. It
+RTX 5090, on Windows with an 8 GB laptop card and on a Mac with an M5 Ultra (a beta there). It
 reads pictures too. Its 24 layers of weights run as 48: the twelve in the middle run three
 times for every token. Forty of the 48 look back 1,024 tokens only, so a long conversation takes little VRAM:
 32,768 bytes a token.
@@ -79,11 +79,22 @@ whatever its launch, so the answers are the same to the bit. It was measured +1.
 Ti (22 GB, every expert in VRAM) and no change on an RTX 2070 (8 GB). `STRATA_POLY_EXPERT_TILES=0` goes back to a
 launch for each run.
 
+On an RTX 20 card a prompt's attention runs in a tensor-core kernel shaped for Turing: one layer's call of 1,024 rows
+takes 1.0 ms in a sliding-window layer and 18 ms in a full layer at 32K keys (RTX 2070 Super). It rounds the
+attention's sums in another order than the kernel before it, which `STRATA_INK_MMA75=0` goes back to (2.8 ms and
+39 ms; a 32K prompt reads about 9% slower). Against that kernel's greedy answers to the three prompts above (64 tokens
+each, the three files) it gives the same most likely token at 566 of the 576 steps (98.3%).
+
 On an RTX 30 card or newer, most of a prompt's products run on the int8 tensor cores, with the prompt's numbers
 rounded to 8 bits. UD-Q2_K_XL's IQ1_S experts (the gate and up of 6 layers) are the exception: they stay on halves
 unless `STRATA_PREFILL_IQ1S=int8` is set. On an RTX 3090 that setting reads a 2,048-token prompt 7.7% faster (2,159
 against 2,005 tokens/s) and an 8,192-token one 6.7% faster, but on a 302-token prompt it moved the answers more for
 each matrix than the other experts' int8 products do, so it is opt-in until more prompts are measured.
+
+On a card that does not hold every expert, a prompt of more than one batch hands each call's row tables to the card
+by a kernel, so they no longer wait behind the experts copied over the bus. The answers are the same and no VRAM is
+added. On an RTX 2070 Super 8 GB a 2,048-token prompt reads 6.5% faster with IQ4_NL (477 against 448 tokens/s) and
+2.7% faster with UD-Q2_K_XL; 32,768 tokens read as fast as before. `STRATA_INK_KERNEL_TABLES=0` turns it off.
 
 On a laptop with an RTX 4070 Laptop (8 GB), a Core i7-14700HX and 32 GB of RAM, on Windows, UD-Q3_K_XL has 1,216 of
 its 3,072 experts on the card and the rest are computed on the CPU. On a card that does not hold every expert, setup
@@ -104,11 +115,19 @@ the 4,526-token prompt:
 
 On the laptop `--expert-swaps 0` writes faster, but it moves the answers more, so setup leaves it out.
 
+For answers closer to the model without them (a high-accuracy mode), `./setup.sh --family inkling
+--inkling-small-card off` leaves the three settings out; a later setup run keeps that (`"small_card": "off"` in the
+run config, also on a card that holds every expert) until `--inkling-small-card on`. With two cards it applies to the
+one card Inkling 2 runs on. An existing run config can also be overridden by adding
+`--attn-requant off --no-loop-bf16 --tail-skip 0` at the end of its arguments (the last of each flag counts;
+`STRATA_ROUTE_TAIL_SKIP`, the app's "Skip rarely used parts of the model" switch, overrides `--tail-skip`). Writing
+is slower on an 8 GB card this way (see the table above).
+
 ### Setup's four settings, one at a time
 
 These settings make the answers worse to make them faster. Setup adds three of them by itself, without asking,
 whenever the card cannot hold every expert of the size: `--attn-requant q5_0`, `--loop-bf16` and `--tail-skip 4`.
-It no longer adds `--expert-swaps 0` (measured below because setup used to); setup has no option that leaves the
+It no longer adds `--expert-swaps 0` (measured below because setup used to); `--inkling-small-card off` (above) leaves the
 three out. `--attn-requant q5_0` stores the attention's matrices in fewer bits and `--loop-bf16` the loop
 controllers: lossy rounding. `--tail-skip 4` does not compute some of a token's experts at all: on the 8 GB cards
 below, with the other three settings, 9% to 27% of a token's expert picks. The answers differ measurably from the model's without them
@@ -260,10 +279,14 @@ go through hipBLASLt, which rounds them differently: after one 2,048-token promp
 9070 XT's answers differed from CUDA's more than the RX 7900 XT's, and with `ROCBLAS_USE_HIPBLASLT=0` as much as the
 RX 7900 XT's; after 302 and 8,192 tokens they match CUDA's. Use an NVIDIA card or a Mac for now.
 
-Not run yet: an AMD card on native Linux or Windows, two cards (`--expert-gpu`, built but not run), UD-Q4_K_XL on the
-8 GB card and UD-Q4_K_XL on a Mac. Pictures go through Unsloth's mmproj-F16.gguf, read on the CPU (`--vision cpu`) or
-the card; on a Mac, on the CPU. The draft file is an option (`--draft-model`). The engine takes one request at a time
-for this model, and the installer writes `"parallel": 1`. Its license is Apache 2.0.
+Not run yet: an AMD card on native Linux or Windows, `--expert-gpu` on two cards (built but not run), `--layer-split`
+on two unequal cards (below; it has run on two RTX 2070 Super), UD-Q4_K_XL on the 8 GB card and UD-Q4_K_XL on a Mac.
+Pictures go through Unsloth's mmproj-F16.gguf, read on the CPU (`--vision cpu`) or the card; on a Mac, on the CPU. The
+draft file is an option (`--draft-model`). Several requests at once (`"parallel"`, see [BATCHING.md](../BATCHING.md))
+are opt-in on an NVIDIA card (up to 16 slots), not with the draft file, not with `--layer-split` and not on AMD. With
+`--tail-skip` (setup's small-card flags) a chat's answer can then depend on the other chats writing at the same time.
+On a Mac the engine takes one request at a time for this model, and the installer writes `"parallel": 1` there. Its
+license is Apache 2.0.
 
 ## Install
 
@@ -288,6 +311,25 @@ Unsloth's layout of the same weights: the engine reads them too. Setup takes the
 `setup --custom-gguf <file>` also takes a quantization the installer does not offer (for example IQ4_NL) as a
 size of its own: its experts' size and the RAM estimate are read from the file's header, and the VRAM before any
 expert is the closest offered size's. `--custom-gguf` is not used on a Mac yet.
+
+## Two or more cards
+
+`--layer-split` puts the first layers on one card and the rest on the next, as for the other strata-poly models.
+Each card keeps its layers' weights, attention caches and expert cache. The loop's twelve layers (6 to 17, which
+run three times a token) stay on one card, so the second card starts at layer 1 to 6 or 18 to 22; a number inside
+the loop is refused. `"auto"` shares the layers by each card's free VRAM and takes 6 or 18, whichever is nearer.
+On two cards whose memory bandwidth differs by more than 5%, `"auto"` also estimates a token's time for every
+place to start the second card and both card orders, counting the loop's layers three times, and takes the fastest
+when it is at least 3% faster: the loop then goes to the faster card, whatever order the cards are listed in. The
+log line `layer split auto: the loop ... on the faster card` says when it did. Equal cards get the plain layout.
+`STRATA_POLY_CARD_GBS=a,b` gives the cards' bandwidths in GB/s where the driver's figure is wrong (on AMD cards it
+is not read, so they get the plain layout unless it is set). This has not been run on two unequal cards yet. The
+idea of keeping the loop on the faster card comes from cobra91 and kuraneko1 (the Strata project's PR #6506).
+On two RTX 2070 Super 8 GB (IQ4_NL, a 302-token prompt, 256 tokens written, mean of 3 runs) one card wrote 37.0
+tok/s, `--layer-split 18` 51.0 and `6` 48.5. Every split (3, 6, 18, 20, `6,18`, `"auto"`) gave one card's tokens and
+top-20 probabilities with every expert on the CPU.
+Once a token, a card hands the next one the token's residual streams and the loop's inputs, 64.5 KB. The DSpark
+drafter (`--draft-model`) runs on one card only.
 
 ## How does it work?
 

@@ -16614,6 +16614,109 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_INK_FLASH_TOKENS",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/inkling2.cu",
+     "line": 3428,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "37670fc1b9",
+   "first_date": "2026-11-23",
+   "since": null,
+   "last_commit": "37670fc1b9",
+   "last_date": "2026-11-23",
+   "status": "rollback",
+   "owner": "poly",
+   "note": "64, 48 or 32: the query rows a block of Inkling 2's prompt flash attention (ink_flash_kernel without LEAN) takes, instead of the choice by the card's last-wave fill; 64 is main's shape (the same bits either way)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_INK_KERNEL_TABLES",
+   "backends": [
+    "cuda"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/inkling2.cpp",
+     "line": 102,
+     "backend": "cuda",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/models/inkling.md:84"
+   ],
+   "first_commit": null,
+   "first_date": "2026-11-23",
+   "since": null,
+   "last_commit": null,
+   "last_date": "2026-11-23",
+   "status": "rollback",
+   "owner": "poly",
+   "note": "Inkling 2 on CUDA: in a prompt read of several calls, moe_rows() hands a call's row tables to the card by a kernel (copy2) that reads them from pinned memory, instead of a copy that waits behind the layer's expert uploads. Same bits, no extra VRAM. Default on; =0 keeps the copies, as before. A single-call read always keeps the copies. HIP and Metal never take it (engine/src/poly/inkling2.cpp, engine.cpp moe_rows())",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_INK_MMA75",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/inkling2.cu",
+     "line": 3057,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "on",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/models/inkling.md:84"
+   ],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "rollback",
+   "owner": "",
+   "note": "0: Inkling 2's prompt attention on Turing (sm_75) goes back to ink_flash75_kernel (PR 209) instead of ink_mma75_kernel (attn_mma_kernel's shape, the position bias on the tensor cores as hi+lo halves; 98.3% top-1 against ink_flash75_kernel's greedy answers)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_INK_PROJECT_MIXED",
    "backends": [
     "cuda"
@@ -17440,13 +17543,13 @@
   {
    "name": "STRATA_IQ3_LANES",
    "backends": [
-    "cuda-hip"
+    "cuda"
    ],
    "reads": [
     {
      "file": "engine/src/kernels/cuda/iq_kernels.cu",
-     "line": 5557,
-     "backend": "cuda-hip",
+     "line": 5847,
+     "backend": "cuda",
      "fn": "getenv"
     }
    ],
@@ -17775,6 +17878,39 @@
    "status": "default",
    "owner": "kernels/cpu",
    "note": "[auto] tunable with a built-in default 2048 (src/kernels/cpu/iq_avx1.cpp:138)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_IQ_SLOT_LANES",
+   "backends": [
+    "cuda"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/kernels/cuda/iq_kernels.cu",
+     "line": 5970,
+     "backend": "cuda",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "on",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "e25d2d501a",
+   "first_date": "2026-11-23",
+   "since": null,
+   "last_commit": "e25d2d501a",
+   "last_date": "2026-11-23",
+   "status": "rollback",
+   "owner": "kernels/cuda",
+   "note": "0: Inkling 2's cached IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S decode products go back to mmvq_slots_kernel instead of mmvq_slots_staged_kernel (same bits); unset: the staged kernel on sm_75 only (slot_lanes_on(), the card checked), 1: on every card; CUDA only",
    "retire_after": "",
    "retired_in": ""
   },
@@ -34049,6 +34185,41 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_POLY_CARD_GBS",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/engine.cpp",
+     "line": 611,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": "0.0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [
+    "docs/models/inkling.md:133"
+   ],
+   "first_commit": "652e1154ba",
+   "first_date": "2026-11-23",
+   "since": null,
+   "last_commit": "652e1154ba",
+   "last_date": "2026-11-23",
+   "status": "research",
+   "owner": "poly",
+   "note": "with --layer-split auto: a,b,... gives each card's memory bandwidth in GB/s for the split plan, instead of the clock and bus width the card reports (HIP and Metal report none)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_POLY_EXPERT_TILES",
    "backends": [
     "cuda-hip"
@@ -34261,6 +34432,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_POLY_STEP_GRAPHS",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/engine.cpp",
+     "line": 6524,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "7f05df246b",
+   "first_date": "2026-11-23",
+   "since": null,
+   "last_commit": "7f05df246b",
+   "last_date": "2026-11-23",
+   "status": "research",
+   "owner": "poly",
+   "note": "Inkling 2 batch slots: N step recordings (CUDA graphs) held at most, in place of the default (4 a MiB of a 64th of the card's VRAM, 256 to 1,024)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_POLY_STEP_HALVES",
    "backends": [
     "cuda-hip"
@@ -34290,6 +34494,39 @@
    "status": "default",
    "owner": "poly",
    "note": "[reviewed] a step's rows in two halves so the card's layer and the CPU's experts overlap, on unless =0 (engine/src/poly/engine.cpp:6062)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_POLY_STEP_RECORD_FAIL",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/poly/engine.cpp",
+     "line": 6527,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "7f05df246b",
+   "first_date": "2026-11-23",
+   "since": null,
+   "last_commit": "7f05df246b",
+   "last_date": "2026-11-23",
+   "status": "research",
+   "owner": "poly",
+   "note": "test knob: Inkling 2 batch slots, every Nth step recording fails as one the card has no memory for, so the step runs unrecorded",
    "retire_after": "",
    "retired_in": ""
   },

@@ -19,6 +19,12 @@ const float* hadamard_device_signs(const float*, int) {
 void scatter_rows_f32(const float*, float*, const int32_t*, int64_t, int64_t, void*) {
     strata::metal_engine::missing("strata::kernels::scatter_rows_f32");
 }
+void scatter_rows_and_signal_f32(const float*, float*, const int32_t*, int64_t, int64_t, uint32_t*, uint32_t, int*, void*) {
+    strata::metal_engine::missing("strata::kernels::scatter_rows_and_signal_f32");
+}
+void signal_stream_done(uint32_t*, uint32_t, void*) {
+    strata::metal_engine::missing("strata::kernels::signal_stream_done");
+}
 void quantize_q8_1_rows(const float*, int64_t, int64_t, void*, void*) {
     strata::metal_engine::missing("strata::kernels::quantize_q8_1_rows");
 }

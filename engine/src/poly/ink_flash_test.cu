@@ -1,14 +1,23 @@
-// src/poly/ink_flash_test.cu - ink_attend_batch() (ink_flash_kernel, from Ampere on) against a float64 reference of the same attention, beside the two paths it stands in
+// src/poly/ink_flash_test.cu - ink_attend_batch() (the flash kernels: ink_flash_kernel from Ampere on,
+// ink_flash75_kernel or ink_mma75_kernel on Turing) against a float64 reference of the same attention, beside the two
+// paths it stands in
 // for: ink_attend() (a token's scores in floats) and attend_batch() with an AttnBias (cuBLAS products, the path
 // Inkling2 takes when ink_attend_batch() does not).  Inkling 2 Mini's heads: 128 values, 16 relative values; groups
 // of 1 to 4 query heads, full and window layers, ring caches, a gate, calls that start past position 0.
 //
+// Then the same rows in one call and split over several: every output the same bits (a token's result does not depend
+// on the call it is in).  On Turing it tests ink_mma75_kernel, and ink_flash75_kernel with
+// STRATA_INK_MMA75=0: run it both ways there.
+//
 // usage: poly_ink_flash_test            (exit 0: every case within the bounds below; 77: no flash kernel here)
 //                                       each case also prints a hash of the flash kernel's output bits, which two
-//                                       builds of the same arithmetic must share
+//                                       builds of the same arithmetic must share, and fails unless the blocks of
+//                                       64, 48 and 32 rows (ink_flash_tokens()'s sizes) give the same bits
 //        STRATA_FAST_ATTN=1 poly_ink_flash_test   (full layers on ink_fast_kernel: twice the flash bound)
-//        poly_ink_flash_test --bench [keys...]   (ms of one call of 1,024 rows, Inkling 2 Mini's shape, full and
-//                                       window layers, at 2K/8K/32K keys or the ones given)
+//        poly_ink_flash_test --bench [--rows N] [keys...]
+//                                       (ms of one call of 1,024 rows or N, Inkling 2 Mini's shape, full and window
+//                                       layers, at 2K/8K/32K keys or the ones given: the size ink_flash_tokens()
+//                                       picks, then each of 64, 48 and 32 rows a block)
 #include "inkling2_kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -18,6 +27,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <random>
 #include <string>
@@ -214,6 +224,75 @@ size_t work_floats(int rows, int n_head) {   // inkling2.cpp's awork_
     return heads + heads / 2 + 1 + 3 * (size_t) rows * n_head;
 }
 
+// A token's result must not depend on the call it is in: the case's rows in one call, then the same rows (same caches,
+// same inputs) in calls of the given sizes, one after another; every output float the same bits.
+int run_split_tests(cudaStream_t st) {
+    struct Split {
+        Case c;
+        std::vector<int> sizes;
+    };
+    const Split splits[] = {
+        // name                    per n_kv pos    rows  window ring  extent gate   call sizes
+        {{"split window ring g3",   3, 8,   1900,  333,  1024,  1357, 1024,  true},  {1, 100, 232}},
+        {{"split window 1K g3",     3, 8,   3072,  1024, 1024,  2048, 1024,  true},  {512, 512}},
+        {{"split window 1K g3 odd", 3, 8,   3072,  1024, 1024,  2048, 1024,  true},  {333, 21, 1, 669}},
+        {{"split full later g3",    3, 8,   1500,  200,  0,     0,    1024,  false}, {21, 64, 115}},
+        {{"split full pos0 g3",     3, 8,   0,     700,  0,     0,    1024,  true},  {300, 17, 383}},
+        {{"split window g1",        1, 8,   999,   64,   128,   192,  128,   true},  {5, 59}},
+        {{"split full g2",          2, 4,   40,    130,  0,     0,    64,    false}, {17, 113}},
+        {{"split full g4",          4, 2,   0,     77,   0,     0,    1024,  false}, {5, 72}},
+        {{"split window g2",        2, 4,   300,   150,  128,   278,  128,   true},  {7, 30, 113}},
+        {{"split window g4",        4, 2,   500,   90,   100,   190,  100,   false}, {3, 87}},
+        {{"split window 20 g3",     3, 8,   64,    70,   20,    90,   20,    true},  {11, 59}},
+    };
+    int fails = 0;
+    for (unsigned si = 0; si < sizeof(splits) / sizeof(splits[0]); ++si) {
+        const Split& sp = splits[si];
+        Call x(sp.c, 4321u + si);
+        const size_t per_row = (size_t) x.n_head * kDim, n_out = (size_t) sp.c.rows * per_row;
+        float* out = zeros(n_out);
+        InkAttn a = x.attn(out, nullptr, 0);
+        if (!ink_attend_batch(a, st)) {
+            std::printf("%-24s flash off\n", sp.c.name);
+            cudaFree(out);
+            continue;
+        }
+        ck(cudaStreamSynchronize(st), "ink_attend_batch");
+        const std::vector<float> whole = download(out, n_out);
+        ck(cudaMemset(out, 0, n_out * sizeof(float)), "cudaMemset");
+        // the calls last first, so a call that wrote past its rows would leave that behind
+        std::vector<int> first;
+        int at = 0;
+        for (const int m : sp.sizes) first.push_back(at), at += m;
+        bool took = true;
+        for (size_t k = sp.sizes.size(); k-- > 0;) {
+            const int m = sp.sizes[k];
+            at = first[k];
+            InkAttn b = a;
+            b.q = x.dq + (size_t) at * per_row;
+            b.r = x.dr + (size_t) at * x.n_head * kRel;
+            b.sink = x.dsink + (size_t) at * x.n_head;
+            if (x.dgate) b.gate = x.dgate + (size_t) at * per_row;
+            b.out = out + (size_t) at * per_row;
+            b.pos = sp.c.pos + at;
+            b.rows = m;
+            took = ink_attend_batch(b, st) && took;
+        }
+        at = first.back() + sp.sizes.back();
+        ck(cudaStreamSynchronize(st), "ink_attend_batch (split)");
+        const std::vector<float> parts = download(out, n_out);
+        size_t differ = 0;
+        for (size_t i = 0; i < n_out; ++i) differ += std::memcmp(&whole[i], &parts[i], 4) != 0;
+        const bool ok = took && at == sp.c.rows && differ == 0;
+        std::printf("%-24s one call fnv %016llx | %zu calls fnv %016llx | %zu floats differ  %s\n", sp.c.name,
+                    (unsigned long long) fnv(whole), sp.sizes.size(), (unsigned long long) fnv(parts), differ,
+                    ok ? "ok" : "FAIL");
+        fails += !ok;
+        cudaFree(out);
+    }
+    return fails;
+}
+
 int run_tests() {
     const Case cases[] = {
         // name                  per n_kv pos    rows  window ring  extent gate
@@ -228,11 +307,16 @@ int run_tests() {
         {"window ring odd g3",    3, 4,   2049,  45,   100,   145,  100,   false},
         {"window ring g1",        1, 8,   999,   64,   128,   192,  128,   true},
         {"few rows g3",           3, 8,   33,    32,   0,     0,    1024,  false},
+        {"window ring g2",        2, 4,   700,   150,  128,   278,  128,   true},
+        {"window ring g4",        4, 2,   333,   90,   100,   190,  100,   false},
+        {"window 20 g3",          3, 8,   64,    70,   20,    90,   20,    true},
+        {"prompt chunk full g3",  3, 8,   1024,  1024, 0,     0,    1024,  true},
+        {"prompt chunk window g3", 3, 8,  1024,  1024, 1024,  2048, 1024,  true},
     };
     cudaStream_t st;
     ck(cudaStreamCreate(&st), "stream");
     void* blas = blas_create(st);
-    int fails = 0;
+    int fails = 0, size_calls = 0, size_same = 0;
     bool ran_flash = false;
     for (unsigned ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
         const Case& cs = cases[ci];
@@ -251,6 +335,21 @@ int run_tests() {
         ck(cudaStreamSynchronize(st), "ink_attend_batch");
         const std::vector<float> got_flash = download(out, n_out);
         ck(cudaMemset(out, 0, n_out * sizeof(float)), "cudaMemset");
+        // every block size the kernel takes: the same bits as the size it picked
+        bool same = true;
+        std::string sizes;
+        if (flash && ink_flash_tokens(a) > 0)   // ink_flash_kernel took it (not Turing's kernel or STRATA_FAST_ATTN's)
+            for (const int t : {64, 48, 32}) {
+                ck(cudaMemset(out, 0xff, n_out * sizeof(float)), "cudaMemset");   // NaNs where nothing is written
+                ink_attend_batch_rows(a, st, t);
+                ck(cudaStreamSynchronize(st), "ink_attend_batch");
+                const uint64_t h = fnv(download(out, n_out));
+                const bool eq = h == fnv(got_flash);
+                same = same && eq;
+                sizes += " " + std::to_string(t) + (eq ? "=" : "!");
+                ++size_calls, size_same += eq;
+            }
+        ck(cudaMemset(out, 0, n_out * sizeof(float)), "cudaMemset");
         ink_attend(a, st);
         ck(cudaStreamSynchronize(st), "ink_attend");
         const std::vector<float> got_token = download(out, n_out);
@@ -263,17 +362,78 @@ int run_tests() {
                      eb = max_err(got_batch, want);
         const char* fv = std::getenv("STRATA_FAST_ATTN");
         const double flash_err = fv && fv[0] == '1' && cs.window <= 0 ? 2 * kFlashErr : kFlashErr;
-        const bool ok = (!flash || ef <= flash_err) && et <= kTokenErr && eb <= kBatchErr;
+        const bool ok = (!flash || ef <= flash_err) && et <= kTokenErr && eb <= kBatchErr && same;
         ran_flash = ran_flash || flash;
         std::printf("%-22s flash %s err %.3e | ink_attend err %.3e | attend_batch err %.3e | flash-batch %.3e | "
-                    "bits %016llx  %s\n",
+                    "bits %016llx picked %d, sizes%s  %s\n",
                     cs.name, flash ? "ran" : "off", ef, et, eb, flash ? max_diff(got_flash, got_batch) : 0.0,
-                    (unsigned long long) fnv(got_flash), ok ? "ok" : "FAIL");
+                    (unsigned long long) fnv(got_flash), ink_flash_tokens(a), sizes.c_str(),
+                    ok ? "ok" : "FAIL");
         fails += !ok;
         for (void* p : {(void*) out, (void*) score, (void*) work, (void*) zero}) cudaFree(p);
     }
+    fails += run_split_tests(st);
+    // FP8 caches (codes and a scale a head, ink_kv8_row() bytes a row) and Q8_0 caches (int8 codes and a half scale
+    // a block of 32, ink_kvq8_row() bytes a row): no reference, the block sizes' bits only, where ink_flash_kernel
+    // takes the call (ink_flash_tokens() > 0)
+    for (const bool q8 : {false, true})
+        for (unsigned ci = 0; ran_flash && ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
+            const Case& cs = cases[ci];
+            Call x(cs, 4321u + ci);
+            std::mt19937 rng(99u + ci);
+            const int codes = cs.n_kv * kDim;
+            const size_t row = q8 ? ink_kvq8_row(cs.n_kv, kDim) : ink_kv8_row(cs.n_kv, kDim);
+            std::vector<uint8_t> k8((size_t) x.slots * row), v8(k8.size());
+            for (std::vector<uint8_t>* c : {&k8, &v8})
+                for (long long t = 0; t < x.slots; ++t) {
+                    uint8_t* r = c->data() + (size_t) t * row;
+                    for (int i = 0; i < codes; ++i)   // FP8: no NaN codes (exponent never 1111); Q8_0: -127..127
+                        r[i] = q8 ? (uint8_t) (int8_t) ((int) (rng() % 255) - 127) : (uint8_t) ((rng() % 255) & 0xf7);
+                    for (int h = 0; h < (q8 ? codes / 32 : cs.n_kv); ++h) {
+                        const float sc = 0.002f + 0.004f * (float) (rng() % 1000) / 1000.0f;
+                        if (q8) {
+                            const uint16_t hb = half_bits(sc * 64.0f / 127.0f);
+                            std::memcpy(r + codes + h * sizeof(uint16_t), &hb, sizeof(hb));
+                        } else {
+                            std::memcpy(r + codes + h * sizeof(float), &sc, sizeof(float));
+                        }
+                    }
+                }
+            uint8_t* dk8 = upload(k8);
+            uint8_t* dv8 = upload(v8);
+            const size_t n_out = (size_t) cs.rows * x.n_head * kDim;
+            float* out = zeros(n_out);
+            InkAttn a = x.attn(out, nullptr, 0);
+            a.keys = reinterpret_cast<const uint16_t*>(dk8), a.vals = reinterpret_cast<const uint16_t*>(dv8);
+            (q8 ? a.kvq8 : a.kv8) = true;
+            const int picked = ink_flash_tokens(a);
+            if (picked > 0) {
+                ink_attend_batch(a, st);
+                ck(cudaStreamSynchronize(st), "ink_attend_batch");
+                const std::vector<float> got = download(out, n_out);
+                bool same = true, finite = true;
+                for (const float f : got) finite = finite && std::isfinite(f);
+                std::string sizes;
+                for (const int t : {64, 48, 32}) {
+                    ck(cudaMemset(out, 0xff, n_out * sizeof(float)), "cudaMemset");
+                    ink_attend_batch_rows(a, st, t);
+                    ck(cudaStreamSynchronize(st), "ink_attend_batch");
+                    const bool eq = fnv(download(out, n_out)) == fnv(got);
+                    same = same && eq;
+                    sizes += " " + std::to_string(t) + (eq ? "=" : "!");
+                    ++size_calls, size_same += eq;
+                }
+                const bool ok = same && finite;
+                std::printf("%-22s %s caches: bits %016llx picked %d, sizes%s%s  %s\n", cs.name, q8 ? "q8_0" : "fp8 ",
+                            (unsigned long long) fnv(got), picked, sizes.c_str(), finite ? "" : " NON-FINITE",
+                            ok ? "ok" : "FAIL");
+                fails += !ok;
+            }
+            for (void* p : {(void*) out, (void*) dk8, (void*) dv8}) cudaFree(p);
+        }
     blas_destroy(blas);
     cudaStreamDestroy(st);
+    std::printf("block sizes: %d / %d calls give the picked size's bits\n", size_same, size_calls);
     std::printf("%d failed\n", fails);
     if (!ran_flash) {
         std::printf("ink_attend_batch() takes no call on this card\n");
@@ -283,14 +443,13 @@ int run_tests() {
 }
 
 // ms of one call of `rows` rows whose last position is keys - 1, Inkling 2 Mini's 24 heads on 8, window layers' 1,024
-int run_bench(std::vector<long long> all_keys) {
+int run_bench(std::vector<long long> all_keys, int rows) {
     cudaStream_t st;
     ck(cudaStreamCreate(&st), "stream");
     void* blas = blas_create(st);
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0);
     cudaEventCreate(&e1);
-    const int rows = 1024;
     if (all_keys.empty()) all_keys = {2048, 8192, 32768};
     for (const long long keys : all_keys)
         for (const bool swa : {false, true}) {
@@ -321,8 +480,13 @@ int run_bench(std::vector<long long> all_keys) {
             bool flash = true;
             const float tf = time([&] { flash = ink_attend_batch(a, st); });
             const float tb = time([&] { attend_batch_path(blas, x, out, score, work, zero, st); });
-            std::printf("%-6s keys %6lld rows %d: flash %s %8.3f ms | attend_batch %8.3f ms\n", cs.name, keys, rows,
-                        flash ? "   " : "off", flash ? tf : 0.0f, tb);
+            std::printf("%-6s keys %6lld rows %d: flash %s %8.3f ms (picked %d) | attend_batch %8.3f ms\n", cs.name,
+                        keys, rows, flash ? "   " : "off", flash ? tf : 0.0f, ink_flash_tokens(a), tb);
+            if (flash && ink_flash_tokens(a) > 0)
+                for (const int t : {64, 48, 32}) {
+                    const float ms = time([&] { ink_attend_batch_rows(a, st, t); });
+                    std::printf("%-6s keys %6lld rows %d: flash tokens %d %8.3f ms\n", cs.name, keys, rows, t, ms);
+                }
             for (void* p : {(void*) out, (void*) score, (void*) work, (void*) zero}) cudaFree(p);
         }
     blas_destroy(blas);
@@ -342,8 +506,11 @@ int main(int argc, char** argv) {
     std::printf("%s (sm_%d%d)\n", p.name, p.major, p.minor);
     if (argc > 1 && std::string(argv[1]) == "--bench") {
         std::vector<long long> keys;
-        for (int i = 2; i < argc; ++i) keys.push_back(std::atoll(argv[i]));
-        return run_bench(keys);
+        int rows = 1024;
+        for (int i = 2; i < argc; ++i)
+            if (std::string(argv[i]) == "--rows" && i + 1 < argc) rows = std::atoi(argv[++i]);
+            else keys.push_back(std::atoll(argv[i]));
+        return run_bench(keys, rows);
     }
     return run_tests();
 }
