@@ -1860,6 +1860,8 @@ void usage() {
                  "  --cpu-down-reuse      experimental Q5_K Down multi-activation AVX2 path (default off)\n"
                  "  --cpu-q5-vnni        experimental Q5_K single-activation AVX-VNNI (default off)\n"
                  "  --cpu-q6-vnni        experimental Q6_K single-activation AVX-VNNI (default off)\n"
+                 "  --cpu-q5-x4          experimental Q5_K four-weight-row AVX2 (default off)\n"
+                 "  --cpu-q6-x4          experimental Q6_K four-weight-row AVX2 (default off)\n"
                  "  --profile-overlap     report host CPU/GPU submission, mixed-batch wait and overlap timings\n"
                  "  --profile-cpu-experts  extra CPU expert/worker stage timing and quant mix (implies --profile-overlap)\n"
                  "  --profile-decode-window N  log each ~N emitted tokens (1..65536; 0 off; implies CPU profiling)\n"
@@ -2099,6 +2101,8 @@ int main(int argc, char** argv) {
         else if (a == "--cpu-down-reuse") o.cpu_task_shape.down_reuse = true;
         else if (a == "--cpu-q5-vnni") o.cpu_task_shape.q5_vnni = true;
         else if (a == "--cpu-q6-vnni") o.cpu_task_shape.q6_vnni = true;
+        else if (a == "--cpu-q5-x4") o.cpu_task_shape.q5_x4 = true;
+        else if (a == "--cpu-q6-x4") o.cpu_task_shape.q6_x4 = true;
         else if (a == "--profile-decode-window") {
             const char* raw = val();
             char* end = nullptr;

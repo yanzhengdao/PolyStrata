@@ -72,4 +72,7 @@ DotRowsFn experimental_q5_rows_kernel(Arith a) noexcept;
 /// Null when unavailable; not part of default dispatch.
 const DotKernel* experimental_k_vnni_kernel(Type w, Arith a) noexcept;
 
+/// Opt-in four-weight-row Q5_K/Q6_K AVX2 experiment. Not in default dispatch.
+const DotX4Kernel* experimental_k_x4_kernel(Type w, Arith a) noexcept;
+
 }  // namespace strata::quant

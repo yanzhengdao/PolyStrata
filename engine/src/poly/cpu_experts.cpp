@@ -99,6 +99,13 @@ Rows rows_of(int type, const CpuExpertTaskShape* shape = nullptr) {
     // the layer's four-row kernel of dot's own level only: one of another level (AVX-512 beside the AVX2 Q4_K the
     // table keeps) need not give dot's bits.  cpu_x4_test checks that each one taken here does.
     const Q::DotX4Kernel* x4 = Q::dot_x4_kernel(t->type, arith, dot->isa);
+    // VNNI single-dot selection takes precedence for the same type.
+    // Do not replace an existing higher-tier kernel or change scalar tails.
+    if (shape && dot->isa == Q::Isa::Avx2 &&
+        ((shape->q5_x4 && t->type == Q::Type::Q5_K) ||
+         (shape->q6_x4 && t->type == Q::Type::Q6_K))) {
+        if (const auto* candidate = Q::experimental_k_x4_kernel(t->type, arith)) x4 = candidate;
+    }
     if (x4 != nullptr && x4->isa == dot->isa) { r.x4 = x4->fn; r.x4_name = x4->name; }
     r.act = act->fn;
     r.blck = t->blck;

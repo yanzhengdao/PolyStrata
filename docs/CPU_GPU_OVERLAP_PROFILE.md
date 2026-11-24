@@ -243,3 +243,33 @@ The previous Q5_K Down reuse benchmark and test remain unchanged in
 purpose. Do not combine the Down reuse flag with the VNNI experiment
 for initial performance tests. Keep both new flags off for normal
 inference until target-machine parity and performance pass.
+
+
+## Experimental Q5_K / Q6_K four-weight-row AVX2
+
+The 5000-call VNNI benchmark on the 285HX showed small Q5 improvements
+and consistent Q6 Down regressions. The next experiment uses
+`--cpu-q5-x4` and `--cpu-q6-x4` independently. Both default off.
+Four weight rows share each Q8_K activation block load and its sums.
+The block-major AVX2 kernels keep four independent FP32 accumulators,
+the original integer lane arithmetic, Q5 scalar minimum correction and
+per-row block/reduction order. No AVX-VNNI instructions are required.
+Register pressure/spills and weight access patterns may offset reuse
+benefits; the target-machine benchmark is the gate, not instruction count.
+
+Only CPU expert dispatch is changed, and only when the baseline uses
+AVX2. The existing Gate/Up and Down four-row paths are reused; incomplete
+row groups still use the original single-dot kernel. If the corresponding
+VNNI flag selects a VNNI dot, that selection takes precedence over x4.
+Do not combine these flags or Down reuse for the first A/B test.
+`cpu-quant-profile` shows the selected x4 kernel name, separately from
+the scalar-dot name. Eligibility is not a count of actual x4 invocations.
+
+`poly_cpu_expert_bench --x4-check` checks both formats against the
+baseline, seven lengths, 256 trials each, packed/padded row strides,
+extreme valid Q8_K bytes and full mixed-quant expert output/dispatch.
+`poly_cpu_k_x4_test` registers the same check with CTest.
+`poly_cpu_expert_bench --x4 12 8 16 2000` or 5000 runs the same
+rotating-bank mixed-quant benchmark as --vnni, comparing baseline
+against Q5-only, Q6-only and both. Keep the existing --vnni and --check
+modes. These are CPU stage measurements, not end-to-end inference.

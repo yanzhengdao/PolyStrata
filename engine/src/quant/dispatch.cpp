@@ -93,6 +93,14 @@ const DotKernel* experimental_k_vnni_kernel(Type w, Arith a) noexcept {
     return nullptr;
 }
 
+const DotX4Kernel* experimental_k_x4_kernel(Type w, Arith a) noexcept {
+#ifdef STRATA_QUANT_X86_TIERS
+    if (a == Arith::Avx2 && isa_ok(Isa::Avx2)) return avx2_experimental_k_x4(w);
+#endif
+    (void) w; (void) a;
+    return nullptr;
+}
+
 DotRowsFn experimental_q5_rows_kernel(Arith a) noexcept {
 #ifdef STRATA_QUANT_X86_TIERS
     if (a == Arith::Avx2 && isa_ok(Isa::Avx2)) return avx2_experimental_q5_rows();
