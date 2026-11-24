@@ -69,7 +69,7 @@ struct Rows {
     size_t row(int64_t n) const { return (size_t) (n / act_blck) * act_block; }
 };
 
-Rows rows_of(int type) {
+Rows rows_of(int type, const CpuExpertTaskShape* shape = nullptr) {
     Rows r;
     const Q::TypeInfo* t = Q::type_info(type);
     if (t == nullptr) return r;
@@ -85,6 +85,12 @@ Rows rows_of(int type) {
     if (a == nullptr) return r;
     const Q::Arith arith = Q::default_arith();
     const Q::DotKernel* dot = Q::dot_kernel(t->type, arith);
+    // Only replace an AVX2 baseline; leave higher-tier kernels untouched.
+    if (shape && dot && dot->isa == Q::Isa::Avx2 &&
+        ((shape->q5_vnni && t->type == Q::Type::Q5_K) ||
+         (shape->q6_vnni && t->type == Q::Type::Q6_K))) {
+        if (const auto* faster = Q::experimental_k_vnni_kernel(t->type, arith)) dot = faster;
+    }
     const Q::ActKernel* act = Q::act_kernel(t->act, arith);
     if (dot == nullptr || act == nullptr) return r;
     r.dot = dot->fn;
@@ -350,7 +356,8 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
         }
         return 0.0;
     };
-    const Rows tg = rows_of(gu_type), tu = rows_of(u_type), td = rows_of(d_type);
+    const auto& shape = workers.task_shape();
+    const Rows tg = rows_of(gu_type, &shape), tu = rows_of(u_type, &shape), td = rows_of(d_type, &shape);
     const size_t gu_row = Q::row_bytes(gu_type, n_embd);
     const size_t u_row = Q::row_bytes(u_type, n_embd);
     const size_t d_row = Q::row_bytes(d_type, n_ff);

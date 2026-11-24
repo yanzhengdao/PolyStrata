@@ -206,3 +206,40 @@ to this engine session and restarts on engine restart.
 Do not enable `--cpu-down-reuse` for baseline stability tests.
 Keep external GPU telemetry separate. Full CPU profiling (including
 quant mix aggregation) is diagnostic and may add small host overhead.
+
+
+## Experimental Q5_K / Q6_K single-activation AVX-VNNI
+
+The 2026-11-24 Tiel UD-Q5_K_XL CPU profile showed Q5_K gate/up and Q6_K
+down as the main hot formats, with AVX2 dots despite effective AVX-VNNI
+support. The new opt-in `--cpu-q5-vnni` and `--cpu-q6-vnni` flags select
+experimental single-activation kernels only for the corresponding CPU
+expert weight type and only when its baseline dot uses AVX2, the
+AVX-VNNI tier is built, and the effective CPU caps allow it. They may be
+enabled independently or together. They do not modify default dot
+dispatch, other formats, activation quantization, routing or GPU kernels.
+The phase `cpu-quant-profile` records actual selected dot names.
+
+The new kernels retain the optimized AVX2 unpack, scale/minimum
+correction, int32 lane structure, FP32 accumulation order and reduction,
+but replace VPMADDWD + VPADDD by VEX VPDPWSSD (non-saturating).
+VPMADDUBSW remains: unsigned Q5/Q6 values fit int16 pair products
+even at the signed Q8 endpoints. Q6 integer additions are regrouped
+without changing sums. This is an experiment in instruction reduction,
+not a guarantee of faster execution on a particular CPU.
+
+Run `poly_cpu_expert_bench --vnni-check` to test bitwise parity of the
+two dots against the existing AVX2 baseline, including valid extreme
+Q8_K bytes with consistent block sums, and the full Q5_K/Q5_K/Q6_K
+expert output and actual dispatch of all three flag combinations.
+The test is also registered as `poly_cpu_k_vnni_test`.
+Run `poly_cpu_expert_bench --vnni 12 8 16 2000` (or 5000) to measure
+three paired, alternating-order rounds for each candidate. Cases:
+single, sparse-4 (two of sixteen uses share one expert), mixed-4 (four
+of sixteen uses share one expert), shared-2, shared-8. Eight rotating
+banks, 2048/512 dimensions, identical input/weights per pair. Per-mode
+baseline is measured separately. No GPU or model required.
+The previous Q5_K Down reuse benchmark and test remain unchanged in
+purpose. Do not combine the Down reuse flag with the VNNI experiment
+for initial performance tests. Keep both new flags off for normal
+inference until target-machine parity and performance pass.

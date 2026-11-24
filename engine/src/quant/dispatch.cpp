@@ -85,6 +85,14 @@ DotRowsFn dot_rows_kernel(Type w, Arith a) noexcept {
     return nullptr;
 }
 
+const DotKernel* experimental_k_vnni_kernel(Type w, Arith a) noexcept {
+#ifdef STRATA_QUANT_AVXVNNI
+    if (a == Arith::Avx2 && isa_ok(Isa::AvxVnni)) return avxvnni_experimental_k_dot(w);
+#endif
+    (void) w; (void) a;
+    return nullptr;
+}
+
 DotRowsFn experimental_q5_rows_kernel(Arith a) noexcept {
 #ifdef STRATA_QUANT_X86_TIERS
     if (a == Arith::Avx2 && isa_ok(Isa::Avx2)) return avx2_experimental_q5_rows();

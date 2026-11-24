@@ -3664,6 +3664,9 @@ void Engine::load(const Options& o) {
                      opt_.cpu_task_shape.gate_max_rows, opt_.cpu_task_shape.down_rows);
         if (opt_.cpu_task_shape.down_reuse)
             std::fprintf(stderr, "strata-poly: experimental Q5_K Down multi-activation reuse requested (AVX2 only)\n");
+        if (opt_.cpu_task_shape.q5_vnni || opt_.cpu_task_shape.q6_vnni)
+            std::fprintf(stderr, "strata-poly: experimental K-quant AVX-VNNI requested q5=%d q6=%d (AVX2 baseline only; see cpu-quant-profile for actual dispatch)\n",
+                         (int)opt_.cpu_task_shape.q5_vnni, (int)opt_.cpu_task_shape.q6_vnni);
     }
     if (!aside_) aside_ = std::make_unique<Aside>();
     // save_state()'s pinned memory, and read()'s for the checkpoints inside a read, with the load: made at the

@@ -68,4 +68,8 @@ DotRowsFn dot_rows_kernel(Type w, Arith a) noexcept;
 /// Opt-in Q5_K/Q8_K AVX2 multi-activation experiment; not in the default dispatch.
 DotRowsFn experimental_q5_rows_kernel(Arith a) noexcept;
 
+/// Opt-in single-activation K-quant AVX-VNNI kernels, AVX2 arithmetic contract.
+/// Null when unavailable; not part of default dispatch.
+const DotKernel* experimental_k_vnni_kernel(Type w, Arith a) noexcept;
+
 }  // namespace strata::quant

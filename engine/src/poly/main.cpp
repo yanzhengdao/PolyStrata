@@ -1858,6 +1858,8 @@ void usage() {
                  "  --cpu-gate-max-rows N  CPU Gate/Up task row cap (dynamic; multiple of 4 in 4..256; default 32)\n"
                  "  --cpu-down-rows N      CPU Down task rows (multiple of 4 in 4..256; default 16)\n"
                  "  --cpu-down-reuse      experimental Q5_K Down multi-activation AVX2 path (default off)\n"
+                 "  --cpu-q5-vnni        experimental Q5_K single-activation AVX-VNNI (default off)\n"
+                 "  --cpu-q6-vnni        experimental Q6_K single-activation AVX-VNNI (default off)\n"
                  "  --profile-overlap     report host CPU/GPU submission, mixed-batch wait and overlap timings\n"
                  "  --profile-cpu-experts  extra CPU expert/worker stage timing and quant mix (implies --profile-overlap)\n"
                  "  --profile-decode-window N  log each ~N emitted tokens (1..65536; 0 off; implies CPU profiling)\n"
@@ -2095,6 +2097,8 @@ int main(int argc, char** argv) {
             else o.cpu_task_shape.down_rows = (int) n;
         }
         else if (a == "--cpu-down-reuse") o.cpu_task_shape.down_reuse = true;
+        else if (a == "--cpu-q5-vnni") o.cpu_task_shape.q5_vnni = true;
+        else if (a == "--cpu-q6-vnni") o.cpu_task_shape.q6_vnni = true;
         else if (a == "--profile-decode-window") {
             const char* raw = val();
             char* end = nullptr;

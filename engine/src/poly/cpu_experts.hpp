@@ -29,6 +29,8 @@ struct CpuExpertTaskShape {
     int gate_max_rows = 32;
     int down_rows = 16;
     bool down_reuse = false; ///< opt-in Q5_K Down multi-activation path
+    bool q5_vnni = false;    ///< opt-in Q5_K single-activation AVX-VNNI
+    bool q6_vnni = false;    ///< opt-in Q6_K single-activation AVX-VNNI
 
     static constexpr bool valid_rows(int n) {
         return n >= row_step && n <= max_rows && n % row_step == 0;
