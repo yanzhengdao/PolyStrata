@@ -66,7 +66,7 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 // Per-request deltas. GPU "submit" is host-side enqueue time, NOT CUDA kernel time.
 void report_overlap(const OverlapTiming& before, const OverlapTiming& after, double router_wait_ms) {
     const OverlapTiming p = after.minus(before);
-    if (p.small_calls == 0 && p.prompt_calls == 0) return;
+    if (p.small_calls == 0 && p.prompt_calls == 0 && p.router.layers.empty()) return;
     std::fprintf(stderr,
                  "overlap-profile: small batches %lld, GPU submissions %lld; CPU work %.1f ms, GPU enqueue "
                  "%.1f ms, concurrent host %.1f ms, enqueue-thread join wait %.1f ms\n",
@@ -77,6 +77,26 @@ void report_overlap(const OverlapTiming& before, const OverlapTiming& after, dou
                  "%.1f ms, concurrent wall %.1f ms, join wait %.1f ms; router wait %.1f ms\n",
                  (long long) p.prompt_calls, p.prompt_cpu_ms, p.prompt_gpu_path_ms,
                  p.prompt_concurrent_ms, p.prompt_join_ms, router_wait_ms);
+}
+
+// Only host-visible synchronization time, not exclusive router kernel time. All layer
+// ids are zero-based, and the values include rejected speculative rows where applicable.
+void report_overlap_phase(const char* phase, const OverlapTiming& p, double wall_ms, int64_t tokens) {
+    const auto wait = p.router.total();
+    std::fprintf(stderr,
+                 "overlap-phase: %s tokens %lld, wall %.1f ms, router wait %.1f ms (%lld calls), "
+                 "small CPU work %.1f ms, GPU enqueue %.1f ms, concurrent host %.1f ms, join wait %.1f ms; "
+                 "mixed CPU work %.1f ms\n",
+                 phase, (long long) tokens, wall_ms, wait.ms, (long long) wait.calls,
+                 p.small_cpu_ms, p.small_submit_ms, p.small_concurrent_ms, p.small_join_ms, p.prompt_cpu_ms);
+    if (wait.calls == 0) return;
+    // One compact line per phase, not a log per layer invocation. ms/calls per layer.
+    std::fprintf(stderr, "overlap-router-layers: %s [layer=ms/calls]", phase);
+    for (std::size_t i = 0; i < p.router.layers.size(); ++i) {
+        const auto& l = p.router.layers[i];
+        if (l.calls > 0) std::fprintf(stderr, " %zu=%.2f/%lld", i, l.ms, (long long) l.calls);
+    }
+    std::fprintf(stderr, "\n");
 }
 
 // serve() saves the experts' use after its first answer and then after an answer when the last save is this long
@@ -426,6 +446,8 @@ struct Session {
         int64_t gave_way = -1;   // where `between` stopped the read
         int64_t guessed = 0, guessed_right = 0;
         double prompt_ms = 0, decode_ms = 0;
+        bool overlap_phases = false;
+        OverlapTiming prefill_overlap, decode_overlap;
         const char* finish = "length";
     };
 
@@ -438,6 +460,11 @@ struct Session {
                     int64_t max_new, const Sampling& s, const std::atomic<bool>& stop, OnToken on_token,
                     OnProgress on_progress, const std::function<bool(int64_t)>* between = nullptr) {
         Result r;
+        // With interleaved batch slots, between() can execute another request's
+        // decode inside this one's prompt. Do not attribute that work to prefill.
+        r.overlap_phases = engine.overlap_profile_enabled() && !between && co_read.empty();
+        OverlapTiming profile_start, profile_boundary;
+        if (r.overlap_phases) profile_start = engine.stats().overlap;
         const int64_t n = (int64_t) ids.size();
         Clock::time_point t0 = Clock::now(), shown = t0;   // bringing a parked conversation back is prompt time
         engine.images(pictures.at.data(), (int) pictures.at.size());
@@ -536,6 +563,10 @@ struct Session {
         engine.end_read();
         kept.prompt_was(n);
         r.prompt_ms = ms_since(t0);
+        if (r.overlap_phases) {
+            profile_boundary = engine.stats().overlap;
+            r.prefill_overlap = profile_boundary.minus(profile_start);
+        }
         if (std::strcmp(r.finish, "cancel") == 0) return r;
 
         t0 = Clock::now();
@@ -624,6 +655,7 @@ struct Session {
             }
         }
         r.decode_ms = ms_since(t0);
+        if (r.overlap_phases) r.decode_overlap = engine.stats().overlap.minus(profile_boundary);
         return r;
     }
 };
@@ -1393,9 +1425,15 @@ int serve(Session& ss) {
         //      <experts from VRAM> <experts> <RAM blobs> <file blobs> <file MB> <prompt tokens read> <offloaded>
         const strata::poly::Stats& now = engine.stats();
         // the cache's share of the experts looked up while answering: a prompt batch's go through VRAM either way
-        if (ss.engine.stats().overlap.small_calls != before.overlap.small_calls ||
-            ss.engine.stats().overlap.prompt_calls != before.overlap.prompt_calls)
+        if (engine.overlap_profile_enabled()) {
             report_overlap(before.overlap, now.overlap, now.route_wait_ms - before.route_wait_ms);
+            if (r.overlap_phases) {
+                report_overlap_phase("prefill", r.prefill_overlap, r.prompt_ms, r.read);
+                report_overlap_phase("decode", r.decode_overlap, r.decode_ms, r.produced);
+            } else if (!ahead) {
+                std::fprintf(stderr, "overlap-phase: unavailable for interleaved batch requests\n");
+            }
+        }
         const long long hits = now.gpu_experts - before.gpu_experts;
         const long long misses = now.cpu_experts - before.cpu_experts;
         std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld 0 0 0.0 %lld 0\n", (long long) r.produced, n,
@@ -1504,8 +1542,13 @@ int once(Session& ss, const std::vector<int32_t>& ids, const Pictures& pictures,
         [](int64_t, int64_t, double, bool) {});
     std::printf("%s\n", out.c_str());
     const strata::poly::Stats& st = ss.engine.stats();
-    if (st.overlap.small_calls || st.overlap.prompt_calls)
+    if (ss.engine.overlap_profile_enabled()) {
         report_overlap(OverlapTiming{}, st.overlap, st.route_wait_ms);
+        if (r.overlap_phases) {
+            report_overlap_phase("prefill", r.prefill_overlap, r.prompt_ms, r.read);
+            report_overlap_phase("decode", r.decode_overlap, r.decode_ms, r.produced);
+        }
+    }
     const double experts = (double) std::max<int64_t>(st.gpu_experts + st.cpu_experts, 1);
     std::fprintf(stderr,
                  "prompt %lld tokens %.1f tok/s, generated %lld tokens %.2f tok/s (%s); experts from VRAM %.1f%%, "

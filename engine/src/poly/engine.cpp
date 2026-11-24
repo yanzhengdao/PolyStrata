@@ -5075,7 +5075,9 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
     const size_t e_row = (size_t) n_embd_;
     Clock::time_point t0 = Clock::now();
     ck(cudaEventSynchronize((cudaEvent_t) ev_), "router");
-    stats_.route_wait_ms += ms_since(t0);
+    const double waited = ms_since(t0);
+    stats_.route_wait_ms += waited;
+    if (opt_.profile_overlap) stats_.overlap.router.record(il, waited);
     if (block_pass_) route_block(il, h_rl_, n);
     if (pool_ && prompt_rows_ >= 4096 && !block_pass_) {
         rekeep();
@@ -6283,7 +6285,9 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     const Clock::time_point t0 = Clock::now();
     ck(cudaEventSynchronize((cudaEvent_t) ev_), "router");
     if (ahead && !early && !freeze_experts_) route_ms_ = ms_since(t0);
-    stats_.route_wait_ms += ms_since(t0);
+    const double waited = ms_since(t0);
+    stats_.route_wait_ms += waited;
+    if (opt_.profile_overlap) stats_.overlap.router.record(il, waited);
 
     const size_t cb_row = (size_t) n_expert_ + 1;
     const int32_t* d_tok = tab_;

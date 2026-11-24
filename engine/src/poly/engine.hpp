@@ -406,6 +406,7 @@ public:
     void load_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n);
 
     const Stats& stats() const;
+    bool overlap_profile_enabled() const { return opt_.profile_overlap; }
     /// Between requests, and once after the load: of the experts the card has, the pages of the half used most
     /// lately leave this process's working set (after the load only under Options::ram_experts_mib), and so do the
     /// CPU's experts' under Options::ram_experts_mib and cuBLAS's pages; the pinned memory only a long prompt needs

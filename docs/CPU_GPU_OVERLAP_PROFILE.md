@@ -39,3 +39,28 @@ unconditional synchronization to the hot path.
 
 A host-only unit test, `poly_overlap_timing_test`, checks interval intersection
 and counter aggregation. It does not validate CUDA execution or throughput.
+
+
+## Phase and layer breakdown (second profiling revision)
+
+The same `--profile-overlap` flag also enables two additional summaries
+for a normal single request:
+
+- `overlap-phase: prefill` and `overlap-phase: decode` report the phase wall
+  time, router wait in milliseconds and its call count, and the original CPU
+  and enqueue timing fields separately. The phases are split at the actual
+  Session::generate boundary, not by MoE batch size. Prefill includes the
+  final prompt token, and reports newly read rather than reused tokens.
+- `overlap-router-layers:` lists all observed layers as
+  `zero_based_layer=total_ms/call_count`. The totals use the same existing
+  host-side event waits as the aggregate router wait. They can include
+  upstream stream work, transfer dependencies, and scheduling latency;
+  they are **not** exclusive router kernel timings. Speculative work,
+  including rejected rows, contributes to the totals.
+
+Interleaved batch-slot requests retain the original aggregate log and do
+not claim an exact phase attribution. Calls using paths with no host router
+wait can have no layer entries. Layer totals aggregate across devices if
+layer splitting is used, and are not necessarily disjoint wall intervals.
+No new GPU events or synchronizations are inserted. Profiling off leaves
+the router layer vectors empty and does not take phase snapshots.
