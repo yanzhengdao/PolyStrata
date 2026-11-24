@@ -58,9 +58,26 @@ using strata::poly::Engine;
 using strata::poly::Guesses;
 using strata::poly::KvFmt;
 using strata::poly::Options;
+using strata::poly::OverlapTiming;
 using Clock = std::chrono::steady_clock;
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
+// Per-request deltas. GPU "submit" is host-side enqueue time, NOT CUDA kernel time.
+void report_overlap(const OverlapTiming& before, const OverlapTiming& after, double router_wait_ms) {
+    const OverlapTiming p = after.minus(before);
+    if (p.small_calls == 0 && p.prompt_calls == 0) return;
+    std::fprintf(stderr,
+                 "overlap-profile: small batches %lld, GPU submissions %lld; CPU work %.1f ms, GPU enqueue "
+                 "%.1f ms, concurrent host %.1f ms, enqueue-thread join wait %.1f ms\n",
+                 (long long) p.small_calls, (long long) p.small_submits, p.small_cpu_ms,
+                 p.small_submit_ms, p.small_concurrent_ms, p.small_join_ms);
+    std::fprintf(stderr,
+                 "overlap-profile: prompt mixed calls %lld; CPU work %.1f ms, GPU/staging completion path "
+                 "%.1f ms, concurrent wall %.1f ms, join wait %.1f ms; router wait %.1f ms\n",
+                 (long long) p.prompt_calls, p.prompt_cpu_ms, p.prompt_gpu_path_ms,
+                 p.prompt_concurrent_ms, p.prompt_join_ms, router_wait_ms);
+}
 
 // serve() saves the experts' use after its first answer and then after an answer when the last save is this long
 // ago, and not only when it is told to quit: a server that is ended on Windows takes its engine with it at once.
@@ -1376,6 +1393,9 @@ int serve(Session& ss) {
         //      <experts from VRAM> <experts> <RAM blobs> <file blobs> <file MB> <prompt tokens read> <offloaded>
         const strata::poly::Stats& now = engine.stats();
         // the cache's share of the experts looked up while answering: a prompt batch's go through VRAM either way
+        if (ss.engine.stats().overlap.small_calls != before.overlap.small_calls ||
+            ss.engine.stats().overlap.prompt_calls != before.overlap.prompt_calls)
+            report_overlap(before.overlap, now.overlap, now.route_wait_ms - before.route_wait_ms);
         const long long hits = now.gpu_experts - before.gpu_experts;
         const long long misses = now.cpu_experts - before.cpu_experts;
         std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld 0 0 0.0 %lld 0\n", (long long) r.produced, n,
@@ -1484,6 +1504,8 @@ int once(Session& ss, const std::vector<int32_t>& ids, const Pictures& pictures,
         [](int64_t, int64_t, double, bool) {});
     std::printf("%s\n", out.c_str());
     const strata::poly::Stats& st = ss.engine.stats();
+    if (st.overlap.small_calls || st.overlap.prompt_calls)
+        report_overlap(OverlapTiming{}, st.overlap, st.route_wait_ms);
     const double experts = (double) std::max<int64_t>(st.gpu_experts + st.cpu_experts, 1);
     std::fprintf(stderr,
                  "prompt %lld tokens %.1f tok/s, generated %lld tokens %.2f tok/s (%s); experts from VRAM %.1f%%, "
@@ -1610,6 +1632,7 @@ void usage() {
                  "                         CPUs; all of them in a container with a CPU quota)\n"
                  "  --worker-idle-spins N  CPU expert worker pause-loop iterations before sleeping (0..1000000;\n"
                  "                         default 20000; 0 = sleep immediately; experimental)\n"
+                 "  --profile-overlap     report host CPU/GPU submission, mixed-batch wait and overlap timings\n"
                  "  --vram-reserve-mib N   VRAM left free beside the expert cache, 256 at least (default: a\n"
                  "                         thirty-second of the card, 256 to 768, or a sixteenth, 512 to 1024,\n"
                  "                         when the PC's free RAM is within 4 GiB of the model's files, and then\n"
@@ -1825,6 +1848,7 @@ int main(int argc, char** argv) {
         else if (a == "--max-context") o.max_context = std::atoi(val());
         else if (a == "--threads") o.threads = std::atoi(val());
         else if (a == "--worker-idle-spins") o.worker_idle_spins = std::atoi(val());
+        else if (a == "--profile-overlap") o.profile_overlap = true;
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(val());
         else if (a == "--vram-pool") o.vram_pool = true;
         else if (a == "--expert-profile") o.profile = val();

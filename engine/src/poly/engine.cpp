@@ -4384,6 +4384,7 @@ const Stats& Engine::stats() const {
         all_stats_.ahead_used += s.ahead_used;
         all_stats_.cpu_ms += s.cpu_ms;
         all_stats_.route_wait_ms += s.route_wait_ms;
+        all_stats_.overlap.add(s.overlap);
     }
     return all_stats_;
 }
@@ -5351,8 +5352,15 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         }
         any_host = true;
         t0 = Clock::now();
-        const std::function<void()>* meanwhile =
-            n_cached > 0 || (first && at == 0) || (ahead_j >= 0 && at == 0) ? &launch : nullptr;
+        OverlapClock::time_point submit_start{}, submit_end{};
+        const std::function<void()> timed_launch = [&] {
+            submit_start = OverlapClock::now();
+            launch();
+            submit_end = OverlapClock::now();
+        };
+        const bool submit_needed = n_cached > 0 || (first && at == 0) || (ahead_j >= 0 && at == 0);
+        const std::function<void()>* meanwhile = submit_needed
+            ? (opt_.profile_overlap ? &timed_launch : &launch) : nullptr;
         // The experts still being read (missed now, or read ahead and not there yet) are computed last, by
         // cpu_experts(), and the others meanwhile: read before them, a call's reads held its whole CPU part up.
         uint8_t late[kCpuRows * kMaxUsed];
@@ -5388,6 +5396,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         // for them.  `first` moves the buffers to the other half's rows while it runs, so this call's are taken now.
         const float* x = h_x_ + (size_t) at * e_row;
         const bool aside = meanwhile && aside_;
+        const auto cpu_start = opt_.profile_overlap ? OverlapClock::now() : OverlapClock::time_point{};
         if (aside) aside_->start(*meanwhile);
         try {
             cpu_experts(*workers_, host, n_host, m, (int) L.gu_type, (int) L.u_type, (int) L.d_type, n_embd_, n_ff_exp_,
@@ -5400,7 +5409,19 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                 }
             throw;
         }
+        const auto cpu_end = opt_.profile_overlap ? OverlapClock::now() : OverlapClock::time_point{};
         if (aside) aside_->finish();
+        if (opt_.profile_overlap) {
+            OverlapTiming& p = stats_.overlap;
+            ++p.small_calls;
+            p.small_cpu_ms += interval_ms(cpu_start, cpu_end);
+            if (aside) p.small_join_ms += interval_ms(cpu_end, OverlapClock::now());
+            if (meanwhile) {
+                ++p.small_submits;
+                p.small_submit_ms += interval_ms(submit_start, submit_end);
+                p.small_concurrent_ms += concurrent_ms(cpu_start, cpu_end, submit_start, submit_end);
+            }
+        }
 #if !defined(STRATA_GPU_METAL)
         if (n_far > 0) ecard_->finish_into(cpu);
 #endif
@@ -6633,20 +6654,31 @@ void Engine::moe_rows(Layer& L, int il, int n) {
         card();
     } else {   // the card's part on a thread of its own, and the CPU's on the workers
         if (!stagers_) stagers_ = std::make_unique<Workers>(4);   // one thread copied slower than the bus
-        Clock::time_point done;
+        Clock::time_point done, gpu_started;
         Behind behind;
         const Clock::time_point start = Clock::now();
         behind.go([&] {
+            if (opt_.profile_overlap) gpu_started = Clock::now();
             cudaSetDevice(device_);   // a thread starts on card 0
             card();
             ck(cudaStreamSynchronize(cs(st_)), "expert staging");
             done = Clock::now();
         });
+        const auto cpu_started = opt_.profile_overlap ? Clock::now() : start;
         cpu_experts(*workers_, host_.data(), (int) host_.size(), n, gt, ut, dt, n_embd_, n_ff_exp_, h_x_, limit, gelu_,
                     h_cpu_, nullptr, nullptr, nullptr, situ_beta_, situ_lb_);
+        const auto cpu_done = opt_.profile_overlap ? Clock::now() : start;
         const double cpu = ms_since(start);
         behind.wait();
         const double gpu = std::chrono::duration<double, std::milli>(done - start).count();
+        if (opt_.profile_overlap) {
+            OverlapTiming& p = stats_.overlap;
+            ++p.prompt_calls;
+            p.prompt_cpu_ms += interval_ms(cpu_started, cpu_done);
+            p.prompt_gpu_path_ms += interval_ms(gpu_started, done);
+            p.prompt_concurrent_ms += concurrent_ms(cpu_started, cpu_done, gpu_started, done);
+            p.prompt_join_ms += interval_ms(cpu_done, Clock::now());
+        }
         stats_.cpu_ms += cpu;
         stats_.cpu_experts += (int64_t) host_.size();
         // the share that would have had both done at once, if each one's time grows with its share
