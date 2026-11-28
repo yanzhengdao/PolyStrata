@@ -4,6 +4,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <cwchar>
 #include <deque>
 #include <functional>
@@ -184,6 +185,7 @@ uint8_t* Spill::data() const {
 
 void Spill::release() const {
     std::lock_guard<std::mutex> l(m_);
+    if (pinned_ram_) return;
     const bool used = used_;
     used_ = false;
     if (heap_) {
@@ -197,6 +199,40 @@ void Spill::release() const {
         return;
     }
     if (view_ && used) drop();
+}
+
+bool Spill::pin_ram() const {
+    std::lock_guard<std::mutex> l(m_);
+    used_ = true;
+    if (!heap_ && filed_) {
+        if (!view_) map();
+        if (cold_) {
+            bring_in(view_, n_);
+            cold_ = false;
+        }
+        uint8_t* copy = new (std::nothrow) uint8_t[n_];
+        if (!copy) return false;
+        if (n_ > 0) std::memcpy(copy, view_, n_);
+        heap_ = copy;
+    }
+    if (!heap_ && n_ > 0) return false;
+    pinned_ram_ = true;
+    return true;
+}
+
+void Spill::unpin_ram() const {
+    std::lock_guard<std::mutex> l(m_);
+    pinned_ram_ = false;
+}
+
+bool Spill::is_pinned_ram() const {
+    std::lock_guard<std::mutex> l(m_);
+    return pinned_ram_;
+}
+
+bool Spill::has_heap() const {
+    std::lock_guard<std::mutex> l(m_);
+    return heap_ != nullptr;
 }
 
 // Nothing writes or frees the heap while it is queued and not filed: it is read without the lock.  A file that
@@ -216,7 +252,7 @@ void Spill::write() const {
     }
     file_ = f;
     filed_ = true;
-    if (!used_) {
+    if (!used_ && !pinned_ram_) {
         delete[] heap_;
         heap_ = nullptr;
     }

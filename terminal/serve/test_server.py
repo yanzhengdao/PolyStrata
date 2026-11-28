@@ -3395,8 +3395,12 @@ class DesktopVramNote(unittest.TestCase):
     def test_desktop_detection(self):
         from serve import server
         with mock.patch.object(server.os, "name", "posix"), mock.patch.object(server.sys, "platform", "linux"):
-            self.assertTrue(server.linux_desktop({"WAYLAND_DISPLAY": "wayland-0"}))
-            self.assertFalse(server.linux_desktop({}))
+            self.assertTrue(server.linux_desktop({"WAYLAND_DISPLAY": "wayland-0"}, release="6.8.0-149-generic"))
+            self.assertFalse(server.linux_desktop({}, release="6.8.0-149-generic"))
+            # WSLg sets both, but the desktop is Windows' (no amdgpu eviction, no OOM killer)
+            wslg = {"DISPLAY": ":0", "WAYLAND_DISPLAY": "wayland-0"}
+            self.assertFalse(server.linux_desktop(wslg, release="6.6.87.2-microsoft-standard-WSL2"))
+            self.assertFalse(server.linux_desktop({**wslg, "WSL_DISTRO_NAME": "Ubuntu"}, release="6.8.0-149-generic"))
 
 
 class StartFailureLog(unittest.TestCase):
@@ -4013,7 +4017,7 @@ class LoadSharedSettings(unittest.TestCase):
         self.assertIn("top_p", said[0])
 
     def test_several_bad_keys_are_each_named(self):
-        got, said = self.load('{"reasoning_effort": "medium", "nope": 1, "top_k": 900}')
+        got, said = self.load('{"reasoning_effort": "medium", "nope": 1, "top_k": -1}')
         self.assertEqual(got, {"reasoning_effort": "medium"})
         self.assertEqual(len(said), 2)
 
@@ -8170,3 +8174,243 @@ class ChatTemplateKwargsShape(unittest.TestCase):
             with self.subTest(chat_template_kwargs=ctk):
                 status, b = self.post({"model": "x", "max_tokens": 8, "messages": msgs, "chat_template_kwargs": ctk})
                 self.assertEqual(status, 200, b)
+
+
+class _MultiPinMockEngine(MockEngine):
+    """Simulates multi-slot Host-RAM prefix pinning (`PIN_CUR`, `PIN_LOAD`, `GEN 0 prefill=1`)."""
+
+    def __init__(self, tok, reply="</think>ok", max_context=CTX, prefill_chunk_delay_s=0.0):
+        super().__init__(tok, reply, max_context=max_context)
+        self.info = {"sessions": 1, "pinned_tokens": 0, "pinned_slots": 0}
+        self.pins: dict[str, list[int]] = {}
+        self.cur_ids: list[int] = []
+        self.calls: list[tuple[list[int], int, bool]] = []
+        self.prefill_chunk_delay_s = prefill_chunk_delay_s
+        self.started_prefill = threading.Event()
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False):
+        best_pin = max(
+            (len(os.path.commonprefix([p_ids, list(ids)])) for p_ids in self.pins.values()),
+            default=0,
+        )
+        cur_same = len(os.path.commonprefix([self.cur_ids, list(ids)]))
+        reused = max(best_pin, cur_same)
+        self.calls.append((list(ids), max_new, bool(prefill_only)))
+        if prefill_only:
+            self.started_prefill.set()
+            if self.prefill_chunk_delay_s > 0:
+                deadline = time.monotonic() + self.prefill_chunk_delay_s
+                while time.monotonic() < deadline:
+                    if cancel is not None and cancel.is_set():
+                        self.last = {"generated": 0, "prompt_tokens": len(ids), "prompt_ms": 1.0,
+                                     "decode_ms": 0.0, "finish": "cancel", "reused": reused,
+                                     "prompt_read": max(0, len(ids) - reused)}
+                        return
+                    time.sleep(0.01)
+            self.cur_ids = list(ids)
+            self.last = {"generated": 0, "prompt_tokens": len(ids), "prompt_ms": 5.0,
+                         "decode_ms": 0.0, "finish": "stop", "reused": reused,
+                         "prompt_read": max(0, len(ids) - reused)}
+            yield None
+            return
+        self.cur_ids = list(ids)
+        emitted = 0
+        try:
+            for t in super().generate(ids, max_new, sampling, cancel, embeddings):
+                if t is not None:
+                    emitted += 1
+                    self.last = {"generated": emitted, "prompt_tokens": len(ids), "prompt_ms": 5.0,
+                                 "decode_ms": 5.0, "finish": "stop", "reused": reused,
+                                 "prompt_read": max(0, len(ids) - reused)}
+                    yield t
+        finally:
+            self.last = {"generated": emitted, "prompt_tokens": len(ids), "prompt_ms": 5.0,
+                         "decode_ms": 5.0, "finish": "stop", "reused": reused,
+                         "prompt_read": max(0, len(ids) - reused)}
+
+    def pin_cur(self, name, resident="ram", path=None, save=None):
+        self.pins[name] = list(self.cur_ids)
+        if path:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text(json.dumps(self.cur_ids), encoding="utf-8")
+        return {"tokens": len(self.cur_ids), "bytes": len(self.cur_ids) * 64, "ms": 1.0}
+
+    def pin_load(self, name, path):
+        ids = json.loads(Path(path).read_text(encoding="utf-8"))
+        self.pins[name] = ids
+        return {"tokens": len(ids), "bytes": len(ids) * 64, "ms": 1.0}
+
+
+class StrataPinHttpAndPreemption(unittest.TestCase):
+    """WHI-1016: OpenAI /v1/chat/completions `strata_pin`, multi-slot pins, restart reload, and preemption."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.cfg_path = Path(self.dir.name) / "strata-m.json"
+        self.cfg_path.write_text("{}", encoding="utf-8")
+        self.tok = ByteTokenizer()
+        self.engine = _MultiPinMockEngine(self.tok, "</think>ok", max_context=CTX)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc.config_path = str(self.cfg_path)
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.dir.cleanup()
+
+    def post(self, body):
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def test_max_tokens_zero_and_one_with_prefill_only_and_multi_slot_hits(self):
+        meta_sys = "Meta static instructions carefully followed."
+        alter_sys = "Alter ego static system persona rules."
+        anchor = "<!-- PIN_END -->"
+        tail = " Dynamic timestamp: 2026-11-25."
+
+        # max_tokens: 0 + prefill_only: true + anchor
+        st, r1 = self.post({
+            "model": "x", "max_tokens": 0,
+            "messages": [{"role": "system", "content": meta_sys + anchor + tail},
+                         {"role": "user", "content": "warmup"}],
+            "strata_pin": {"name": "meta", "prefill_only": True, "resident": "ram", "anchor": anchor},
+        })
+        self.assertEqual(st, 200, r1)
+        self.assertEqual(r1["choices"][0]["message"]["content"], "")
+        self.assertEqual(r1["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(r1["usage"]["completion_tokens"], 0)
+        self.assertEqual(r1["strata_pin"]["name"], "meta")
+        self.assertEqual(r1["strata_pin"]["status"], "pinned")
+        self.assertIn(meta_sys, self.tok.decode(self.engine.pins["meta"]))
+        self.assertNotIn(anchor, self.tok.decode(self.engine.pins["meta"]))
+        self.assertNotIn(tail, self.tok.decode(self.engine.pins["meta"]))
+
+        # max_tokens: 1 + prefill_only: true (Bifrost passthrough compat) without anchor
+        st, r2 = self.post({
+            "model": "x", "max_tokens": 1,
+            "messages": [{"role": "system", "content": alter_sys},
+                         {"role": "user", "content": "warmup"}],
+            "strata_pin": {"name": "alter_ego", "prefill_only": True, "resident": "ram"},
+        })
+        self.assertEqual(st, 200, r2)
+        self.assertEqual(r2["usage"]["completion_tokens"], 0)
+        self.assertEqual(r2["strata_pin"]["name"], "alter_ego")
+        self.assertIn(alter_sys, self.tok.decode(self.engine.pins["alter_ego"]))
+
+        # Bifrost clamped shape: max_tokens deleted, clamped to max_completion_tokens=16 + prefill_only: true
+        st, r2_bf = self.post({
+            "model": "x", "max_completion_tokens": 16,
+            "messages": [{"role": "system", "content": alter_sys},
+                         {"role": "user", "content": "warmup"}],
+            "strata_pin": {"name": "alter_ego", "prefill_only": True, "resident": "ram"},
+        })
+        self.assertEqual(st, 200, r2_bf)
+        self.assertEqual(r2_bf["choices"][0]["message"]["content"], "")
+        self.assertEqual(r2_bf["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(r2_bf["usage"]["completion_tokens"], 0)
+        self.assertEqual(r2_bf["strata_pin"]["status"], "pinned")
+
+        # Normal requests with NO strata_pin hit both pinned slots alternately
+        st, chat1 = self.post({
+            "model": "x", "max_tokens": 8,
+            "messages": [{"role": "system", "content": meta_sys + tail},
+                         {"role": "user", "content": "hello meta"}],
+        })
+        self.assertEqual(st, 200, chat1)
+        self.assertEqual(chat1["usage"]["prompt_tokens_details"]["cached_tokens"], len(self.engine.pins["meta"]))
+
+        st, chat2 = self.post({
+            "model": "x", "max_tokens": 8,
+            "messages": [{"role": "system", "content": alter_sys},
+                         {"role": "user", "content": "hello alter"}],
+        })
+        self.assertEqual(st, 200, chat2)
+        self.assertEqual(chat2["usage"]["prompt_tokens_details"]["cached_tokens"], len(self.engine.pins["alter_ego"]))
+
+        # Restart reload from persisted .bin files
+        engine2 = _MultiPinMockEngine(self.tok, "</think>ok", max_context=CTX)
+        svc2 = Service(engine2, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc2.config_path = str(self.cfg_path)
+        svc2.load_saved_pins()
+        self.assertEqual(set(engine2.pins), {"meta", "alter_ego"})
+
+    def test_streaming_and_validation_and_default_cli_args_byte_identical(self):
+        # Invalid strata_pin specs return HTTP 400 cleanly
+        for bad in ("meta", {"name": "../bad"}, {"name": "ok", "resident": "nvme"},
+                    {"name": "ok", "prefill_only": "yes"}, {"name": "ok", "extra": 1}):
+            st, body = self.post({"model": "x", "max_tokens": 1,
+                                  "messages": [{"role": "system", "content": "sys"},
+                                               {"role": "user", "content": "hi"}],
+                                  "strata_pin": bad})
+            self.assertEqual(st, 400, (bad, body))
+
+        # Streaming prefill_only emits valid OpenAI SSE chunks + usage + [DONE]
+        req = urllib.request.Request(
+            self.base + "/v1/chat/completions",
+            data=json.dumps({
+                "model": "x", "max_tokens": 1, "stream": True,
+                "messages": [{"role": "system", "content": "Streamed system prompt."}],
+                "strata_pin": {"name": "stream_pin", "prefill_only": True},
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read().decode("utf-8")
+        self.assertIn("data: [DONE]", raw)
+        self.assertIn('"finish_reason": "stop"', raw)
+        self.assertIn('"completion_tokens": 0', raw)
+
+        # Default path without opt-in flags produces byte-identical engine_args
+        base_cfg = {"exe": "strata-poly", "args": ["--model", "m.gguf"]}
+        self.assertEqual(engine_args(base_cfg), ["--model", "m.gguf"])
+        opted_in = {**base_cfg, "pin_dir": self.dir.name, "pin_cache_mib": 1024}
+        self.assertEqual(engine_args(opted_in),
+                         ["--model", "m.gguf", "--pin-dir", os.path.abspath(self.dir.name), "--pin-cache-mib", "1024"])
+
+    def test_warmup_preempted_by_interactive_request_and_retries_when_idle(self):
+        slow = _MultiPinMockEngine(self.tok, "</think>ok", max_context=CTX, prefill_chunk_delay_s=0.4)
+        svc = Service(slow, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        results = {}
+
+        def run_warmup():
+            req = urllib.request.Request(
+                base + "/v1/chat/completions",
+                data=json.dumps({
+                    "model": "x", "max_tokens": 1,
+                    "messages": [{"role": "system", "content": "Long system prefix to warm up."}],
+                    "strata_pin": {"name": "preempt_test", "prefill_only": True},
+                }).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                results["warm"] = json.loads(r.read())
+
+        try:
+            t = threading.Thread(target=run_warmup, daemon=True)
+            t.start()
+            self.assertTrue(slow.started_prefill.wait(timeout=5))
+            req_real = urllib.request.Request(
+                base + "/v1/chat/completions",
+                data=json.dumps({"model": "x", "max_tokens": 16,
+                                 "messages": [{"role": "user", "content": "urgent interactive"}]}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req_real, timeout=30) as r:
+                results["real"] = json.loads(r.read())
+            t.join(timeout=10)
+            self.assertEqual(results["real"]["choices"][0]["message"]["content"], "ok")
+            self.assertGreaterEqual(results["warm"]["strata_pin"]["preempted"], 1)
+            self.assertEqual(results["warm"]["strata_pin"]["status"], "pinned")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()

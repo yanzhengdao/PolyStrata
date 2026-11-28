@@ -40,11 +40,11 @@ struct Gate {
 
     bool ask() {
         ++rounds;
-        if (seen[1] < 16) return true;
-        if (seen[0] < 4) return false;
+        if (seen[1] < 24) return true;
+        if (seen[0] < 2) return false;
         const double with = tokens[1] * ms[0], without = tokens[0] * ms[1];   // the two rates, over one divisor
-        pays = with >= without;
-        return rounds % (!pays ? 8 : with > 1.1 * without ? 96 : 24) == 0 ? !pays : pays;
+        pays = pays ? with >= 0.90 * without : with >= without;
+        return rounds % (!pays ? 4 : with > 1.05 * without ? 96 : 32) == 0 ? !pays : pays;
     }
     void saw(bool asked, int n, double round_ms) {
         if (++seen[asked] <= 8 && asked) return;
@@ -62,11 +62,16 @@ public:
 
     Gate gate;
 
-    /// A round begins.  `blocks`: the block may be asked in it.  Returns whether it is asked at all.
-    bool begin(bool blocks, const spec::DraftPolicy& policy) {
+    /// A round begins.  `blocks`: the block may be asked in it.  `at_once`: the first draft call makes the whole
+    /// block's guesses and the later ones only read them.  Returns whether it is asked at all.
+    bool begin(bool blocks, const spec::DraftPolicy& policy, bool at_once = false) {
         ++round_;
         blocks_ = blocks;
+        at_once_ = at_once;
         asked_ = 0;
+        round_ask_ms_ = 0.0;
+        prev_ask_ms_ = ask_ms_;
+        prev_asked_at_ = asked_at_;
         sure_ = tokens_ = 1.0;
         one_ = at_[1] ? ms_[1] : policy.cost_ms(1);   // a token alone is the measure, old or not
         return blocks && gate.ask();
@@ -76,16 +81,20 @@ public:
     bool wants(int n) {
         const int to = n + 2;   // the window's tokens with this guess
         more_ = knows(to) ? std::clamp((ms_[to] - round_ms(to - 1)) / one_, 0.2, 0.8) : kUnmeasured;
-        // asking takes time too: not when a guess the block were sure of would not pay for it
-        const double ask = measured_ && fresh(asked_at_) ? ask_ms_ : 0.0;
+        // asking takes time too: not when a guess the block were sure of would not pay for it (with at_once, only
+        // the first call runs the block; later guesses are already computed)
+        const double ask = measured_ && fresh(asked_at_) && (!at_once_ || n == 0) ? ask_ms_ : 0.0;
         return sure_ * round_ms(to - 1) > tokens_ * (more_ * one_ + ask);
     }
 
     /// The block's guess after n others, right with probability p; asking took `ms`.  Returns whether it joins
     /// the window.
     bool takes(int n, double p, double ms) {
-        ask_ms_ = fresh(asked_at_) ? ask_ms_ + 0.1 * (std::min(ms, 2.0 * ask_ms_) - ask_ms_) : ms;
-        asked_at_ = round_;
+        round_ask_ms_ += ms;
+        if (!at_once_ || n == 0) {
+            ask_ms_ = fresh(asked_at_) ? ask_ms_ + 0.1 * (std::min(ms, 2.0 * ask_ms_) - ask_ms_) : ms;
+            asked_at_ = round_;
+        }
         ++asked_;
         sure_ *= p;
         if (sure_ * round_ms(n + 1) <= tokens_ * more_ * one_) return false;
@@ -96,14 +105,24 @@ public:
     /// The round is over: a window of t tokens wrote `wrote` of them in `ms`.  Returns the time as it counts,
     /// which is the policy's too: none for a round that recorded launches, which took many rounds' time.
     double end(int t, int wrote, double ms, bool recorded) {
-        if (recorded) return 0.0;
+        if (recorded) {
+            ask_ms_ = prev_ask_ms_;
+            asked_at_ = prev_asked_at_;
+            return 0.0;
+        }
         t = std::clamp(t, 1, spec::DraftPolicy::kMaxT);
-        if (knows(t)) ms = std::min(ms, 2.0 * ms_[t]);
-        ms_[t] = knows(t) ? ms_[t] + 0.1 * (ms - ms_[t]) : ms;
+        // ms_[t] tracks verify time without the round's draft time so incremental window costs do not double-count ask
+        const double vms = std::max(0.0, ms - round_ask_ms_);
+        const double sample = knows(t) ? std::min(vms, 2.0 * ms_[t]) : vms;
+        ms_[t] = knows(t) ? ms_[t] + 0.1 * (sample - ms_[t]) : sample;
         at_[t] = round_;
         measured_ = true;
-        if (blocks_) gate.saw(asked_ > 0, wrote, ms);
-        return ms;
+        const double ask_cap = asked_ > 0 && fresh(asked_at_)
+                                   ? std::min(round_ask_ms_, 2.0 * ask_ms_ * (at_once_ ? 1 : asked_))
+                                   : round_ask_ms_;
+        const double seen_ms = sample + ask_cap;
+        if (blocks_) gate.saw(asked_ > 0, wrote, seen_ms);
+        return seen_ms;
     }
 
 private:
@@ -113,14 +132,16 @@ private:
     double round_ms(int t) const { return t <= 1 ? one_ : knows(t) ? ms_[t] : round_ms(t - 1) + kUnmeasured * one_; }
 
     long long round_ = 0;                            // the first is 1
-    double ms_[spec::DraftPolicy::kMaxT + 1] = {};   // a round's time by its window's tokens
+    double ms_[spec::DraftPolicy::kMaxT + 1] = {};   // a round's verify time by its window's tokens
     long long at_[spec::DraftPolicy::kMaxT + 1] = {};   // the round that time is of; 0: none yet
-    double ask_ms_ = 0.0;                            // what one guess of the block takes
-    long long asked_at_ = 0;
+    double ask_ms_ = 0.0, prev_ask_ms_ = 0.0;        // what one guess (or block) takes
+    long long asked_at_ = 0, prev_asked_at_ = 0;
     bool measured_ = false;                          // some round's time is known: asking can be weighed against it
     // of the round
     bool blocks_ = false;
+    bool at_once_ = false;
     int asked_ = 0;
+    double round_ask_ms_ = 0.0;
     double one_ = 1.0, more_ = kUnmeasured, sure_ = 1.0, tokens_ = 1.0;
 };
 

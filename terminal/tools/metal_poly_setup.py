@@ -19,15 +19,18 @@ def add_arguments(parser):
                         help="strata-poly memory policy (default balanced); omitted keeps a saved setting")
     parser.add_argument("--poly-kv", choices=("fp16", "q8_0"), default=None,
                         help="strata-poly KV override; default Q8 for compatible Qwen35MoE models, otherwise FP16")
+    parser.add_argument("--no-draft", action="store_true", default=False,
+                        help="disable the draft model or draft block (saved as \"mtp\": false until --mtp on)")
 
 
 def requested(a):
-    return any(getattr(a, key, None) is not None for key in ("metal_optimize", "metal_memory", "poly_kv"))
+    return any(getattr(a, key, None) is not None for key in ("metal_optimize", "metal_memory", "poly_kv")) or bool(
+        getattr(a, "no_draft", False))
 
 
 def validate(a, poly_families):
     if requested(a) and a.family not in poly_families:
-        raise ValueError("--metal-optimize, --no-metal-optimize, --metal-memory and --poly-kv require a strata-poly --family")
+        raise ValueError("--metal-optimize, --no-metal-optimize, --metal-memory, --poly-kv and --no-draft require a strata-poly --family")
     if getattr(a, "poly_kv", None) == "q8_0" and a.family not in Q8_FAMILIES:
         raise ValueError("--poly-kv q8_0 requires qwen36, ornith, tiel or minicpmv (Qwen35MoE)")
 

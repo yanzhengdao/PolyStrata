@@ -460,6 +460,26 @@ void case_clips() {
             ink_clips(st, stream());
             same_bits(tag + ": the stores", keys.get(), keys2.get());
             same_bits(tag + ": the stores (values)", vals.get(), vals2.get());
+            if (!kv8) {   // the fp16 stores against store_f16() / ink_store_ring() and store_f16_at() of the same rows
+                const int n = kKv * kDim;
+                Dev<uint8_t> k3(cache_bytes(false, cells)), v3(cache_bytes(false, cells)), k4(cache_bytes(false, cells)),
+                    v4(cache_bytes(false, cells));
+                Dev<long long> at(std::vector<long long>{pos, 0});
+                if (ring) {
+                    ink_store_ring(dk2, (uint16_t*) k3.p, n, pos, rows, ring, stream());
+                    ink_store_ring(dv2, (uint16_t*) v3.p, n, pos, rows, ring, stream());
+                } else {
+                    store_f16(dk2, (uint16_t*) k3.p, n, pos, rows, stream());
+                    store_f16(dv2, (uint16_t*) v3.p, n, pos, rows, stream());
+                }
+                store_f16_at(dk2, (uint16_t*) k4.p, n, at.p, rows, ring, stream());
+                store_f16_at(dv2, (uint16_t*) v4.p, n, at.p, rows, ring, stream());
+                const char* plain = ring ? "ink_store_ring()" : "store_f16()";
+                same_bits(tag + ": K stored = " + plain, keys.get(), k3.get());
+                same_bits(tag + ": V stored = " + plain, vals.get(), v3.get());
+                same_bits(tag + ": K stored = store_f16_at()", keys.get(), k4.get());
+                same_bits(tag + ": V stored = store_f16_at()", vals.get(), v4.get());
+            }
             // the K reference, and the rows where the stores put it
             std::vector<double> kref(k.size());
             for (size_t h = 0; h < (size_t) rows * kKv; ++h)
@@ -904,6 +924,18 @@ void case_norms() {
     same_bits("ink_gate_norm_q8 = ink_gate(): the gate", out.get(), out2.get());
     same_bits("ink_gate_norm_q8 = native_add_rms_norm_q8_1(): norm", y.get(), y2.get());
     same_bits("ink_gate_norm_q8 = native_add_rms_norm_q8_1(): q8_1", q.get(), q2.get());
+    // ExpertCard's scratch sizes Q8_1 rows by native_q8_1_bytes(n) * count (kSlots = 32 > MAX_NCOLS = 8)
+    {
+        const int ff = 1152, kSlots = 32;
+        const auto h = randv((size_t) kSlots * ff, 1.0f);
+        Dev<float> dh(h);
+        const size_t row_b = nk::native_q8_1_bytes(ff);
+        Dev<uint8_t> dq(row_b * (size_t) kSlots), dq1(row_b * (size_t) kSlots);
+        nk::native_quantize_q8_1(dh, dq, ff, kSlots, stream());
+        for (int r = 0; r < kSlots; ++r)
+            nk::native_quantize_q8_1(dh + (size_t) r * ff, dq1 + (size_t) r * row_b, ff, 1, stream());
+        same_bits("native_quantize_q8_1 kSlots rows = per-row", dq.get(), dq1.get());
+    }
 }
 
 // The loop controllers: ink_cat_norm(_set)(), ink_ctrl_down() (F32: against ink_cat_norm_set() + gemv_set(), the
@@ -1218,6 +1250,18 @@ void case_small() {
         compare("ink_softcap: the rows past the vocabulary are -inf", std::vector<float>{(float) pads_ok},
                 std::vector<double>{(double) rows * (n_all - n_keep)}, 0.0);
     }
+    {   // ink_loopcd_extrap: in-place dst[i] += omega * (dst[i] - ref[i]), and omega == 0 no-op
+        const size_t n = 3 * (size_t) kEmbd + 17;
+        const auto dst0 = randv(n, 3.0f), ref0 = randv(n, 3.0f);
+        Dev<float> dd(dst0), dr(ref0);
+        ink_loopcd_extrap(dd, dr, 0.0f, n, stream());
+        compare("ink_loopcd_extrap (omega 0 no-op)", dd.get(), std::vector<double>(dst0.begin(), dst0.end()), 0.0);
+        const float omega = 0.2f;
+        ink_loopcd_extrap(dd, dr, omega, n, stream());
+        std::vector<double> want(n);
+        for (size_t i = 0; i < n; ++i) want[i] = (double) dst0[i] + (double) omega * ((double) dst0[i] - (double) ref0[i]);
+        compare("ink_loopcd_extrap (omega 0.2)", dd.get(), want, 1e-5);
+    }
 }
 
 // ---- the attention ----
@@ -1421,7 +1465,643 @@ void case_attend_batch() {
     blas_destroy(blas);
 }
 
+// Multi-row and fused CUDA kernels added for Inkling 2 window verification and DSpark drafting.
+void case_cuda_win() {
+    // 1. ink_mix_many multi-row (rows = 4)
+    {
+        const int jobs = 12, nq = 4, rows = 4;
+        std::vector<Dev<float>> st, qs, outs, outs2;
+        InkStates s;
+        for (int k = 0; k < 2; ++k) st.emplace_back(randv((size_t) rows * kEmbd, 1.0f)), s.p[s.n++] = st.back().p;
+        std::vector<const float*> qp;
+        std::vector<float*> op, op2;
+        for (int k = 0; k < jobs; ++k) qs.emplace_back(randv((size_t) nq * kEmbd, 1.0f)), qp.push_back(qs.back().p);
+        for (int k = 0; k < jobs * nq; ++k) {
+            outs.emplace_back((size_t) rows * kEmbd), op.push_back(outs.back().p);
+            outs2.emplace_back((size_t) rows * kEmbd), op2.push_back(outs2.back().p);
+        }
+        ink_mix_many(s, qp.data(), nq, op.data(), jobs, kEmbd, stream(), rows);
+        for (int k = 0; k < jobs; ++k)
+            ink_mix(s, qp[(size_t) k], nq, op2.data() + (size_t) k * nq, kEmbd, rows, stream());
+        std::vector<float> a, b;
+        for (int k = 0; k < jobs * nq; ++k) {
+            const auto x = outs[(size_t) k].get(), y = outs2[(size_t) k].get();
+            a.insert(a.end(), x.begin(), x.end());
+            b.insert(b.end(), y.begin(), y.end());
+        }
+        same_bits("ink_mix_many 4 rows, 12 jobs x 4 queries = ink_mix()", a, b);
+    }
+    // 2. ink_mix_norm multi-row with q8 (mode 1: rms_norm + q8, mode 2: ffn add_rms_norm_q8_1)
+    for (const int mode : {1, 2}) {
+        const int rows = 4, ns = 3;
+        std::vector<Dev<float>> st;
+        InkStates s;
+        for (int k = 0; k < ns; ++k) st.emplace_back(randv((size_t) rows * kEmbd, 1.0f)), s.p[s.n++] = st.back().p;
+        const auto q = randv((size_t) 3 * kEmbd, 1.0f), w = randv(kEmbd, 0.2f, 1.0f);
+        Dev<float> dq(q), dw(w), o0((size_t) rows * kEmbd), o1((size_t) rows * kEmbd), o2((size_t) rows * kEmbd),
+            y((size_t) rows * kEmbd), m0((size_t) rows * kEmbd), m1((size_t) rows * kEmbd), m2((size_t) rows * kEmbd),
+            y2((size_t) rows * kEmbd);
+        const size_t qb = nk::native_q8_1_bytes(kEmbd, rows);
+        Dev<uint8_t> q8(qb), q82(qb);
+        float* out[3] = {o0, o1, o2};
+        float* ref_out[3] = {m0, m1, m2};
+        ink_mix_norm(s, dq, 3, out, kEmbd, rows, dw, y, kEps, stream(), q8.p, mode == 2);
+        ink_mix(s, dq, 3, ref_out, kEmbd, rows, stream());
+        if (mode == 2) {
+            nk::native_add_rms_norm_q8_1(m0, nullptr, dw, y2, q82, kEmbd, rows, kEps, sum_threads(kEmbd), stream());
+        } else {
+            rms_norm(m0, dw, y2, kEmbd, rows, kEps, stream());
+            nk::native_quantize_q8_1(y2, q82, kEmbd, rows, stream());
+        }
+        const std::string tag = fmt("ink_mix_norm 4 rows %s", mode == 2 ? "ffn" : "attn+q8");
+        same_bits(tag + ": norm", y.get(), y2.get());
+        same_bits(tag + ": q8_1", q8.get(), q82.get());
+    }
+    // 3. ink_norm_many_q8_rows & ink_gate_norm_q8_rows (rows = 4)
+    {
+        const int rows = 4;
+        const size_t qb_row = nk::native_q8_1_bytes(kEmbd);
+        std::vector<Dev<float>> xs, ws, ys, ys2;
+        std::vector<Dev<uint8_t>> qs, qs2;
+        const float* xp[3];
+        const float* wp[3];
+        float* yp[3];
+        void* qp[3];
+        for (int j = 0; j < 3; ++j) {
+            xs.emplace_back(randv((size_t) rows * kEmbd, 1.0f + j));
+            ws.emplace_back(randv(kEmbd, 0.2f, 1.0f));
+            ys.emplace_back((size_t) rows * kEmbd);
+            ys2.emplace_back((size_t) rows * kEmbd);
+            qs.emplace_back(qb_row * rows);
+            qs2.emplace_back(qb_row * rows);
+            xp[j] = xs.back(), wp[j] = ws.back(), yp[j] = ys.back(), qp[j] = qs.back();
+        }
+        ink_norm_many_q8_rows(xp, wp, yp, qp, 3, kEmbd, rows, kEps, stream());
+        for (int r = 0; r < rows; ++r) {
+            const float* xr[3] = {xs[0].p + (size_t) r * kEmbd, xs[1].p + (size_t) r * kEmbd,
+                                  xs[2].p + (size_t) r * kEmbd};
+            float* yr[3] = {ys2[0].p + (size_t) r * kEmbd, ys2[1].p + (size_t) r * kEmbd,
+                            ys2[2].p + (size_t) r * kEmbd};
+            void* qr[3] = {qs2[0].p + (size_t) r * qb_row, qs2[1].p + (size_t) r * qb_row,
+                           qs2[2].p + (size_t) r * qb_row};
+            ink_norm_many_q8(xr, wp, yr, qr, 3, kEmbd, kEps, stream());
+        }
+        for (int j = 0; j < 3; ++j) {
+            same_bits(fmt("ink_norm_many_q8_rows input %d: norm", j), ys[(size_t) j].get(), ys2[(size_t) j].get());
+            same_bits(fmt("ink_norm_many_q8_rows input %d: q8_1", j), qs[(size_t) j].get(), qs2[(size_t) j].get());
+        }
+        const auto cur = randv((size_t) rows * kEmbd, 1.0f), msg = randv((size_t) rows * kEmbd, 1.0f),
+                   g = randv((size_t) rows * kEmbd, 1.0f), f = randv((size_t) rows * kEmbd, 1.0f),
+                   w = randv(kEmbd, 0.2f, 1.0f);
+        Dev<float> dc(cur), dm(msg), dg(g), df(f), dw(w), out((size_t) rows * kEmbd), out2((size_t) rows * kEmbd),
+            y((size_t) rows * kEmbd), y2((size_t) rows * kEmbd);
+        Dev<uint8_t> q(qb_row * rows), q2(qb_row * rows);
+        ink_gate_norm_q8_rows(dc, dm, dg, df, out, dw, y, q, kEmbd, rows, kEps, stream());
+        for (int r = 0; r < rows; ++r) {
+            const size_t o = (size_t) r * kEmbd;
+            ink_gate_norm_q8(dc.p + o, dm.p + o, dg.p + o, df.p + o, out2.p + o, dw, y2.p + o,
+                             q2.p + (size_t) r * qb_row, kEmbd, kEps, stream());
+        }
+        same_bits("ink_gate_norm_q8_rows 4 rows: gate", out.get(), out2.get());
+        same_bits("ink_gate_norm_q8_rows 4 rows: norm", y.get(), y2.get());
+        same_bits("ink_gate_norm_q8_rows 4 rows: q8_1", q.get(), q2.get());
+    }
+    // 4. ink_ctrl_down (rows = 2, 4, 7, 8, F32 & BF16) + ink_control3_gate_rows (F32 & BF16, in-place & count=1)
+    for (const bool bf16 : {false, true}) {
+        for (const int rows : {2, 4, 7, 8}) {
+            std::vector<Dev<float>> dcur, dmsg, ch, ch2, out, out2;
+            std::vector<Dev<uint8_t>> ddown, dgain, dforget;
+            const float* cp[3];
+            const float* mp[3];
+            const void* dp[3];
+            const void* gw[3];
+            const void* fw[3];
+            float* chp[3];
+            float* ch2p[3];
+            float* op[3];
+            for (int j = 0; j < 3; ++j) {
+                dcur.emplace_back(randv((size_t) rows * kEmbd, 1.0f + 0.3f * j));
+                dmsg.emplace_back(randv((size_t) rows * kEmbd, 0.5f));
+                ch.emplace_back((size_t) rows * kRank);
+                ch2.emplace_back((size_t) rows * kRank);
+                out.emplace_back((size_t) rows * kEmbd);
+                out2.emplace_back((size_t) rows * kEmbd);
+                if (bf16) {
+                    std::vector<uint16_t> bd, bg, bf;
+                    std::vector<float> wd, wg, wf;
+                    bf16_of(randv((size_t) kRank * 2 * kEmbd, 0.02f), bd, wd);
+                    bf16_of(randv((size_t) kEmbd * kRank, 0.1f), bg, wg);
+                    bf16_of(randv((size_t) kEmbd * kRank, 0.1f), bf, wf);
+                    ddown.emplace_back(bd.size() * 2);
+                    dgain.emplace_back(bg.size() * 2);
+                    dforget.emplace_back(bf.size() * 2);
+                    ck(cudaMemcpy(ddown.back().p, bd.data(), bd.size() * 2, cudaMemcpyHostToDevice), "up");
+                    ck(cudaMemcpy(dgain.back().p, bg.data(), bg.size() * 2, cudaMemcpyHostToDevice), "up");
+                    ck(cudaMemcpy(dforget.back().p, bf.data(), bf.size() * 2, cudaMemcpyHostToDevice), "up");
+                } else {
+                    const auto fd = randv((size_t) kRank * 2 * kEmbd, 0.02f);
+                    const auto fg = randv((size_t) kEmbd * kRank, 0.1f);
+                    const auto ff = randv((size_t) kEmbd * kRank, 0.1f);
+                    ddown.emplace_back(fd.size() * 4);
+                    dgain.emplace_back(fg.size() * 4);
+                    dforget.emplace_back(ff.size() * 4);
+                    ck(cudaMemcpy(ddown.back().p, fd.data(), fd.size() * 4, cudaMemcpyHostToDevice), "up");
+                    ck(cudaMemcpy(dgain.back().p, fg.data(), fg.size() * 4, cudaMemcpyHostToDevice), "up");
+                    ck(cudaMemcpy(dforget.back().p, ff.data(), ff.size() * 4, cudaMemcpyHostToDevice), "up");
+                }
+                cp[j] = dcur.back(), mp[j] = dmsg.back(), dp[j] = ddown.back().p, gw[j] = dgain.back().p,
+                fw[j] = dforget.back().p, chp[j] = ch.back(), ch2p[j] = ch2.back(), op[j] = out.back();
+            }
+            if (!ink_ctrl_down(cp, mp, dp, chp, 3, kEmbd, kRank, rows, stream(), bf16)) {
+                ++failures;
+                std::printf("ink_ctrl_down %s %d rows: refused  FAIL\n", bf16 ? "bf16" : "f32", rows);
+                continue;
+            }
+            for (int r = 0; r < rows; ++r) {
+                const float* cr[3] = {cp[0] + (size_t) r * kEmbd, cp[1] + (size_t) r * kEmbd,
+                                      cp[2] + (size_t) r * kEmbd};
+                const float* mr[3] = {mp[0] + (size_t) r * kEmbd, mp[1] + (size_t) r * kEmbd,
+                                      mp[2] + (size_t) r * kEmbd};
+                float* chr[3] = {ch2p[0] + (size_t) r * kRank, ch2p[1] + (size_t) r * kRank,
+                                 ch2p[2] + (size_t) r * kRank};
+                ink_ctrl_down(cr, mr, dp, chr, 3, kEmbd, kRank, 1, stream(), bf16);
+            }
+            for (int j = 0; j < 3; ++j)
+                same_bits(fmt("ink_ctrl_down %s %d rows = rows=1 loop, ctrl %d", bf16 ? "bf16" : "f32", rows, j),
+                          ch[(size_t) j].get(), ch2[(size_t) j].get());
+            if (rows == 4) {
+                const float* chs[3] = {ch[0], ch[1], ch[2]};
+                ink_control3_gate_rows(cp, mp, chs, gw, fw, op, kEmbd, kRank, rows, stream(), 3, bf16);
+                for (int r = 0; r < rows; ++r) {
+                    const float* cr[3] = {cp[0] + (size_t) r * kEmbd, cp[1] + (size_t) r * kEmbd,
+                                          cp[2] + (size_t) r * kEmbd};
+                    const float* mr[3] = {mp[0] + (size_t) r * kEmbd, mp[1] + (size_t) r * kEmbd,
+                                          mp[2] + (size_t) r * kEmbd};
+                    const float* chr[3] = {ch[0].p + (size_t) r * kRank, ch[1].p + (size_t) r * kRank,
+                                           ch[2].p + (size_t) r * kRank};
+                    float* orow[3] = {out2[0].p + (size_t) r * kEmbd, out2[1].p + (size_t) r * kEmbd,
+                                      out2[2].p + (size_t) r * kEmbd};
+                    ink_control3_gate(cr, mr, chr, gw, fw, orow, kEmbd, kRank, stream(), 3, bf16);
+                }
+                for (int j = 0; j < 3; ++j)
+                    same_bits(fmt("ink_control3_gate_rows %s 4 rows, ctrl %d", bf16 ? "bf16" : "f32", j),
+                              out[(size_t) j].get(), out2[(size_t) j].get());
+                // count = 1 + in-place shared cur[0]
+                Dev<float> sh1(dcur[0].get()), sh2(dcur[0].get());
+                const float* csh1[3] = {sh1, sh1, sh1};
+                const float* csh2[3] = {sh2, sh2, sh2};
+                float* osh1[3] = {sh1, out[1], out[2]};
+                ink_control3_gate_rows(csh1, mp, chs, gw, fw, osh1, kEmbd, kRank, rows, stream(), 3, bf16);
+                for (int r = 0; r < rows; ++r) {
+                    const float* cr[3] = {csh2[0] + (size_t) r * kEmbd, csh2[1] + (size_t) r * kEmbd,
+                                          csh2[2] + (size_t) r * kEmbd};
+                    const float* mr[3] = {mp[0] + (size_t) r * kEmbd, mp[1] + (size_t) r * kEmbd,
+                                          mp[2] + (size_t) r * kEmbd};
+                    const float* chr[3] = {ch[0].p + (size_t) r * kRank, ch[1].p + (size_t) r * kRank,
+                                           ch[2].p + (size_t) r * kRank};
+                    float* orow[3] = {sh2.p + (size_t) r * kEmbd, out2[1].p + (size_t) r * kEmbd,
+                                      out2[2].p + (size_t) r * kEmbd};
+                    ink_control3_gate(cr, mr, chr, gw, fw, orow, kEmbd, kRank, stream(), 3, bf16);
+                }
+                same_bits(fmt("ink_control3_gate_rows %s in-place ctrl 0", bf16 ? "bf16" : "f32"), sh1.get(),
+                          sh2.get());
+                same_bits(fmt("ink_control3_gate_rows %s in-place ctrl 1", bf16 ? "bf16" : "f32"), out[1].get(),
+                          out2[1].get());
+            }
+        }
+    }
+    // 5. ink_conv_mix (1 row) + ink_conv_mix_rows + ink_conv_state_update / 2 (rows = 4)
+    for (const int mode : {0, 1, 2}) {
+        for (const int rows : {1, 4}) {
+            const int nq = mode == 0 ? 3 : 1;
+            const bool ffn = mode == 1;
+            const auto x = randv((size_t) rows * kEmbd, 1.0f), acc = randv((size_t) rows * kEmbd, 1.0f);
+            const auto b0 = randv((size_t) rows * kEmbd, 1.0f), b1 = randv((size_t) rows * kEmbd, 1.0f);
+            const auto st = randv((size_t) (kTaps - 1) * kEmbd, 1.0f), w = randv((size_t) kEmbd * kTaps, 0.5f);
+            const auto q = randv((size_t) nq * kEmbd, 1.0f), nw = randv(kEmbd, 0.2f, 1.0f);
+            Dev<float> dx(x), dacc1(acc), dacc2(acc), db0(b0), db1(b1), dst1(st), dst2(st), dw(w), dq(q), dnw(nw);
+            Dev<float> ao1((size_t) rows * kEmbd), ao2((size_t) rows * kEmbd), keep1((size_t) rows * kEmbd),
+                keep2((size_t) rows * kEmbd), yn1((size_t) rows * kEmbd), yn2((size_t) rows * kEmbd);
+            std::vector<Dev<float>> mo1, mo2;
+            float* mop1[3] = {};
+            float* mop2[3] = {};
+            for (int j = 0; j < nq; ++j) {
+                mo1.emplace_back((size_t) rows * kEmbd), mop1[j] = mo1.back();
+                mo2.emplace_back((size_t) rows * kEmbd), mop2[j] = mo2.back();
+            }
+            const size_t qb = nk::native_q8_1_bytes(kEmbd, rows);
+            Dev<uint8_t> q81(qb), q82(qb);
+            InkStates s1, s2;
+            s1.p[s1.n++] = db0, s2.p[s2.n++] = db0;
+            if (mode == 1) {
+                s1.p[s1.n++] = keep1, s2.p[s2.n++] = keep2;
+            } else {
+                s1.p[s1.n++] = db1, s2.p[s2.n++] = db1;
+            }
+            s1.p[s1.n++] = dacc1, s2.p[s2.n++] = dacc2;
+            const bool do_norm = nq == 1;
+            if (rows == 1) {
+                ink_conv_mix(dx, dst1, dw, ao1, dacc1, mode == 1 ? keep1.p : nullptr, 1.f, mode, kTaps, s1, dq, nq,
+                             mop1, kEmbd, do_norm ? dnw.p : nullptr, do_norm ? yn1.p : nullptr, kEps, stream(),
+                             do_norm ? q81.p : nullptr, ffn);
+                ink_conv_add(dx, dst2, dw, ao2, dacc2, mode == 1 ? keep2.p : nullptr, 1.f, mode, kEmbd, kTaps,
+                             stream());
+                ink_mix_norm(s2, dq, nq, mop2, kEmbd, 1, do_norm ? dnw.p : nullptr, do_norm ? yn2.p : nullptr, kEps,
+                             stream(), do_norm ? q82.p : nullptr, ffn);
+            } else {
+                const unsigned bits = 0x5u;
+                const size_t sstride = (size_t) (kTaps - 1) * kEmbd;
+                Dev<float> snap1(2 * sstride), snap2(2 * sstride);
+                ink_conv_mix_rows(dx, dst1, dw, ao1, dacc1, mode == 1 ? keep1.p : nullptr, 1.f, mode, kTaps, s1, dq, nq,
+                                  mop1, kEmbd, rows, do_norm ? dnw.p : nullptr, do_norm ? yn1.p : nullptr, kEps,
+                                  stream(), do_norm ? q81.p : nullptr, ffn);
+                ink_conv_state_update(dx, dst1, kEmbd, kTaps, rows, snap1, sstride, bits, stream());
+                InkConv jc;
+                jc.x = dx, jc.state = dst2, jc.w = dw, jc.out = ao2, jc.acc = dacc2, jc.mode = mode;
+                jc.keep = mode == 1 ? keep2.p : nullptr, jc.snap = snap2;
+                ink_conv_few(jc, InkConv{}, kEmbd, 1, kTaps, rows, stream(), sstride, bits);
+                ink_mix_norm(s2, dq, nq, mop2, kEmbd, rows, do_norm ? dnw.p : nullptr, do_norm ? yn2.p : nullptr, kEps,
+                             stream(), do_norm ? q82.p : nullptr, ffn);
+                same_bits(fmt("ink_conv_state_update mode %d: snap", mode), snap1.get(), snap2.get());
+            }
+            const std::string tag = fmt("ink_conv_mix%s mode %d", rows > 1 ? "_rows" : "", mode);
+            same_bits(tag + ": ao", ao1.get(), ao2.get());
+            same_bits(tag + ": acc", dacc1.get(), dacc2.get());
+            same_bits(tag + ": state", dst1.get(), dst2.get());
+            if (mode == 1) same_bits(tag + ": keep", keep1.get(), keep2.get());
+            for (int j = 0; j < nq; ++j)
+                same_bits(tag + fmt(": mix %d", j), mo1[(size_t) j].get(), mo2[(size_t) j].get());
+            if (do_norm) {
+                same_bits(tag + ": norm", yn1.get(), yn2.get());
+                same_bits(tag + ": q8_1", q81.get(), q82.get());
+            }
+        }
+    }
+    // 6. ink_moe_conv_mix (1 row) + ink_moe_conv_add_rows + ink_moe_sum_rows + ink_conv_state_update2 (rows = 4)
+    for (const bool scaled : {false, true}) {
+        const auto x = randv((size_t) kUsed * kEmbd, 1.0f), w = randv(kUsed, 0.3f, 0.5f);
+        const auto esc = randv(kExperts, 0.2f, 1.0f), acc = randv(kEmbd, 1.0f), b0 = randv(kEmbd, 1.0f);
+        const auto st = randv((size_t) (kTaps - 1) * kEmbd, 1.0f), cw = randv((size_t) kEmbd * kTaps, 0.5f);
+        const auto q = randv(kEmbd, 1.0f), nw = randv(kEmbd, 0.2f, 1.0f);
+        std::vector<int> ids(kUsed);
+        for (int k = 0; k < kUsed; ++k) ids[k] = (k * 37 + 5) % kExperts;
+        Dev<float> dx(x), dw(w), des(esc), dacc1(acc), dacc2(acc), db0(b0), dst1(st), dst2(st), dcw(cw), dq(q), dnw(nw);
+        Dev<float> fo1(kEmbd), fo2(kEmbd), fc1(kEmbd), fc2(kEmbd), mo1(kEmbd), mo2(kEmbd), yn1(kEmbd), yn2(kEmbd);
+        Dev<uint8_t> q81(nk::native_q8_1_bytes(kEmbd)), q82(nk::native_q8_1_bytes(kEmbd));
+        Dev<int> dids(ids);
+        InkStates s1, s2;
+        s1.p[s1.n++] = db0, s1.p[s1.n++] = dacc1;
+        s2.p[s2.n++] = db0, s2.p[s2.n++] = dacc2;
+        float* mp1[1] = {mo1};
+        float* mp2[1] = {mo2};
+        ink_moe_conv_mix(dx, dw, scaled ? des.p : nullptr, dids, kUsed, fo1, dst1, dcw, fc1, dacc1, 1.f, kTaps, s1, dq,
+                         1, mp1, kEmbd, dnw, yn1, kEps, stream(), q81);
+        ink_moe_conv_add(dx, dw, scaled ? des.p : nullptr, dids, kUsed, fo2, dst2, dcw, fc2, dacc2, 1.f, kEmbd, kTaps,
+                         stream());
+        ink_mix_norm(s2, dq, 1, mp2, kEmbd, 1, dnw, yn2, kEps, stream(), q82, false);
+        const std::string tag = fmt("ink_moe_conv_mix %s", scaled ? "scaled" : "plain");
+        same_bits(tag + ": fo", fo1.get(), fo2.get());
+        same_bits(tag + ": fc", fc1.get(), fc2.get());
+        same_bits(tag + ": acc", dacc1.get(), dacc2.get());
+        same_bits(tag + ": state", dst1.get(), dst2.get());
+        same_bits(tag + ": norm", yn1.get(), yn2.get());
+        same_bits(tag + ": q8_1", q81.get(), q82.get());
+
+        // Multi-row ink_moe_conv_add_rows + ink_moe_sum_rows + ink_conv_state_update2
+        const int rows = 4;
+        const size_t sstride = (size_t) (kTaps - 1) * kEmbd;
+        const auto xm = randv((size_t) rows * kUsed * kEmbd, 1.0f), wm = randv((size_t) rows * kUsed, 0.3f, 0.5f);
+        const auto accm = randv((size_t) rows * kEmbd, 1.0f);
+        std::vector<int> idsm((size_t) rows * kUsed);
+        for (size_t k = 0; k < idsm.size(); ++k) idsm[k] = (int) ((k * 31 + 7) % kExperts);
+        Dev<float> dxm(xm), dwm(wm), dacc_a(accm), dacc_b(accm), dst_a(st), dst_b(st), dst_c(st), dst_d(st);
+        Dev<float> fo_a((size_t) rows * kEmbd), fo_b((size_t) rows * kEmbd), fo_s((size_t) rows * kEmbd);
+        Dev<float> fc_a((size_t) rows * kEmbd), fc_b((size_t) rows * kEmbd);
+        Dev<float> snap_a(2 * sstride), snap_c(2 * sstride), snap_d(2 * sstride);
+        Dev<int> didsm(idsm);
+        ink_moe_conv_add_rows(dxm, dwm, scaled ? des.p : nullptr, didsm, kUsed, fo_a, dst_a, dcw, fc_a, dacc_a, 1.f,
+                              kEmbd, kTaps, rows, stream(), snap_a, sstride, 0x5u);
+        ink_moe_sum_rows(dxm, dwm, scaled ? des.p : nullptr, didsm, kUsed, fo_s, kEmbd, rows, stream());
+        for (int r = 0; r < rows; ++r) {
+            ink_moe_conv_add(dxm.p + (size_t) r * kUsed * kEmbd, dwm.p + (size_t) r * kUsed,
+                             scaled ? des.p : nullptr, didsm.p + (size_t) r * kUsed, kUsed, fo_b.p + (size_t) r * kEmbd,
+                             dst_b, dcw, fc_b.p + (size_t) r * kEmbd, dacc_b.p + (size_t) r * kEmbd, 1.f, kEmbd, kTaps,
+                             stream());
+        }
+        ink_conv_state_update2(fo_a, dst_c, snap_c, rows, fo_a, dst_d, snap_d, rows, kEmbd, kTaps, sstride, 0x5u,
+                               stream());
+        same_bits(fmt("ink_moe_conv_add_rows %s: fo", scaled ? "scaled" : "plain"), fo_a.get(), fo_b.get());
+        same_bits(fmt("ink_moe_sum_rows %s: fo", scaled ? "scaled" : "plain"), fo_s.get(), fo_b.get());
+        same_bits(fmt("ink_moe_conv_add_rows %s: fc", scaled ? "scaled" : "plain"), fc_a.get(), fc_b.get());
+        same_bits(fmt("ink_moe_conv_add_rows %s: acc", scaled ? "scaled" : "plain"), dacc_a.get(), dacc_b.get());
+        same_bits(fmt("ink_moe_conv_add_rows %s: state", scaled ? "scaled" : "plain"), dst_a.get(), dst_b.get());
+        same_bits(fmt("ink_conv_state_update2 %s: state0", scaled ? "scaled" : "plain"), dst_c.get(), dst_b.get());
+        same_bits(fmt("ink_conv_state_update2 %s: snap1", scaled ? "scaled" : "plain"), snap_d.get(), snap_a.get());
+    }
+    // 7. ink_qkv_win (rows = 4, fp16 & fp8, full & ring, host & card pos, snapshots)
+    {
+        const int kvn = kKv * kDim, rows = 4;
+        const size_t sstride = (size_t) (kTaps - 1) * kvn;
+        const unsigned bits = 0x5u;
+        for (const bool kv8 : {false, true}) {
+#if defined(__HIPCC__)
+            if (kv8) continue;
+#endif
+            for (const bool full : {false, true}) {
+                for (const bool on_card : {false, true}) {
+                    const int ring = full ? 0 : kWindow + 8, cells = full ? 3000 : ring;
+                    const long long pos = 2100;
+                    const auto q = randv((size_t) rows * kHeads * kDim, 0.8f);
+                    const auto r = randv((size_t) rows * kHeads * kRel, 1.5f);
+                    const auto kraw = randv((size_t) rows * kvn, 2.0f), vraw = randv((size_t) rows * kvn, 2.0f);
+                    const auto kst = randv(sstride, 2.0f), vst = randv(sstride, 2.0f);
+                    const auto kw = randv((size_t) kvn * kTaps, 0.5f), vw = randv((size_t) kvn * kTaps, 0.5f);
+                    const auto kd = randv((size_t) rows * kKv * kTaps, 0.4f),
+                               vd = randv((size_t) rows * kKv * kTaps, 0.4f);
+                    const auto qs = randv((size_t) kHeads * kDim, 0.3f, 1.0f),
+                               rs = randv((size_t) kHeads * kRel, 0.3f, 1.0f);
+                    Dev<float> q1(q), q2(q), r1(r), r2(r), ks1(kst), ks2(kst), vs1(vst), vs2(vst);
+                    Dev<float> k1((size_t) rows * kvn), k2((size_t) rows * kvn), v1((size_t) rows * kvn),
+                        v2((size_t) rows * kvn);
+                    Dev<float> ksnap1(2 * sstride), ksnap2(2 * sstride), vsnap1(2 * sstride), vsnap2(2 * sstride);
+                    Dev<float> dkraw(kraw), dvraw(vraw), dkw(kw), dvw(vw), dkd(kd), dvd(vd), dqs(qs), drs(rs);
+                    Dev<uint8_t> keys1(cache_bytes(kv8, cells)), vals1(cache_bytes(kv8, cells));
+                    Dev<uint8_t> keys2(cache_bytes(kv8, cells)), vals2(cache_bytes(kv8, cells));
+                    std::vector<long long> atv((size_t) 2 * rows);
+                    for (int t = 0; t < rows; ++t) atv[(size_t) 2 * t] = pos + t;
+                    Dev<long long> dat(atv);
+                    InkQkv a;
+                    a.q = q1, a.q_scale = dqs, a.r = r1, a.r_scale = drs, a.kraw = dkraw, a.vraw = dvraw;
+                    a.kstate = ks1, a.vstate = vs1, a.kw = dkw, a.vw = dvw;
+                    a.kdyn = full ? dkd.p : nullptr, a.vdyn = full ? dvd.p : nullptr;
+                    a.k = k1, a.v = v1, a.keys = (uint16_t*) keys1.p, a.vals = (uint16_t*) vals1.p;
+                    a.at = on_card ? dat.p : nullptr, a.pos = on_card ? 0 : pos;
+                    a.qk_thr = kQkClip, a.rel_thr = kRelClip, a.alpha = full ? kAlpha : 0.f, a.floor = kFloor;
+                    a.eps = kEps, a.n_head = kHeads, a.n_kv = kKv, a.dim = kDim, a.n_rel = kRel, a.taps = kTaps;
+                    a.ring = ring, a.kv8 = kv8;
+                    ink_qkv_win(a, rows, ksnap1, vsnap1, sstride, bits, stream());
+                    InkConv ckk, cvv;
+                    ckk.x = dkraw, ckk.state = ks2, ckk.w = dkw, ckk.dyn = a.kdyn, ckk.out = k2, ckk.snap = ksnap2;
+                    cvv.x = dvraw, cvv.state = vs2, cvv.w = dvw, cvv.dyn = a.vdyn, cvv.out = v2, cvv.snap = vsnap2;
+                    ink_conv_few(ckk, cvv, kvn, kKv, kTaps, rows, stream(), sstride, bits);
+                    InkClips c;
+                    float* xs[4] = {q2, k2, v2, r2};
+                    const float* sc[4] = {dqs, nullptr, nullptr, drs};
+                    const float thr[4] = {kQkClip, kQkClip, 0.f, kRelClip}, al[4] = {a.alpha, 0.f, 0.f, a.alpha};
+                    const float fl[4] = {kFloor, 1.f, 1.f, kFloor};
+                    const int dims[4] = {kDim, kDim, kDim, kRel}, hs[4] = {kHeads, kKv, kKv, kHeads};
+                    for (int j = 0; j < 4; ++j) {
+                        c.x[j] = xs[j], c.scale[j] = sc[j], c.thr[j] = thr[j], c.alpha[j] = al[j], c.floor[j] = fl[j];
+                        c.dim[j] = dims[j], c.heads[j] = hs[j];
+                    }
+                    c.rms[2] = true, c.eps = kEps, c.pos = pos, c.rows = rows, c.ring = ring, c.kv8 = kv8;
+                    c.cache[1] = (uint16_t*) keys2.p, c.cache[2] = (uint16_t*) vals2.p;
+                    ink_clips(c, stream());
+                    const std::string tag = fmt("ink_qkv_win %s %s%s", kv8 ? "fp8" : "fp16", full ? "full" : "ring",
+                                                on_card ? " card" : "");
+                    same_bits(tag + ": Q", q1.get(), q2.get());
+                    same_bits(tag + ": R", r1.get(), r2.get());
+                    same_bits(tag + ": K", k1.get(), k2.get());
+                    same_bits(tag + ": V", v1.get(), v2.get());
+                    same_bits(tag + ": kstate", ks1.get(), ks2.get());
+                    same_bits(tag + ": ksnap", ksnap1.get(), ksnap2.get());
+                    same_bits(tag + ": keys", keys1.get(), keys2.get());
+                    same_bits(tag + ": vals", vals1.get(), vals2.get());
+                }
+            }
+        }
+    }
+    // 8. Multi-row ink_attend with a.q8 != nullptr (exercises ink_score_win_kernel / ink_value_win_kernel + q8)
+    for (const bool kv8 : {false, true}) {
+#if defined(__HIPCC__)
+        if (kv8) continue;
+#endif
+        for (const bool swa : {false, true}) {
+            const long long upto = 2200;
+            const int ring = swa ? kWindow + 32 : 0, rows = 7, window = swa ? kWindow : 0;
+            const long long pos = upto - rows;
+            const Cache c(kv8, ring, swa ? ring : (int) upto, upto);
+            Inputs in(rows);
+            const size_t per = ink_attend_floats(kHeads, kKv, kDim, upto);
+            Dev<float> score(per * rows), out((size_t) rows * kHeads * kDim), out2((size_t) rows * kHeads * kDim);
+            Dev<uint8_t> q8(nk::native_q8_1_bytes(kHeads * kDim, rows)),
+                q82(nk::native_q8_1_bytes(kHeads * kDim, rows));
+            InkAttn a = attn_of(c, in, pos, rows, window, out, score, score.n);
+            a.q8 = q8;
+            ink_attend(a, stream());
+            for (int r = 0; r < rows; ++r) {
+                InkAttn b = attn_of(c, in, pos + r, 1, window, out2.p + (size_t) r * kHeads * kDim, score, score.n);
+                b.q = in.dq.p + (size_t) r * kHeads * kDim;
+                b.r = in.dr.p + (size_t) r * kHeads * kRel;
+                b.sink = in.dsink.p + (size_t) r * kHeads;
+                b.gate = in.dgate.p + (size_t) r * kHeads * kDim;
+                ink_attend(b, stream());
+            }
+            nk::native_quantize_q8_1(out2, q82, kHeads * kDim, rows, stream());
+            const std::string tag = fmt("ink_attend 7 rows+q8 %s %s", kv8 ? "fp8" : "fp16", swa ? "window" : "full");
+            same_bits(tag + ": out = rows=1 loop", out.get(), out2.get());
+            same_bits(tag + ": q8_1 = native_quantize_q8_1()", q8.get(), q82.get());
+        }
+    }
+    // 9. DSpark fused kernels: ds_rope_qkv, ds_attend + q8, ds_markov_fused, ds_screen_pack (Q8_0/Q4_K/Q5_K)
+    {
+        const int rows = 4, cap = 64, pos0 = 40;
+        const auto q = randv((size_t) rows * kHeads * kDim, 1.0f), k = randv((size_t) rows * kKv * kDim, 1.0f),
+                   v = randv((size_t) rows * kKv * kDim, 1.0f);
+        const auto qw = randv(kDim, 0.2f, 1.0f), kw = randv(kDim, 0.2f, 1.0f);
+        Dev<float> dq1(q), dq2(q), dk1(k), dk2(k), dv(v), dqw(qw), dkw(kw);
+        Dev<uint16_t> kc1((size_t) cap * kKv * kDim), vc1((size_t) cap * kKv * kDim),
+            kc2((size_t) cap * kKv * kDim), vc2((size_t) cap * kKv * kDim);
+        Dev<long long> tags1(cap), tags2(cap);
+        ck(cudaMemset(tags1, 0xff, (size_t) cap * sizeof(long long)), "memset");
+        ck(cudaMemset(tags2, 0xff, (size_t) cap * sizeof(long long)), "memset");
+        ck(cudaDeviceSynchronize(), "memset");
+        const DsPos p{nullptr, pos0};
+        ds_rope_qkv(dq1, dk1, dv, kHeads, kKv, rows, dqw, dkw, kEps, 10000.f, p, kc1, vc1, cap, tags1, stream());
+        ds_rope(dq2, kHeads, rows, dqw, kEps, 10000.f, p, nullptr, 0, nullptr, nullptr, stream());
+        ds_rope(dk2, kKv, rows, dkw, kEps, 10000.f, p, kc2, cap, dv, vc2, stream(), tags2);
+        same_bits("ds_rope_qkv: Q = ds_rope", dq1.get(), dq2.get());
+        same_bits("ds_rope_qkv: kcache = ds_rope", kc1.get(), kc2.get());
+        same_bits("ds_rope_qkv: vcache = ds_rope", vc1.get(), vc2.get());
+        same_bits("ds_rope_qkv: tags = ds_rope", tags1.get(), tags2.get());
+
+        // ds_attend with q8
+        Dev<float> part(ds_attend_floats(kKv)), aout1((size_t) rows * kHeads * kDim),
+            aout2((size_t) rows * kHeads * kDim);
+        Dev<uint8_t> aq1(nk::native_q8_1_bytes(kHeads * kDim, rows)), aq2(nk::native_q8_1_bytes(kHeads * kDim, rows));
+        const float sc = 1.f / std::sqrt((float) kDim);
+        ds_attend(dq1, kc1, vc1, tags1, cap, p, 32, rows, kHeads, kKv, sc, part, aout1, stream(), aq1);
+        ds_attend(dq1, kc1, vc1, tags1, cap, p, 32, rows, kHeads, kKv, sc, part, aout2, stream(), nullptr);
+        nk::native_quantize_q8_1(aout2, aq2, kHeads * kDim, rows, stream());
+        same_bits("ds_attend + q8: out", aout1.get(), aout2.get());
+        same_bits("ds_attend + q8: q8_1", aq1.get(), aq2.get());
+
+        // ds_markov_fused vs ds_markov_in + gemv_bf16 + ds_markov_step + quantize
+        const int rank = 256, vocab = 64;
+        const auto st0 = randv(rank, 0.5f), ctxh = randv(3 * rank, 0.4f), ctxf = randv(3 * rank, 0.4f),
+                   bias = randv(3 * rank, 0.2f);
+        std::vector<uint16_t> bw1, bwsp;
+        std::vector<float> ww1, wwsp;
+        bf16_of(randv((size_t) vocab * rank, 0.5f), bw1, ww1);
+        bf16_of(randv((size_t) 3 * rank * 2 * rank, 0.05f), bwsp, wwsp);
+        Dev<float> dst_in(st0), dst_out(rank), dst_ref(st0), dctxh(ctxh), dctxf(ctxf), dbias(bias);
+        Dev<float> dlat1(rank), dlat2(rank), din(2 * rank), dsp(3 * rank);
+        Dev<uint16_t> dw1(bw1), dwsp(bwsp);
+        Dev<int32_t> dprev(std::vector<int32_t>{17});
+        Dev<uint8_t> dlq1(nk::native_q8_1_bytes(rank)), dlq2(nk::native_q8_1_bytes(rank));
+        ds_markov_fused(dst_in, dw1, dprev, dwsp, dctxh, dctxf, dbias, dst_out, dlat1, dlq1, rank, stream());
+        ds_markov_in(dst_ref, dw1, dprev, din, rank, stream());
+        gemv_bf16(dwsp, din, dsp, 2 * rank, 3 * rank, 3 * rank, 1, stream());
+        ds_markov_step(dctxh, dctxf, dbias, dsp, dst_ref, dlat2, rank, stream());
+        nk::native_quantize_q8_1(dlat1, dlq2, rank, 1, stream());
+        compare("ds_markov_fused: state vs unfused", dst_out.get(), dbl(dst_ref.get()), 2e-5);
+        compare("ds_markov_fused: latent vs unfused", dlat1.get(), dbl(dlat2.get()), 2e-5);
+        same_bits("ds_markov_fused: lat_q8 = native_quantize_q8_1()", dlq1.get(), dlq2.get());
+
+        // ds_screen_pack + ds_head_base + ds_head_pick for Q8_0 (8), Q4_K (12), Q5_K (13)
+        const int64_t n_rows = 2048;
+        const int nd = 3;
+        // Build random valid Q8_0 fold [n_rows][256]
+        const size_t q8_fold_row = (size_t) (rank / 32) * 34;
+        std::vector<uint8_t> hfold((size_t) n_rows * q8_fold_row);
+        std::uniform_int_distribution<int> u8(0, 255);
+        std::uniform_real_distribution<float> uf(0.01f, 0.05f);
+        for (int64_t r = 0; r < n_rows; ++r)
+            for (int b = 0; b < rank / 32; ++b) {
+                uint8_t* p = hfold.data() + (size_t) r * q8_fold_row + (size_t) b * 34;
+                const uint16_t d = __half_as_ushort(__float2half(uf(rng)));
+                std::memcpy(p, &d, 2);
+                for (int i = 0; i < 32; ++i) p[2 + i] = (uint8_t) u8(rng);
+            }
+        const auto hfb = randv((size_t) n_rows, 0.3f);
+        const auto hh = randv((size_t) nd * kEmbd, 1.0f), hlat = randv(rank, 1.0f);
+        Dev<uint8_t> dfold(hfold), dfold_sc(ds_screen_bytes(rank, n_rows));
+        Dev<float> dfb(hfb), dfbp((size_t) ds_screen_rows(n_rows)), dh(hh), dlat(hlat);
+        Dev<uint8_t> dhq(nk::native_q8_1_bytes(kEmbd, nd)), dlatq(nk::native_q8_1_bytes(rank));
+        nk::native_quantize_q8_1(dh, dhq, kEmbd, nd, stream());
+        nk::native_quantize_q8_1(dlat, dlatq, rank, 1, stream());
+        ds_screen_pack(dfold, rank, n_rows, dfold_sc, stream(), 8u);
+        ds_screen_order(dfb, n_rows, dfbp, stream());
+        Dev<float> dfy((size_t) n_rows), dbase((size_t) nd * n_rows), dz(ds_pick_floats()),
+            dapprox((size_t) nd * ds_screen_rows(n_rows));
+        Dev<uint8_t> dhscr(ds_screen_scratch_bytes(n_rows));
+        nk::native_mmvq(8, dfold, dlatq, dfy, rank, (int) n_rows, 1, stream());
+        for (const uint32_t htype : {8u, 12u, 13u}) {
+            const size_t blk_b = htype == 8u ? 34 : htype == 12u ? 144 : 176;
+            const int bpr = htype == 8u ? kEmbd / 32 : kEmbd / 256;
+            const size_t row_b = (size_t) bpr * blk_b;
+            std::vector<uint8_t> hhead((size_t) n_rows * row_b);
+            const float d_base = htype == 8u ? 0.0005f : htype == 12u ? 0.0015f : 0.0008f;
+            const float dmin_mul = htype == 12u ? 7.5f : 15.5f;
+            for (int64_t r = 0; r < n_rows; ++r)
+                for (int b = 0; b < bpr; ++b) {
+                    uint8_t* p = hhead.data() + (size_t) r * row_b + (size_t) b * blk_b;
+                    const float df = d_base * (0.5f + uf(rng) * 20.f);
+                    const uint16_t d = __half_as_ushort(__float2half(df));
+                    std::memcpy(p, &d, 2);
+                    if (htype == 8u) {
+                        for (size_t i = 2; i < blk_b; ++i) p[i] = (uint8_t) u8(rng);
+                    } else {
+                        const uint16_t dmin = __half_as_ushort(__float2half(df * dmin_mul));
+                        std::memcpy(p + 2, &dmin, 2);
+                        // Keep subblock scale and min equal so weights are zero-mean like real trained heads
+                        for (int sb = 0; sb < 4; ++sb) {
+                            const uint8_t sv = (uint8_t) (16 + (u8(rng) & 31));
+                            p[4 + sb] = sv;
+                            p[4 + sb + 4] = sv;
+                            p[4 + sb + 8] = (uint8_t) ((sv & 0x0Fu) | ((sv & 0x0Fu) << 4));
+                        }
+                        for (size_t i = 16; i < blk_b; ++i) p[i] = (uint8_t) u8(rng);
+                    }
+                }
+            Dev<uint8_t> dhead(hhead), dhead_sc(ds_screen_bytes(kEmbd, n_rows));
+            ds_screen_pack(dhead, kEmbd, n_rows, dhead_sc, stream(), htype);
+            nk::native_mmvq((int) htype, dhead, dhq, dbase, kEmbd, (int) n_rows, nd, stream());
+            DsScreen sc;
+            sc.head = dhead, sc.fold = dfold, sc.fold_b = dfb, sc.fold_bp = dfbp;
+            sc.head_sc = dhead_sc, sc.fold_sc = dfold_sc, sc.n_rows = n_rows, sc.cap = 30.f, sc.head_type = htype;
+            ds_head_base(sc, dhq, nd, dapprox, stream());
+            Dev<Likeliest> dpick_s(nd), dpick_r(nd);
+            Dev<int32_t> dpr_s(1), dpr_r(1);
+            for (int i = 0; i < nd; ++i) {
+                ds_head_pick(sc, dhq, dlatq, dapprox, i, dhscr, dpr_s, dpick_s.p + i, stream());
+                ds_pick(dbase.p + (size_t) i * n_rows, dfy, dfb, (int) n_rows, 30.f, dz, dpick_r.p + i, dpr_r,
+                        stream());
+            }
+            const auto ps = dpick_s.get(), pr = dpick_r.get();
+            ++checks;
+            int id_bad = 0;
+            for (int i = 0; i < nd; ++i) id_bad += ps[(size_t) i].token != pr[(size_t) i].token;
+            if (id_bad) ++failures;
+            std::printf("%-66s %d of %d picks differ  %s\n",
+                        fmt("ds_screen type %u: top-1 pick = exact ds_pick()", htype).c_str(), id_bad, nd,
+                        id_bad ? "FAIL" : "ok");
+        }
+    }
+}
+
 // ---- the list ----
+
+// A prompt's controller after its down product: ink_ctrl_up_gate() against lin_pair()'s launches for it (gemm_f32()'s
+// two products, after bf16_to_f32() for BF16 matrices, then ink_gate()), byte for byte, at row counts around the
+// prompt calls' and in place (out = cur, as the FFN's controller writes it); and against the reference.  The bits are
+// hipblasSgemm's where gemm_f32() calls it (HIP): CUDA's cuBLAS sums in another order, so there it is checked against
+// the reference only.
+void case_ctrl_up_gate() {
+    void* blas = blas_create(stream());
+    constexpr std::pair<int, int> cases[] = {{32, kEmbd}, {33, kEmbd}, {100, kEmbd}, {777, kEmbd},
+                                             {1024, kEmbd}, {2048, kEmbd}, {3001, kEmbd}, {100, kEmbd + 32}};
+    for (const bool bf : {false, true})
+        for (const auto [rows, embd] : cases) {
+            const auto cur = randv((size_t) rows * embd, 1.0f), msg = randv((size_t) rows * embd, 0.5f),
+                       chv = randv((size_t) rows * kRank, 1.0f);
+            auto gain = randv((size_t) embd * kRank, 0.1f), forget = randv((size_t) embd * kRank, 0.1f);
+            std::vector<uint16_t> gb, fb;
+            if (bf) bf16_of(std::vector<float>(gain), gb, gain), bf16_of(std::vector<float>(forget), fb, forget);
+            Dev<float> dcur(cur), dmsg(msg), dch(chv), dg(gain), df(forget), gv((size_t) rows * embd),
+                fv((size_t) rows * embd), out((size_t) rows * embd), out2((size_t) rows * embd), wide(gain.size());
+            Dev<uint16_t> dgb(bf ? gb : std::vector<uint16_t>(1)), dfb(bf ? fb : std::vector<uint16_t>(1));
+            if (bf) {
+                bf16_to_f32(dgb, wide, gain.size(), stream());
+                gemm_f32(blas, wide, dch, gv, kRank, embd, embd, rows);
+                bf16_to_f32(dfb, wide, forget.size(), stream());
+                gemm_f32(blas, wide, dch, fv, kRank, embd, embd, rows);
+            } else {
+                gemm_f32(blas, dg, dch, gv, kRank, embd, embd, rows);
+                gemm_f32(blas, df, dch, fv, kRank, embd, embd, rows);
+            }
+            ink_gate(dcur, dmsg, gv, fv, out2, (size_t) rows * embd, stream());
+            const void* gw = bf ? (const void*) dgb.p : (const void*) dg.p;
+            const void* fw = bf ? (const void*) dfb.p : (const void*) df.p;
+            if (!ink_ctrl_up_gate(dcur, dmsg, dch, gw, fw, out, embd, kRank, rows, stream(), bf)) {
+                ++failures;
+                std::printf("ink_ctrl_up_gate: refused Inkling 2 Mini's shape  FAIL\n");
+                continue;
+            }
+            const auto got = out.get();
+            const std::string what = fmt("ink_ctrl_up_gate %s, %d rows of %d", bf ? "BF16" : "F32", rows, embd);
+#if defined(__HIPCC__)
+            same_bits(what + " = gemm_f32() x2 + ink_gate()", got, out2.get());
+#endif
+            // in place: the FFN's controller writes its cur
+            ink_ctrl_up_gate(dcur, dmsg, dch, gw, fw, dcur, embd, kRank, rows, stream(), bf);
+            same_bits(what + ", out = cur", dcur.get(), got);
+            if (rows > 100) continue;
+            std::vector<double> ref((size_t) rows * embd);
+            for (int t = 0; t < rows; ++t)
+                for (int i = 0; i < embd; ++i) {
+                    double g = 0, f = 0;
+                    for (int k = 0; k < kRank; ++k) {
+                        g += (double) gain[(size_t) i * kRank + k] * chv[(size_t) t * kRank + k];
+                        f += (double) forget[(size_t) i * kRank + k] * chv[(size_t) t * kRank + k];
+                    }
+                    const size_t at = (size_t) t * embd + i;
+                    ref[at] = h_gate(cur[at], msg[at], g, f);
+                }
+            compare(what + " against the reference", got, ref, 2e-5);
+        }
+    blas_destroy(blas);
+}
 
 struct Case {
     const char* name;
@@ -1439,11 +2119,13 @@ const Case kCases[] = {
     {"mix", case_mix},
     {"norms", case_norms},
     {"controllers", case_controllers},
+    {"ctrl_up_gate", case_ctrl_up_gate},
     {"situ", case_situ},
     {"router", case_router},
     {"small", case_small},
     {"attend", case_attend},
     {"attend_batch", case_attend_batch},
+    {"cuda_win", case_cuda_win},
 };
 
 }  // namespace

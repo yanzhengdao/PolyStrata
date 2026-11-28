@@ -843,6 +843,8 @@ class SmallerModelSetup(unittest.TestCase):
                 root = Path(tmp)
                 for m in setup.family_models(family):
                     (root / setup.model_file(fam, m, 1)).write_bytes(b"fixture")
+                draft_name = Path(fam["models"][want]["draft_model"]).name
+                (root / draft_name).write_bytes(b"fixture")
                 (root / mmproj_name).write_bytes(b"fixture")
                 def patch(obj, name, **kw):
                     return stack.enter_context(mock.patch.object(obj, name, **kw))
@@ -876,6 +878,7 @@ class SmallerModelSetup(unittest.TestCase):
                 self.assertEqual(rc, 0)
                 cfg = write.call_args.args[1]
                 self.assertEqual(cfg["args"][cfg["args"].index("--model") + 1], str(root / setup.model_file(fam, want, 1)))
+                self.assertEqual(cfg["args"][cfg["args"].index("--draft-model") + 1], str(root / draft_name))
                 self.assertEqual(cfg["parallel"], 1)   # one request at a time, whatever was asked
                 if vision == "no":
                     self.assertNotIn("vision", cfg)

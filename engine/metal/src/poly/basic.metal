@@ -44,13 +44,21 @@ kernel void poly_gemv(constant BasicArgs& a [[buffer(0)]], uint2 group [[threadg
     const ulong o = group.x, token = group.y;
     device const float* x = a.p[1] + (token * (a.rows / a.stride) + o / a.stride) * a.n;
     float acc = 0;
-    for (int i = tid; i < a.n; i += nt) {
-        ulong j = o * a.n + i;
-        float w = a.kind ? as_type<float>(uint(reinterpret_cast<device ushort*>(a.p[0])[j]) << 16) : a.p[0][j];
-        acc += w * x[i];
+    if (a.kind) {
+        device const ushort* w = reinterpret_cast<device const ushort*>(a.p[0]) + o * a.n;
+        for (int i = tid; i < a.n; i += nt) acc += as_type<float>(uint(w[i]) << 16) * x[i];
+    } else {
+        device const float* w = a.p[0] + o * a.n;
+        for (int i = tid; i < a.n; i += nt) acc += w[i] * x[i];
     }
-    float sum = block_sum(acc, partial, tid, nt);
-    if (tid == 0) a.p[2][token * a.rows + o] = sum;
+    for (uint k = 16; k; k >>= 1) acc += simd_shuffle_xor(acc, k);
+    if ((tid & 31) == 0) partial[tid >> 5] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float sum = 0;
+        for (uint i = 0; i < nt / 32; ++i) sum += partial[i];
+        a.p[2][token * a.rows + o] = sum;
+    }
 }
 
 kernel void poly_elementwise(constant BasicArgs& a [[buffer(0)]], uint i [[thread_position_in_grid]]) {
@@ -196,30 +204,41 @@ kernel void poly_scaled(constant ScaledArgs& a [[buffer(0)]],uint i [[thread_pos
     if(i>=uint(a.n)) return;
     for(int k=0;k<a.count;++k) a.acc[k][i]+=a.x[k][i]*a.w[k];
 }
-// The likeliest token and its probability: one threadgroup (up to 1,024 threads), its SIMD groups' results joined
-// through threadgroup memory; a vocabulary of 248K was 1.8 ms on 32 threads
-kernel void poly_likeliest(constant BasicArgs& a [[buffer(0)]],uint tid [[thread_index_in_threadgroup]],
-                           uint nt [[threads_per_threadgroup]],uint sg [[simdgroup_index_in_threadgroup]],
+// The likeliest token and its probability: one threadgroup per row (up to 1,024 threads), its SIMD groups' results
+// joined through threadgroup memory; a vocabulary of 248K was 1.8 ms on 32 threads.
+kernel void poly_likeliest(constant BasicArgs& a [[buffer(0)]], uint row [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           uint nt [[threads_per_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                            uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float tm[32],ts[32];
+    threadgroup float tm[32], ts[32];
     threadgroup int ta[32];
-    const uint groups=(nt+31)/32;
-    float m=-INFINITY;
-    for(int i=tid;i<a.n;i+=nt) m=max(m,a.p[0][i]);
-    m=simd_max(m);
-    if(!lane) tm[sg]=m;
+    device const float* x = a.p[0] + ulong(row) * a.n;
+    device float* out = a.p[1] + ulong(row) * 2;
+    const uint groups = (nt + 31) / 32;
+    float m = -INFINITY;
+    for (int i = tid; i < a.n; i += nt) m = max(m, x[i]);
+    m = simd_max(m);
+    if (!lane) tm[sg] = m;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    m=tm[0];
-    for(uint g=1;g<groups;++g) m=max(m,tm[g]);
-    float sum=0; int at=a.n;
-    for(int i=tid;i<a.n;i+=nt) { float v=a.p[0][i]; if(v==m) at=min(at,i); if(v>m-20) sum+=exp(v-m); }
-    sum=simd_sum(sum); at=simd_min(at);
-    if(!lane) { ts[sg]=sum; ta[sg]=at; }
+    m = tm[0];
+    for (uint g = 1; g < groups; ++g) m = max(m, tm[g]);
+    float sum = 0;
+    int at = a.n;
+    for (int i = tid; i < a.n; i += nt) {
+        float v = x[i];
+        if (v == m) at = min(at, i);
+        if (v > m - 20) sum += exp(v - m);
+    }
+    sum = simd_sum(sum);
+    at = simd_min(at);
+    if (!lane) { ts[sg] = sum; ta[sg] = at; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if(tid) return;
-    sum=0; at=a.n;
-    for(uint g=0;g<groups;++g) { sum+=ts[g]; at=min(at,ta[g]); }
-    reinterpret_cast<device int*>(a.p[1])[0]=at<a.n?at:0; a.p[1][1]=1.0f/sum;
+    if (tid) return;
+    sum = 0;
+    at = a.n;
+    for (uint g = 0; g < groups; ++g) { sum += ts[g]; at = min(at, ta[g]); }
+    reinterpret_cast<device int*>(out)[0] = at < a.n ? at : 0;
+    out[1] = 1.0f / sum;
 }
 
 // The global scales of NVFP4 experts (ExpertScales; mirrors ExpertArgs in basic.cpp), as CUDA's activations put them

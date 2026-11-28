@@ -501,15 +501,33 @@ def setup_poly(a, info: dict, data: Path, elsewhere: list) -> int:
         return path
 
     S.step(5, f"{fam['title']} {model}")
+    cfg_path = config_path(tag)
+    previous = P.read_config(cfg_path)
+    if getattr(a, "no_draft", False) or getattr(a, "mtp", None) == "off":
+        draft_on = False
+    elif getattr(a, "mtp", None) == "on":
+        draft_on = True
+    else:
+        prev_args = previous.get("args")
+        draft_on = previous.get("mtp") is not False and not (
+            isinstance(prev_args, list) and "--no-draft" in prev_args)
+    par = getattr(a, "parallel", None)
+    eff_parallel = 1 if fam.get("one_request") else max(
+        1, par if par is not None else int(previous.get("parallel") or 1))
+    use_draft = draft_on and not (a.family == "inkling" and eff_parallel >= 2)
     base = d.get("hf", fam["hf"]).format(q=model)
     for file in files:
-        asset(file, base + file.name)
+        asset(file, base + file.name + fam.get("remote_suffix", ""))
     S.check_shards(files)
     draft = None
-    if d.get("draft_model"):
-        draft = folder / Path(d["draft_model"]).name
-        draft = asset(draft, base + d["draft_model"])
-    if d.get("draft") != "own" and fam.get("draft"):
+    if use_draft and d.get("draft_model"):
+        draft_name = Path(d["draft_model"]).name
+        draft = folder / draft_name
+        if a.gguf_dir and not draft.is_file() and not getattr(a, "no_download_models", False):
+            draft = models_root / tag / draft_name
+        draft_base = (d.get("draft_hf") or (d["hf"] if "hf" in d else fam.get("draft_hf", fam["hf"]))).format(q=model)
+        draft = asset(draft, draft_base + d["draft_model"])
+    if use_draft and d.get("draft") != "own" and fam.get("draft"):
         draft = S.find_in([data, *elsewhere], fam["draft"]) or data / fam["draft"]
         if not draft.is_file():
             if a.no_download_models:
@@ -534,6 +552,8 @@ def setup_poly(a, info: dict, data: Path, elsewhere: list) -> int:
     args = ["--model", str(files[0]), "--max-context", str(ctx), "--expert-profile", str(profile)]
     if draft:
         args += ["--draft-model", str(draft)]
+    elif not draft_on and (d.get("draft") == "own" or fam.get("draft")):
+        args.append("--no-draft")
     if fam.get("tail_skip"):
         args += ["--tail-skip", str(fam["tail_skip"])]
     if info.get("perf_cores"):
@@ -546,6 +566,8 @@ def setup_poly(a, info: dict, data: Path, elsewhere: list) -> int:
             args += [flag, str(value)]
     cfg = mac_config(exe, args, pack, f"{fam['name']}-{model.lower()}", tag, a.port or 8080)
     cfg["display_name"] = f"{fam['title']} {model}"
+    if not draft_on:
+        cfg["mtp"] = False
     for key in ("host", "api_key"):
         if getattr(a, key):
             cfg[key] = getattr(a, key)
@@ -563,8 +585,6 @@ def setup_poly(a, info: dict, data: Path, elsewhere: list) -> int:
         if cpu_tower:
             cfg["vision"]["threads"] = info.get("perf_cores") or max(1, (os.cpu_count() or 8) // 2)
     S.poly_kv_whole(cfg)
-    cfg_path = config_path(tag)
-    previous = P.read_config(cfg_path)
     P.apply_options(cfg["args"], a, previous)
     headers, why = P.read_headers([*files, *([draft] if draft else [])])
     if getattr(a, "poly_kv", None) == "q8_0" and (
@@ -572,13 +592,17 @@ def setup_poly(a, info: dict, data: Path, elsewhere: list) -> int:
         S.fail("--poly-kv q8_0 requires a verified Qwen35MoE GGUF header")
     estimate = P.estimate(headers, ctx, kv=P.flag_value(cfg["args"], "--kv", "auto"),
                           memory=P.flag_value(cfg["args"], "--metal-memory", "balanced"),
-                          parallel=cfg.get("parallel", previous.get("parallel", 1)))
+                          parallel=cfg.get("parallel", previous.get("parallel", 1)), draft=draft_on)
     if why:
         estimate["reason"] = why
     P.report(estimate, S.say)
     if P.flag_value(cfg["args"], "--metal-memory") == "balanced":
         S.say("  balanced KV grows in 4096-token steps with 1024 tokens ahead, up to the chosen context")
-    S.write_setup_config(cfg_path, cfg)
+    def inkling_effort_default(done: dict) -> None:
+        if a.family == "inkling" and "reasoning_effort" not in done:
+            done["reasoning_effort"] = S.inkling_default_effort(model)
+
+    S.write_setup_config(cfg_path, cfg, after_carry=inkling_effort_default)
     script = S.write_run_script(tag, cfg_path, cfg["port"], cfg.get("open_browser") is True)
     S.ok(f"start script: {script.name}")
     return 0 if a.no_start else start(cfg_path, a.port, a.browser is not False)
@@ -709,6 +733,7 @@ def main(argv=None) -> int:
     ap.add_argument("--host")
     ap.add_argument("--api-key")
     ap.add_argument("--draft-vocab", choices=list(S.DRAFT_VOCABS))
+    ap.add_argument("--mtp", choices=["on", "off"])
     ap.add_argument("--no-browser", dest="browser", action="store_false", default=None)
     ap.add_argument("--data-dir")
     ap.add_argument("--move-data", action="store_true", help="with --data-dir: move the model files already here into the new folder")

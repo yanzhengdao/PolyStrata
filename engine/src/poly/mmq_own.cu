@@ -3,7 +3,7 @@
 // mmq.cu is the llama.cpp form of the same class (-DSTRATA_POLY_MMQ=ON); one of the two is built.
 //
 // On Ampere and newer, a type the int8 decoders have and rows of whole stages of 256 values (of whole blocks, for a
-// type of 32-value blocks) go to the int8 tensor cores (gemm_iq_i8_grouped, i8_mma.cuh): the activations are int8 with
+// type of 32-value blocks, and for NVFP4 and Q2_0 of 64) go to the int8 tensor cores (gemm_iq_i8_grouped, i8_mma.cuh): the activations are int8 with
 // a scale per 32 values, MMQ's numbers, and a matrix may have any number of rows.  quantize() and mul() choose by the type and the row length alone, so the rows
 // one wrote are the rows the other reads.
 //
@@ -32,6 +32,8 @@
 // block-scaled FP4 tensor cores instead, the activations two FP4 terms under a float a row (nvfp4_x2.hpp, about 8
 // bits against a half's 11), its products straight to dst's rows and its rows read by index as the int8 ones are.
 // NVFP4 takes the int8 kernel only with STRATA_PREFILL_NVFP4=w4a8 (nvfp4_w4a8()), on any card that has it.
+//
+// HIP on RDNA2 / RDNA3 / RDNA4: the int8 kernel too, NVFP4 included, as on Ampere (--no-prompt-int8 and STRATA_PF_I8MMA=0 turn it off).
 #include "mmq.hpp"
 #if STRATA_POLY_X2
 #include "nvfp4_x2.hpp"
@@ -284,9 +286,32 @@ bool nvfp4_w4a8() {
     return asked;
 }
 
+#ifdef STRATA_MMQ_OWN_HIP
+// The int8 kernel on RDNA3's and RDNA4's matrix cores (i8_mma.cuh's i8m_wmma) and RDNA2's dot4, for the types and
+// rows it takes, in place of the FP16 tiles and the per-expert dequantize + rocBLAS loop.  On by default;
+// --no-prompt-int8 (Inkling 2) or STRATA_PF_I8MMA=0 (every model) turns it off: the FP16 tiles and the BLAS loop, 0.2.20-poly.4's path.  The
+// activations are int8 a 32 values there where the halves keep 11 bits, as on CUDA's Ampere and newer by default (the
+// same kernel's numbers, bit for bit), and as llama.cpp's MMQ, which the HIP build used up to 0.1.45.  NVFP4 goes with
+// it unless STRATA_PREFILL_NVFP4 names a mode (w4a8: the same; any other: the halves).
+// Issue #289, RX 7800 XT, Qwen3.6-35B-A3B UD-Q3_K_M, prompts of 4,096 tokens: 546 tok/s off, 2,340 on (0.1.45's MMQ
+// build: 2,104); keeping the FP16 tiles for the matrices they take (its Q8_0 ones) and int8 for the rest: 1,313.
+bool nvfp4_default() {
+    static const bool unset = [] {
+        const char* v = std::getenv("STRATA_PREFILL_NVFP4");
+        return !v || !*v;
+    }();
+    return unset;
+}
+#endif
+
 // the int8 kernel takes a matrix of this type with rows this long, whatever their number
 bool int8_rows(int t, int64_t cols) {
-    return !blas_only() && cols <= 0x7fffffff && (t != 40 || nvfp4_w4a8()) && kernels::gemm_iq_i8_takes(t, (int) cols);
+#ifdef STRATA_MMQ_OWN_HIP
+    const bool nv4 = nvfp4_w4a8() || nvfp4_default();
+#else
+    const bool nv4 = nvfp4_w4a8();
+#endif
+    return !blas_only() && cols <= 0x7fffffff && (t != 40 || nv4) && kernels::gemm_iq_i8_takes(t, (int) cols);
 }
 
 // the rows' halves, then a float a row (back)

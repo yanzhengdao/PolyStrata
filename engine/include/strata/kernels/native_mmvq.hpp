@@ -179,6 +179,7 @@ bool native_mmvq_slots_wide();
 // step's routed experts when every one of them is in VRAM): matrix j is table[ids[j]] + offset bytes, times the
 // Q8_1 column x + (j / x_every) * x_stride bytes, into y + j * y_stride floats.  count may pass 8.  False, with
 // nothing launched: there is no kernel for the format (native_mmvq_ids_supported() says so beforehand).
+constexpr std::size_t kMmvqIdsGroupBytes = 1024;
 struct MmvqIds {
     const void* const* table;
     const int32_t* ids;
@@ -188,9 +189,12 @@ struct MmvqIds {
     int x_every;
     float* y;
     std::size_t y_stride;
-    bool lanes = false;   ///< as MmvqSlots::lanes
+    bool lanes = false;        ///< as MmvqSlots::lanes
+    void* group_buf = nullptr; ///< optional kMmvqIdsGroupBytes scratch for GPU expert dedup (count <= 64)
+    bool group_ready = false;  ///< true if native_mmvq_ids_group() already filled group_buf for this ids array
 };
 bool native_mmvq_ids_supported(int ggml_type);
+void native_mmvq_ids_group(const int32_t* ids, int count, void* group_buf, void* stream);
 bool native_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_out, void* stream);
 
 // Storage/dispatch helpers take stable GGML type IDs, avoiding a ggml runtime
@@ -220,6 +224,10 @@ struct NativeMmvqMany {
 /// type, the small-K layout, a packed tensor, the wave layout).
 bool native_mmvq_many_fits(int ggml_type, const NativeMmvqMany& m, int n_in);
 void native_mmvq_many(int ggml_type, const NativeMmvqMany& m, int n_in, void* stream);
+#if defined(STRATA_GPU_METAL)
+bool native_mmvq_many_rows_fits(int ggml_type, const NativeMmvqMany& m, int n_in, int rows);
+void native_mmvq_many_rows(int ggml_type, const NativeMmvqMany& m, int n_in, int rows, void* stream);
+#endif
 /// native_mmvq() of 1 to 8 matrices of one width, one column each, each of its own type (types[j]) and on a q8_1
 /// input of its own, in ONE launch: each row's block is the one-row-a-block kernel native_mmvq() runs for its matrix
 /// alone, the same bits.  Q8_0, Q4_K, Q5_K and Q6_K, CUDA only.  False, with nothing launched, where one of the
@@ -227,6 +235,10 @@ void native_mmvq_many(int ggml_type, const NativeMmvqMany& m, int n_in, void* st
 /// layout); the caller then launches them one by one.
 bool native_mmvq_mixed_fits(const int* types, const NativeMmvqMany& m, int n_in);
 bool native_mmvq_mixed(const int* types, const NativeMmvqMany& m, int n_in, void* stream);
+/// Multi-column (2..8) native_mmvq_mixed() for mixed quantized types (Q8_0, Q4_K, Q5_K, Q6_K), CUDA only:
+/// reads each weight block once across ncols columns, every output bitwise the single-column exact layout.
+bool native_mmvq_mixed_rows_fits(const int* types, const NativeMmvqMany& m, int n_in, int ncols);
+bool native_mmvq_mixed_rows(const int* types, const NativeMmvqMany& m, int n_in, int ncols, void* stream);
 /// native_quantize_q8_1() of 1 to 3 vectors of n_in values in one launch: the same bytes.
 void native_quantize_q8_1_many(const float* const* x, void* const* x_q8_1, int count, int n_in, void* stream);
 

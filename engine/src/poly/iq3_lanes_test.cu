@@ -79,8 +79,8 @@ void* random_q8_1(int n_in, int rows, cudaStream_t st) {
     for (float& v : h) v = nd(rng);
     float* x = up(h);
     void* q;
-    ck(cudaMalloc(&q, k::native_q8_1_bytes(n_in, rows)), "malloc");
-    k::native_quantize_q8_1(x, q, n_in, rows, st);
+    ck(cudaMalloc(&q, k::native_q8_1_bytes(n_in) * (size_t) rows), "malloc");
+    k::native_quantize_q8_1(x, q, n_in * rows, 1, st);
     ck(cudaStreamSynchronize(st), "quantize");
     cudaFree(x);
     return q;
@@ -127,6 +127,99 @@ void test_slots_lanes(int type, const char* name, int n_in, int n_out, int count
     for (void* p : w) cudaFree(p);
     cudaFree(xq), cudaFree(dtable), cudaFree(dids);
     cudaFree(ya), cudaFree(yb), cudaFree(yc), cudaFree(yd);
+    cudaStreamDestroy(st);
+}
+
+// random NVFP4 weights: 64-element blocks (36 bytes: 4 UE4M3 scales + 32 nibble bytes)
+void* random_nvfp4(int n_in, int n_out) {
+    const size_t bytes = k::native_mmvq_weight_bytes(40, n_in, n_out);
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::uniform_int_distribution<int> sc(0x20, 0x58);   // finite normal UE4M3 scales
+    std::vector<uint8_t> h(bytes);
+    for (uint8_t& c : h) c = (uint8_t) byte(rng);
+    for (size_t b = 0; b < bytes; b += 36)
+        for (int k = 0; k < 4; ++k) h[b + k] = (uint8_t) sc(rng);
+    return up(h);
+}
+
+void* random_any_weights(int type, int n_in, int n_out) {
+    return type == 40 ? random_nvfp4(n_in, n_out) : random_weights(type, n_in, n_out);
+}
+
+void test_nvfp4_lanes(int n_in, int n_out, int count) {
+    cudaStream_t st;
+    ck(cudaStreamCreate(&st), "stream");
+    std::vector<void*> w((size_t) count);
+    for (void*& p : w) p = random_nvfp4(n_in, n_out);
+    void* xq = random_q8_1(n_in, count, st);
+    const size_t xr = k::native_q8_1_bytes(n_in), total = size_t(n_out) * count;
+    float *ya, *yb, *yc;
+    for (float** p : {&ya, &yb, &yc}) ck(cudaMalloc(p, total * sizeof(float)), "malloc");
+    k::MmvqSlots slots{};
+    slots.lanes = true;
+    for (int i = 0; i < count; ++i) {
+        const void* x = (const uint8_t*) xq + i * xr;
+        k::native_mmvq(40, w[(size_t) i], x, ya + size_t(i) * n_out, n_in, n_out, 1, st);
+        slots.w[i] = w[(size_t) i], slots.x[i] = x, slots.y[i] = yb + size_t(i) * n_out;
+    }
+    std::vector<const void*> table(w.rbegin(), w.rend());
+    std::vector<int32_t> ids((size_t) count);
+    for (int i = 0; i < count; ++i) ids[(size_t) i] = count - 1 - i;
+    void* dtable;
+    ck(cudaMalloc(&dtable, table.size() * sizeof(void*)), "malloc");
+    ck(cudaMemcpy(dtable, table.data(), table.size() * sizeof(void*), cudaMemcpyHostToDevice), "table");
+    int32_t* dids = up(ids);
+    const k::MmvqIds picks{(const void* const*) dtable, dids, 0, xq, xr, 1, yc, size_t(n_out), true};
+    const std::string what =
+        "slots lanes NVFP4 " + std::to_string(n_in) + " -> " + std::to_string(n_out) + " x" + std::to_string(count);
+    if (!k::native_mmvq_slots(40, slots, count, n_in, n_out, st) ||
+        !k::native_mmvq_ids(40, picks, count, n_in, n_out, st)) {
+        std::printf("%-58s not taken  FAIL\n", what.c_str());
+        ++failures;
+    } else {
+        same_bits(what, ya, yb, total);
+        same_bits(what + ", picks", ya, yc, total);
+    }
+    for (void* p : w) cudaFree(p);
+    cudaFree(xq), cudaFree(dtable), cudaFree(dids);
+    cudaFree(ya), cudaFree(yb), cudaFree(yc);
+    cudaStreamDestroy(st);
+}
+
+void test_grouped_ids(int type, const char* name, int n_in, int n_out, int count, int x_every,
+                      const std::vector<int32_t>& ids_vec, bool pregroup) {
+    cudaStream_t st;
+    ck(cudaStreamCreate(&st), "stream");
+    const int n_exp = 16;
+    std::vector<void*> w((size_t) n_exp);
+    for (void*& p : w) p = random_any_weights(type, n_in, n_out);
+    const int n_x = (count + x_every - 1) / x_every;
+    void* xq = random_q8_1(n_in, n_x, st);
+    const size_t xr = k::native_q8_1_bytes(n_in), total = size_t(n_out) * count;
+    float *ya, *yb;
+    ck(cudaMalloc(&ya, total * sizeof(float)), "malloc");
+    ck(cudaMalloc(&yb, total * sizeof(float)), "malloc");
+    void *dtable, *dgrp;
+    ck(cudaMalloc(&dtable, w.size() * sizeof(void*)), "malloc");
+    ck(cudaMemcpy(dtable, w.data(), w.size() * sizeof(void*), cudaMemcpyHostToDevice), "table");
+    ck(cudaMalloc(&dgrp, k::kMmvqIdsGroupBytes), "malloc");
+    int32_t* dids = up(ids_vec);
+    const k::MmvqIds plain{(const void* const*) dtable, dids, 0, xq, xr, x_every, ya, size_t(n_out), true};
+    if (pregroup) k::native_mmvq_ids_group(dids, count, dgrp, st);
+    const k::MmvqIds grouped{(const void* const*) dtable, dids, 0, xq, xr, x_every, yb, size_t(n_out), true, dgrp,
+                             pregroup};
+    const std::string what = std::string("grouped_ids ") + name + " " + std::to_string(n_in) + "->" +
+                             std::to_string(n_out) + " c=" + std::to_string(count) +
+                             (pregroup ? " pre" : " auto");
+    if (!k::native_mmvq_ids(type, plain, count, n_in, n_out, st) ||
+        !k::native_mmvq_ids(type, grouped, count, n_in, n_out, st)) {
+        std::printf("%-58s not taken  FAIL\n", what.c_str());
+        ++failures;
+    } else {
+        same_bits(what, ya, yb, total);
+    }
+    for (void* p : w) cudaFree(p);
+    cudaFree(xq), cudaFree(dtable), cudaFree(dgrp), cudaFree(dids), cudaFree(ya), cudaFree(yb);
     cudaStreamDestroy(st);
 }
 
@@ -219,6 +312,26 @@ int main(int argc, char** argv) {
     test_slots_lanes(21, "IQ3_S", 1024, 37, 3);
     test_slots_lanes(18, "IQ3_XXS", 1280, 2299, 5);
     test_slots_lanes(18, "IQ3_XXS", 256, 7, 2);
+    // NVFP4 full-lane (R=4 at 2304, R=8 at 1152) and GPU-dedup grouped MmvqIds (including >8 duplicates)
+    for (int count : {1, 8}) {
+        test_nvfp4_lanes(2304, 2304, count);
+        test_nvfp4_lanes(1152, 2304, count);
+    }
+    test_nvfp4_lanes(2304, 2301, 5);
+    test_nvfp4_lanes(1152, 37, 3);
+    std::vector<int32_t> dup32(32);
+    for (int i = 0; i < 32; ++i) dup32[(size_t) i] = (i % 7);   // heavy duplicates (4-5x per expert)
+    std::vector<int32_t> dup12(12, 3);                          // >8 duplicates of one expert (splits 8 + 4)
+    dup12[11] = 5;
+    std::vector<int32_t> dup64(64);
+    for (int i = 0; i < 64; ++i) dup64[(size_t) i] = (i < 11 ? 2 : (i % 16));
+    test_grouped_ids(40, "NVFP4", 2304, 2304, 32, 8, dup32, true);
+    test_grouped_ids(40, "NVFP4", 1152, 2301, 32, 1, dup32, false);
+    test_grouped_ids(40, "NVFP4", 2304, 129, 12, 1, dup12, true);
+    test_grouped_ids(40, "NVFP4", 1152, 65, 64, 8, dup64, true);
+    test_grouped_ids(21, "IQ3_S", 2304, 2301, 32, 8, dup32, true);
+    test_grouped_ids(18, "IQ3_XXS", 2304, 129, 12, 1, dup12, false);
+    test_grouped_ids(22, "IQ2_S", 2304, 65, 32, 8, dup32, true);
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) bench();
     std::printf("%s: %d failures\n", failures ? "FAIL" : "ok", failures);
     return failures ? 1 : 0;

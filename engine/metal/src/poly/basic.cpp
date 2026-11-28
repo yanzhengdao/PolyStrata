@@ -210,8 +210,10 @@ void likeliest(const float* logits,int n,Likeliest* out,void* s) {
     BasicArgs a{{logits,out}}; a.n=n;
     launch("poly_likeliest",a,s,{1,1,1},uint32_t(std::clamp((n+31)/32*32,32,1024)));
 }
-// a batch step's few rows, one poly_likeliest each
+// a batch step's or window's few rows in one launch (one TG per row)
 void likeliest_rows(const float* logits,int n,int rows,Likeliest* out,void* s) {
-    for(int r=0;r<rows;++r) likeliest(logits+size_t(r)*n,n,out+r,s);
+    if(rows<=0) return;
+    BasicArgs a{{logits,out}}; a.n=n;
+    launch("poly_likeliest",a,s,{uint32_t(rows),1,1},uint32_t(std::clamp((n+31)/32*32,32,1024)));
 }
 } // namespace strata::poly

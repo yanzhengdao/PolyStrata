@@ -11,7 +11,7 @@
 // from the same rows gathered by ids, bit for bit; and for the int8 path the experts stored in another order and found
 // by their offsets (Mmq::mul_at()) give mul()'s products, bit for bit.  On an RTX 50 card NVFP4 takes the two-term FP4 products
 // (nvfp4_x2.hpp) unless STRATA_PREFILL_NVFP4 names another mode: run it with STRATA_PREFILL_NVFP4=fp16 too.
-// IQ1_S and MXFP4 take the int8 tiles only where an engine asks for them (gemm_iq_i8_allow(), as Inkling 2 does), so the test
+// IQ1_S, MXFP4 and Q2_0 in rows of 1,152 take the int8 tiles only where an engine asks for them (gemm_iq_i8_allow(), as Inkling 2 does), so the test
 // asks; where it then takes them, its product is also made on the FP16 kernel (the path it had before) and the two
 // are compared.  STRATA_MMQ_TEST_BLOCKS=DIR: a type's weights are the bytes of DIR/<type name>.bin where that file is
 // long enough (whole blocks cut from a model's tensor), in place of ggml's quantization of random weights.
@@ -19,8 +19,10 @@
 //
 // usage: poly_mmq_paths_test [--turing-int8]   (--turing-int8: the int8 path on Turing too, gemm_iq_i8_turing(); exit 0: every product within 2% RMS of the reference, and an int8 product within
 // 1e-5 RMS of its own numbers; 77: no card).  Rows of 2,048 values for every type, then rows of 1,152 (Inkling 2's
-// experts' downs) for Q8_0, IQ4_NL and NVFP4.  Where a row's product does not depend on its launch
+// experts' downs) for Q8_0, IQ4_NL, NVFP4 and Q2_0.  Where a row's product does not depend on its launch
 // (Mmq::split_exact()), 100 of the dense rows multiplied as a launch of their own give the same bits.
+// Where the int8 tiles take a type, also matrices of 500 rows (not whole tiles of 64) times 10, 20 and 256 rows,
+// four experts of 10 rows at most, and (Q8_0) 70,000 one-row matrices by offset, more blocks than a grid's y side.
 #include "mmq.hpp"
 #include "ggml.h"
 #include "strata/kernels/iq_kernels.hpp"
@@ -35,6 +37,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <random>
 #include <string>
 #include <vector>
@@ -71,6 +74,47 @@ Err compare(const std::vector<float>& y, const std::vector<double>& ref, int64_t
     return {std::sqrt(se / std::max(sr, 1e-300)), me / std::max(mr, 1e-300)};
 }
 
+// STRATA_MMQ_TEST_DUMP=DIR: an int8 product's floats as they are, DIR/<type>_<values a row>_<case>.bin, and one line a
+// type in DIR/inputs.txt with an FNV-1a hash of its weights' and activations' bytes; so that two cards' products
+// (CUDA's and HIP's int8 tiles) can be compared bit for bit on the same inputs.  STRATA_MMQ_TEST_REF=DIR: each such
+// product is also compared with DIR's file of the same name (another card's dump), and the test fails where one is
+// missing or differs, or where DIR/inputs.txt's line for the type is not this run's.
+const char* dump_dir() {
+    static const char* d = std::getenv("STRATA_MMQ_TEST_DUMP");
+    return d && *d ? d : nullptr;
+}
+const char* ref_dir() {
+    static const char* d = std::getenv("STRATA_MMQ_TEST_REF");
+    return d && *d ? d : nullptr;
+}
+int ref_same = 0, ref_bad = 0;
+// against the reference dump of the same name: false where it is missing or differs
+bool ref_check(const std::string& name, const void* p, size_t n) {
+    if (!ref_dir()) return true;
+    std::ifstream f(std::string(ref_dir()) + "/" + name, std::ios::binary);
+    std::vector<char> r((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const bool same = f.is_open() && r.size() == n && std::memcmp(r.data(), p, n) == 0;
+    if (same) ++ref_same;
+    else {
+        ++ref_bad;
+        std::printf("reference %s: %s\n", name.c_str(), f.is_open() ? "OTHER BYTES" : "MISSING");
+    }
+    return same;
+}
+uint64_t fnv(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
+    for (size_t i = 0; i < n; ++i) h = (h ^ ((const uint8_t*) p)[i]) * 1099511628211ull;
+    return h;
+}
+// (false: the reference has other bytes)
+bool dump(const char* type, int64_t k, const char* what, const std::vector<float>& y) {
+    const std::string name = std::string(type) + "_" + std::to_string(k) + "_" + what + ".bin";
+    if (dump_dir()) {
+        std::ofstream f(std::string(dump_dir()) + "/" + name, std::ios::binary);
+        f.write((const char*) y.data(), (std::streamsize) (y.size() * sizeof(float)));
+    }
+    return ref_check(name, y.data(), y.size() * sizeof(float));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -83,9 +127,10 @@ int main(int argc, char** argv) {
     const char* forced = std::getenv("STRATA_POLY_PROMPT_BLAS");
     std::printf("path: %s\n", forced && forced[0] == '1' ? "BLAS (STRATA_POLY_PROMPT_BLAS=1)" : "the card's");
     // the 32-value types, the K-quants, the i-quants, MXFP4, NVFP4
-    const std::vector<int> types_2048 = {2, 6, 7, 8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 39, 40};
-    const std::vector<int> types_1152 = {8, 20, 40};
-    const int asked[] = {19, 39};   // the types the int8 tiles take only when asked
+    const std::vector<int> types_2048 = {2, 6, 7, 8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 39, 40, 42};
+    const std::vector<int> types_1152 = {8, 20, 40, 42};
+    const int asked[] = {19, 39, 42};   // the types the int8 tiles take only when asked (Q2_0: in rows not whole 256s)
+    const auto asked_at = [](int t, int64_t k) { return t == 42 ? k % 256 != 0 : t == 19 || t == 39; };
     for (int t : asked) strata::kernels::gemm_iq_i8_allow(t, true);
     const char* blocks_dir = std::getenv("STRATA_MMQ_TEST_BLOCKS");
     constexpr int64_t kOut = 512, kTokens = 256, kExperts = 4;
@@ -180,6 +225,24 @@ int main(int argc, char** argv) {
                 if (int8) reference(r, 0, true, &ref8[(size_t) (r * kOut)]);
             }
             const Err dense = compare(y, ref, kTokens, kOut, kOut);
+            bool ref_ok = true;   // (STRATA_MMQ_TEST_REF: every product of this type as the reference's)
+            if (int8 && (dump_dir() || ref_dir())) {
+                char line[160];
+                std::snprintf(line, sizeof line, "%s %lld weights %llx activations %llx", ggml_type_name(ty), (long long) kIn,
+                              (unsigned long long) fnv(wq.data(), wq.size()), (unsigned long long) fnv(x.data(), x.size() * sizeof(float)));
+                if (dump_dir()) std::ofstream(std::string(dump_dir()) + "/inputs.txt", std::ios::app) << line << "\n";
+                if (ref_dir()) {   // the reference's inputs must be these
+                    std::ifstream f(std::string(ref_dir()) + "/inputs.txt");
+                    bool found = false;
+                    for (std::string l; std::getline(f, l);) found = found || l == line;
+                    if (!found) {
+                        std::printf("reference inputs for %s %lld: NOT THESE\n", ggml_type_name(ty), (long long) kIn);
+                        ++ref_bad;
+                        ref_ok = false;
+                    }
+                }
+                ref_ok = dump(ggml_type_name(ty), kIn, "dense", y) && ref_ok;
+            }
             // rows 37 to 136 as a launch of their own
             bool apart = true;
             if (Mmq::split_exact(t, kOut)) {
@@ -196,6 +259,7 @@ int main(int argc, char** argv) {
             Mmq::quantize(dx, nullptr, xq, t, kIn, kIn, kTokens, nullptr);
             mmq.mul(dw, t, kOut, kIn, mat, kExperts, xq, dbounds, dperm, kTokens, 149, dy, kOut, nullptr);
             if (!ok(cudaMemcpy(y.data(), dy, y.size() * sizeof(float), cudaMemcpyDeviceToHost), "experts' product")) return 1;
+            if (int8) ref_ok = dump(ggml_type_name(ty), kIn, "experts", y) && ref_ok;
             std::vector<float> back((size_t) (kTokens * kOut));
             for (int e = 0; e < kExperts; ++e)
                 for (int64_t r = bounds_h[e]; r < bounds_h[e + 1]; ++r) {
@@ -236,7 +300,7 @@ int main(int argc, char** argv) {
                             experts8.top);
             std::printf("  %s\n", fine ? "ok" : "WRONG");
 
-            if (int8 && std::find(std::begin(asked), std::end(asked), t) != std::end(asked)) {
+            if (int8 && asked_at(t, kIn)) {
                 // the same products on the FP16 kernel, as before the type was asked for: both against the reference, and
                 // the int8 products against them
                 strata::kernels::gemm_iq_i8_allow(t, false);
@@ -276,6 +340,7 @@ int main(int argc, char** argv) {
                 mmq.mul(dw, t, kOut, kIn, mat, kExperts, xq, dbounds, dperm, 61, 149, dy, kOut, nullptr, dsrc);
                 if (!ok(cudaMemcpy(y2.data(), dy, y2.size() * sizeof(float), cudaMemcpyDeviceToHost), "rows by index")) return 1;
                 const bool same = std::memcmp(y1.data(), y2.data(), y1.size() * sizeof(float)) == 0;
+                if (int8) ref_ok = dump(ggml_type_name(ty), kIn, "by_index", y2) && ref_ok;
                 std::printf("%-8s rows read by index: %s\n", ggml_type_name(ty), same ? "same products" : "OTHER PRODUCTS");
                 fine = fine && same;
             }
@@ -323,6 +388,85 @@ int main(int argc, char** argv) {
             }
             cudaFree(gy);
             cudaFree(gdq);
+
+            if (int8) {
+                // The int8 tile's other shapes: matrices of kOut2 rows (not whole tiles of 64: the rows past the last are
+                // not read, and their products not written), and launches of 10 and 20 rows (the tiles of 16 and 32
+                // activation rows); dense, and four experts of 10 rows at most (the first kOut2 rows of each matrix)
+                constexpr int64_t kOut2 = 500;
+                const int32_t small_h[kExperts + 1] = {0, 10, 10, 17, 20};
+                int32_t* dsmall = upload(std::vector<int32_t>(small_h, small_h + kExperts + 1));
+                if (!dsmall) return 1;
+                const auto against = [&](const std::vector<float>& yy, int64_t rows, const std::vector<int>& expert_of, const char* what) {
+                    std::vector<double> r((size_t) (rows * kOut)), r2((size_t) (rows * kOut2));
+                    for (int64_t i = 0; i < rows; ++i) {
+                        reference(i, expert_of[(size_t) i], true, &r[(size_t) (i * kOut)]);
+                        std::copy_n(&r[(size_t) (i * kOut)], kOut2, &r2[(size_t) (i * kOut2)]);
+                    }
+                    const Err e = compare(yy, r2, rows, kOut2, kOut2);
+                    const bool same = dump(ggml_type_name(ty), kIn, what, yy);
+                    const bool good = e.rms < 1e-5 && same;
+                    std::printf("%-8s %s (%lld outputs): int8 numbers RMS error %.2e, largest %.2e  %s\n", ggml_type_name(ty), what,
+                                (long long) kOut2, e.rms, e.top, good ? "ok" : "WRONG");
+                    return good;
+                };
+                bool shapes = true;
+                for (const int64_t rows : {(int64_t) 10, (int64_t) 20, kTokens}) {
+                    std::vector<float> ys((size_t) (rows * kOut2));
+                    Mmq::quantize(dx, nullptr, xq, t, kIn, kIn, rows, nullptr);
+                    mmq.mul(dw, t, kOut2, kIn, 0, 1, xq, nullptr, nullptr, rows, rows, dy, kOut2, nullptr);
+                    if (!ok(cudaMemcpy(ys.data(), dy, ys.size() * sizeof(float), cudaMemcpyDeviceToHost), "short rows")) return 1;
+                    shapes = against(ys, rows, std::vector<int>((size_t) rows, 0), ("dense" + std::to_string(rows) + "x500").c_str()) && shapes;
+                }
+                {
+                    std::vector<float> ys((size_t) (20 * kOut2));
+                    Mmq::quantize(dx, nullptr, xq, t, kIn, kIn, 20, nullptr);
+                    mmq.mul(dw, t, kOut2, kIn, mat, kExperts, xq, dsmall, nullptr, 20, 10, dy, kOut2, nullptr);
+                    if (!ok(cudaMemcpy(ys.data(), dy, ys.size() * sizeof(float), cudaMemcpyDeviceToHost), "small experts")) return 1;
+                    std::vector<int> eo(20);
+                    for (int e = 0; e < kExperts; ++e)
+                        for (int32_t r = small_h[e]; r < small_h[e + 1]; ++r) eo[(size_t) r] = e;
+                    shapes = against(ys, 20, eo, "experts20x500") && shapes;
+                }
+                cudaFree(dsmall);
+                if (t == 8 && kIn == 2048) {
+                    // More launches' blocks than a grid's y side holds: 70,000 matrices of one row each (all the same
+                    // matrix, by offset), row i token i % 256: each row's product is the dense product's row, bit for bit
+                    constexpr int kMany = 70000;
+                    std::vector<int32_t> ids_h(kMany), mb(kMany + 1);
+                    for (int i = 0; i < kMany; ++i) ids_h[(size_t) i] = i % (int) kTokens;
+                    for (int i = 0; i <= kMany; ++i) mb[(size_t) i] = i;
+                    int32_t* dids = upload(ids_h);
+                    int32_t* dmb = upload(mb);
+                    int64_t* dat0 = upload(std::vector<int64_t>((size_t) kMany, 0));
+                    void* xq_many = nullptr;
+                    float* dy_many = nullptr;
+                    if (!dids || !dmb || !dat0 || !ok(cudaMalloc(&xq_many, Mmq::q8_bytes(kMany, kIn)), "cudaMalloc") ||
+                        !ok(cudaMalloc(&dy_many, (size_t) kMany * kOut * sizeof(float)), "cudaMalloc"))
+                        return 1;
+                    std::vector<float> yd((size_t) (kTokens * kOut)), ym((size_t) kMany * kOut);
+                    Mmq::quantize(dx, nullptr, xq, t, kIn, kIn, kTokens, nullptr);
+                    mmq.mul(dw, t, kOut, kIn, 0, 1, xq, nullptr, nullptr, kTokens, kTokens, dy, kOut, nullptr);
+                    Mmq::quantize(dx, dids, xq_many, t, kIn, kIn, kMany, nullptr);
+                    mmq.mul_at(dw, dat0, t, kOut, kIn, kMany, xq_many, dmb, nullptr, kMany, 1, dy_many, kOut, nullptr);
+                    if (!ok(cudaMemcpy(yd.data(), dy, yd.size() * sizeof(float), cudaMemcpyDeviceToHost), "dense product") ||
+                        !ok(cudaMemcpy(ym.data(), dy_many, ym.size() * sizeof(float), cudaMemcpyDeviceToHost), "many matrices"))
+                        return 1;
+                    bool many = true;
+                    for (int i = 0; i < kMany && many; ++i)
+                        many = std::memcmp(&ym[(size_t) i * kOut], &yd[(size_t) (i % kTokens) * kOut], kOut * sizeof(float)) == 0;
+                    std::printf("%-8s %d matrices of a row (more blocks than a grid side): %s\n", ggml_type_name(ty), kMany,
+                                many ? "same products" : "OTHER PRODUCTS");
+                    shapes = shapes && many;
+                    cudaFree(dids);
+                    cudaFree(dmb);
+                    cudaFree(dat0);
+                    cudaFree(xq_many);
+                    cudaFree(dy_many);
+                }
+                fine = fine && shapes;
+            }
+            fine = fine && ref_ok;
             bad += !fine;
             cudaFree(dw);
         }
@@ -335,6 +479,8 @@ int main(int argc, char** argv) {
         cudaFree(dbounds);
     }
     ggml_quantize_free();
+    if (ref_dir()) std::printf("reference %s: %d products the same, %d not\n", ref_dir(), ref_same, ref_bad);
+    if (ref_bad && !bad) bad = 1;
     std::printf("%s\n", bad ? "FAIL" : "PASS");
     return bad ? 1 : 0;
 }

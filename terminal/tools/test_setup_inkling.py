@@ -18,6 +18,8 @@ from tools import test_setup_glm as glm_tests  # noqa: E402
 
 FAM = setup.FAMILIES["inkling"]
 SIZES = [("UD-Q4_K_XL", 17629760736), ("UD-Q3_K_XL", 13631779296), ("UD-Q2_K_XL", 9138716608)]
+DSPARK = "dspark-Inkling-2-Mini-Q8_0.gguf"
+DSPARK_PIN = (402278560, "2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773")
 
 
 class Pins(unittest.TestCase):
@@ -25,14 +27,20 @@ class Pins(unittest.TestCase):
         self.assertEqual(list(setup.family_models("inkling")), [m for m, _ in SIZES])
         self.assertRegex(FAM["hf"], r"^https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/[0-9a-f]{40}/"
                                     r"Mainline_Support/$")
-        self.assertEqual(list(FAM["sha256"]), [f"Inkling-2-Mini-{m}.gguf" for m, _ in SIZES] + [FAM["mmproj"]])
+        # DSpark sits at the repository root (no Mainline_Support/ folder, no _file suffix), like mmproj-F16.gguf
+        self.assertRegex(FAM["draft_hf"], r"^https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/[0-9a-f]{40}/$")
+        self.assertEqual(FAM["draft_hf"], FAM["mmproj_hf"])
+        self.assertEqual(setup.ms_file(FAM["draft_hf"] + DSPARK), ("unsloth/Inkling-2-Mini-GGUF", DSPARK))
+        self.assertEqual(list(FAM["sha256"]), [f"Inkling-2-Mini-{m}.gguf" for m, _ in SIZES] + [DSPARK, FAM["mmproj"]])
+        self.assertEqual(FAM["sha256"][DSPARK], DSPARK_PIN)
         for size, n in SIZES:
             file = f"Inkling-2-Mini-{size}.gguf"
             d = FAM["models"][size]
             self.assertEqual((setup.model_file(FAM, size, 1), setup.model_shards(FAM, size)), (file, 1))
+            self.assertEqual(d["draft_model"], DSPARK)
             self.assertEqual(FAM["sha256"][file][0], n)
             self.assertRegex(FAM["sha256"][file][1], r"^[0-9a-f]{64}$")
-            self.assertAlmostEqual(n / 1e9, d["download_gb"], delta=0.05)
+            self.assertAlmostEqual((n + DSPARK_PIN[0]) / 1e9, d["download_gb"], delta=0.05)
             self.assertLess(d["arena_gb"], d["download_gb"])
             self.assertEqual(d["ram_gb"], round(setup.poly_ram_need(d, 8.0)), size)
 
@@ -53,27 +61,42 @@ class Main(unittest.TestCase):
                 self.assertEqual(code, 0, out)
                 cfg = json.loads((self.t / f"strata-inkling-{size.lower()}.json").read_text())
                 file = f"Inkling-2-Mini-{size}.gguf"
-                self.assertEqual(self.downloads, [FAM["hf"] + file + "_file"])     # saved without the suffix
-                self.assertEqual(self.verified, [(file, *FAM["sha256"][file])])
+                self.assertEqual(self.downloads, [FAM["hf"] + file + "_file", FAM["draft_hf"] + DSPARK])
+                self.assertEqual(self.verified, [(file, *FAM["sha256"][file]), (DSPARK, *DSPARK_PIN)])
                 args = cfg["args"]
                 self.assertEqual(Path(args[args.index("--model") + 1]), self.t / "models" / f"inkling-{size}" / file)
+                self.assertEqual(Path(args[args.index("--draft-model") + 1]),
+                                 self.t / "models" / f"inkling-{size}" / DSPARK)
                 # a card that holds every expert runs the file as it is (small_card_args: none)
-                for flag in ("--draft-model", "--tail-skip", "--prompt-batch", "--batch", "--attn-requant",
+                for flag in ("--tail-skip", "--prompt-batch", "--batch", "--attn-requant",
                              "--loop-bf16", "--expert-swaps"):
                     self.assertNotIn(flag, args)
                 self.assertNotIn("parallel", cfg)                                 # opt-in: written when asked
                 self.assertNotIn("vision", cfg)
+                self.assertEqual(cfg.get("reasoning_effort"), "low" if size == "UD-Q2_K_XL" else 0.4)
                 self.assertIn("--parallel 2 to 4", out)                           # offered, as for the other families
+        # Re-running setup keeps a user-customized reasoning_effort in the existing config
+        cfg_path = self.t / "strata-inkling-ud-q3_k_xl.json"
+        saved = json.loads(cfg_path.read_text())
+        saved["reasoning_effort"] = "high"
+        cfg_path.write_text(json.dumps(saved))
+        code, out, _ = self.main(family="inkling", model="UD-Q3_K_XL", ram=64.0, vram=32607 / 1024)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(cfg_path.read_text()).get("reasoning_effort"), "high")
 
     def test_a_card_that_holds_part_of_the_experts_gets_the_small_card_flags(self):
-        # an 8 GB card: Q5_0 attention, BF16 loop controllers, tail skip 4; expert swaps stay on (the default)
+        # an 8 GB card: Q5_K attention, BF16 loop controllers, tail skip 4; expert swaps stay on (the default)
+        # and DSpark is left off by default so its 0.4 GB does not crowd out cached experts
+        self.downloads = []
         code, out, _ = self.main(family="inkling", model="UD-Q3_K_XL", ram=32.0, vram=8188 / 1024)
         self.assertEqual(code, 0, out)
         args = json.loads((self.t / "strata-inkling-ud-q3_k_xl.json").read_text())["args"]
-        self.assertEqual(args[args.index("--attn-requant") + 1], "q5_0")
+        self.assertEqual(args[args.index("--attn-requant") + 1], "q5_k")
         self.assertIn("--loop-bf16", args)
         self.assertEqual(args[args.index("--tail-skip") + 1], "4")
         self.assertNotIn("--expert-swaps", args)
+        self.assertNotIn("--draft-model", args)
+        self.assertEqual(self.downloads, [FAM["hf"] + "Inkling-2-Mini-UD-Q3_K_XL.gguf_file"])
         self.assertEqual(args.count("--tail-skip"), 1)
         self.assertIn("holds part of", out)
         self.assertNotIn("small_card", json.loads((self.t / "strata-inkling-ud-q3_k_xl.json").read_text()))
@@ -90,7 +113,7 @@ class Main(unittest.TestCase):
         return cfg["args"], cfg.get("small_card"), out
 
     def assert_on(self, args):
-        self.assertEqual(args[args.index("--attn-requant") + 1], "q5_0")
+        self.assertEqual(args[args.index("--attn-requant") + 1], "q5_k")
         self.assertIn("--loop-bf16", args)
         self.assertEqual(args[args.index("--tail-skip") + 1], "4")
         self.assertEqual(args.count("--tail-skip"), 1)
@@ -163,7 +186,7 @@ class Main(unittest.TestCase):
         self.assertNotIn("layer_split", cfg)
         self.assertIn("runs on one card so far", out)
         args = cfg["args"]
-        self.assertEqual(args[args.index("--attn-requant") + 1], "q5_0")
+        self.assertEqual(args[args.index("--attn-requant") + 1], "q5_k")
         self.assertEqual(args[args.index("--tail-skip") + 1], "4")
         self.assertIn("holds part of", out)
         code, out, cfg = self.main(family="inkling", model="UD-Q3_K_XL", ram=64.0, vram=16303 / 1024, n_gpus=2)
@@ -172,10 +195,12 @@ class Main(unittest.TestCase):
         self.assertNotIn("layer_split", cfg)
 
     def test_requests_at_once_are_taken(self):
-        # the engine's batch slots ("parallel"), opt-in as for the other strata-poly families
+        # the engine's batch slots ("parallel"), opt-in as for the other strata-poly families; DSpark is skipped automatically
         code, out, _ = self.main(("--parallel", "4"), family="inkling", model="UD-Q3_K_XL", ram=64.0, vram=32607 / 1024)
         self.assertEqual(code, 0, out)
-        self.assertEqual(json.loads((self.t / "strata-inkling-ud-q3_k_xl.json").read_text())["parallel"], 4)
+        cfg = json.loads((self.t / "strata-inkling-ud-q3_k_xl.json").read_text())
+        self.assertEqual(cfg["parallel"], 4)
+        self.assertNotIn("--draft-model", cfg["args"])
         self.assertNotIn("answers one request at a time", out)
         self.assertIn("parallel requests: 4 at once", out)
         self.assertNotIn("with --tail-skip", out)                          # a card that holds every expert: no skip
@@ -184,13 +209,79 @@ class Main(unittest.TestCase):
         # an 8 GB card's small_card_args skip tail experts over a step's rows, which are several chats' tokens
         code, out, _ = self.main(("--parallel", "2"), family="inkling", model="UD-Q3_K_XL", ram=32.0, vram=8188 / 1024)
         self.assertEqual(code, 0, out)
-        self.assertEqual(json.loads((self.t / "strata-inkling-ud-q3_k_xl.json").read_text())["parallel"], 2)
+        cfg = json.loads((self.t / "strata-inkling-ud-q3_k_xl.json").read_text())
+        self.assertEqual(cfg["parallel"], 2)
+        self.assertNotIn("--draft-model", cfg["args"])
         self.assertIn('"parallel": 2 with --tail-skip', out)
-        # setup again without --parallel: the config keeps "parallel": 2, and the warning with it
+        # setup again without --parallel: the config keeps "parallel": 2, DSpark stays skipped, and the warning stays
         code, out, _ = self.main(family="inkling", model="UD-Q3_K_XL", ram=32.0, vram=8188 / 1024)
         self.assertEqual(code, 0, out)
-        self.assertEqual(json.loads((self.t / "strata-inkling-ud-q3_k_xl.json").read_text())["parallel"], 2)
+        cfg = json.loads((self.t / "strata-inkling-ud-q3_k_xl.json").read_text())
+        self.assertEqual(cfg["parallel"], 2)
+        self.assertNotIn("--draft-model", cfg["args"])
         self.assertIn('"parallel": 2 with --tail-skip', out)
+
+    def test_draft_opt_out_gguf_dir_amd_and_custom_gguf(self):
+        from unittest import mock
+        # --no-draft turns DSpark off on a card that holds every expert and remembers "mtp": false until --mtp on
+        self.downloads, self.verified = [], []
+        code, out, cfg = self.main(("--no-draft",), family="inkling", model="UD-Q3_K_XL", ram=64.0, vram=32607 / 1024)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.downloads, [FAM["hf"] + "Inkling-2-Mini-UD-Q3_K_XL.gguf_file"])
+        self.assertNotIn("--draft-model", cfg["args"])
+        self.assertIs(cfg.get("mtp"), False)
+        code, out, cfg = self.main(family="inkling", model="UD-Q3_K_XL", ram=64.0, vram=32607 / 1024)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("--draft-model", cfg["args"])
+        self.assertIs(cfg.get("mtp"), False)
+        self.downloads = []
+        code, out, cfg = self.main(("--mtp", "on"), family="inkling", model="UD-Q3_K_XL", ram=64.0, vram=32607 / 1024)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.downloads, [FAM["draft_hf"] + DSPARK])
+        self.assertIn("--draft-model", cfg["args"])
+        self.assertNotIn("mtp", cfg)
+
+        # An 8 GB card holding part of the experts leaves DSpark off by default, and --mtp on opts in explicitly
+        self.downloads = []
+        code, out, cfg = self.main(family="inkling", model="UD-Q3_K_XL", ram=32.0, vram=8188 / 1024)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("--draft-model", cfg["args"])
+        code, out, cfg = self.main(("--mtp", "on"), family="inkling", model="UD-Q3_K_XL", ram=32.0, vram=8188 / 1024)
+        self.assertEqual(code, 0, out)
+        self.assertIn("--draft-model", cfg["args"])
+
+        # --gguf-dir with both files already present uses both directly and verifies both SHA-256s
+        mine = self.t / "own"
+        mine.mkdir()
+        (mine / "Inkling-2-Mini-UD-Q3_K_XL.gguf").write_bytes(b"")
+        (mine / DSPARK).write_bytes(b"")
+        self.downloads, self.verified = [], []
+        code, out, cfg = self.main(("--gguf-dir", str(mine)), family="inkling", model="UD-Q3_K_XL", ram=64.0,
+                                   vram=32607 / 1024)
+        self.assertEqual((code, self.downloads), (0, []), out)
+        self.assertEqual([v[0] for v in self.verified], ["Inkling-2-Mini-UD-Q3_K_XL.gguf", DSPARK])
+        self.assertEqual(Path(cfg["args"][cfg["args"].index("--draft-model") + 1]), mine / DSPARK)
+
+        # AMD HIP skips DSpark automatically
+        amd = [{"index": 0, "name": "AMD Radeon RX 9070 XT", "vram_gb": 16.0, "arch": "gfx1201", "driver": "hip",
+                "count": 1}]
+        def fake_hip(gpu, llama, portable=False):
+            eng = self.t / setup.ENGINE_POLY_DIR
+            eng.mkdir(exist_ok=True)
+            (eng / "BUILD.json").write_text(json.dumps({"backend": "hip", "archs": ["gfx1201"]}))
+            return eng
+        real_main = setup.main
+        def amd_main():
+            with mock.patch.object(setup, "gpus", lambda: []), \
+                    mock.patch.object(setup, "amd_gpus", lambda *a: amd), \
+                    mock.patch.object(setup, "build_engine_poly_hip", fake_hip):
+                return real_main()
+        with mock.patch.object(setup, "main", amd_main):
+            code, out, cfg = self.main(("--backend", "hip", "--gguf-dir", str(mine)), family="inkling",
+                                       model="UD-Q3_K_XL", ram=32.0, vram=16.0)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg["backend"], "hip")
+        self.assertNotIn("--draft-model", cfg["args"])
 
 
 

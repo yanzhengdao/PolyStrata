@@ -215,8 +215,8 @@ olduğu: [docs/MAC.md](docs/MAC.md). Varsayılan olarak Qwen3.8-Flash-Next'i kur
 `--family lfm25` onun yerine Qwen3.6'yı ya da LFM2.5'i strata-poly'nin Metal motorunda beta olarak kurar: bir M5
 Ultra'da Qwen3.6 UD-Q2_K_XL kısa bir sohbette saniyede 134 token yazdı ve 3.768 token'lık bir prompt'u saniyede 2.978
 token hızla okudu. `--family inkling` Inkling 2 Mini'yi de aynı şekilde kurar: M5 Ultra'da UD-Q3_K_XL kısa bir
-sohbette saniyede 74 token yazdı, 32.787 token'lık bir prompt'u saniyede 2.440 token hızla okudu ve ardından saniyede
-61 token yazdı; resimleri CPU'da okur. Kurulum Mac'te GLM, DeepSeek, Ornith, Gemma 4, Tiel Coder ve MiniCPM-V'yi de
+sohbette saniyede 105 token yazdı, 32.768 token'lık bir prompt'u saniyede 2.442 token hızla okudu ve ardından saniyede
+107 token yazdı; resimleri CPU'da okur. Kurulum Mac'te GLM, DeepSeek, Ornith, Gemma 4, Tiel Coder ve MiniCPM-V'yi de
 sunar, ama bunlar orada henüz gerçek ağırlıklarıyla çalıştırılmadı. Kolibri, Flint ve Clover bir NVIDIA veya AMD kart
 gerektirir.
 

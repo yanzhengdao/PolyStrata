@@ -41,6 +41,13 @@ On an RTX 3090 that reads a 2,048-token prompt 3.1% faster (2,068 against 2,005 
 faster. Against a run with every product in halves, it moved the answers no more than the other int8 products do on
 a 302- and an 8,192-token prompt (one prompt each). `STRATA_PREFILL_MXFP4=fp16` keeps them on halves, as before.
 
+UD-Q2_K_XL's Q2_0 experts (the down of 12 layers, rows of 1,152 values) go to the same int8 kernel while it reads a
+prompt: on an RTX 30 card or newer by default, on an RTX 20 card with `--prompt-int8`. On an RTX 2070 Super with
+`--prompt-int8` that reads a 2,048-token prompt 3.2% faster (858 against 831 tokens/s) and an 8,192-token one 3.4%
+faster (902 against 873). Against a run with every product in halves, on six prompts of 302 to 8,192 tokens, the
+answers moved about as much as with the other int8 products alone (less on four prompts, more on two).
+`STRATA_PF_I8MMA=0` keeps every prompt product on halves.
+
 On an RTX 50 card the engine multiplies the experts kept in NVFP4 (most of them, in both sizes) on the FP4 tensor
 cores while it reads a prompt, with the prompt's numbers rounded to about 8 bits instead of 11. That reads a prompt
 1.5 to 1.9 times as fast as multiplying them as halves (`STRATA_PREFILL_NVFP4=fp16`). It moves the answers a little:
@@ -60,10 +67,11 @@ only part of the experts was not measured. Three runs each, 32 tokens written af
 On an RTX 20 card (Turing) the engine multiplies the experts as halves while it reads a prompt. With `--prompt-int8`
 it multiplies them on the int8 tensor cores, as it does on RTX 30 and newer, with the prompt's numbers rounded to 8
 bits with a scale for every 32 (`STRATA_PF_I8MMA=0` turns the int8 products off on every card). It is not the
-default because it moves the answers more: measured on a Quadro RTX 4000 (8 GB),
+default on RTX 20 because it moves the answers more: measured on a Quadro RTX 4000 (8 GB),
 which holds a third to two thirds of the experts, written after the halves' greedy answers to three prompts of 302
 to 8,192 tokens, 64 tokens each, with three files (the two below and an IQ3_S), it gives the same most likely token
-at 560 of the 576 steps (97.2%). Prompt speed on that card, three runs each:
+at 560 of the 576 steps (97.2%). On an AMD RDNA3 or RDNA4 card (HIP) the same kernel is the default, and
+`--no-prompt-int8` turns it off. Prompt speed on the RTX 20 card, three runs each:
 
 | Size | Prompt | Halves (the default on RTX 20) | int8 (`--prompt-int8`) |
 | --- | ---: | ---: | ---: |
@@ -98,7 +106,7 @@ added. On an RTX 2070 Super 8 GB a 2,048-token prompt reads 6.5% faster with IQ4
 
 On a laptop with an RTX 4070 Laptop (8 GB), a Core i7-14700HX and 32 GB of RAM, on Windows, UD-Q3_K_XL has 1,216 of
 its 3,072 experts on the card and the rest are computed on the CPU. On a card that does not hold every expert, setup
-gives Inkling 2 Mini three settings that read fewer bytes for each token: `--attn-requant q5_0` (the attention's
+gives Inkling 2 Mini three settings that read fewer bytes for each token: `--attn-requant q5_k` (the attention's
 matrices in 5 bits instead of 8), `--loop-bf16` (the loop controllers in BF16 instead of F32) and `--tail-skip 4`.
 A card that holds the whole model gets none of them. Expert swaps stay on: with `--expert-swaps 0` the experts the
 card holds stay the ones it loaded, fewer of a token's experts are found there, and the CPU computes more of them
@@ -126,16 +134,16 @@ is slower on an 8 GB card this way (see the table above).
 ### Setup's four settings, one at a time
 
 These settings make the answers worse to make them faster. Setup adds three of them by itself, without asking,
-whenever the card cannot hold every expert of the size: `--attn-requant q5_0`, `--loop-bf16` and `--tail-skip 4`.
+whenever the card cannot hold every expert of the size: `--attn-requant q5_k`, `--loop-bf16` and `--tail-skip 4`.
 It no longer adds `--expert-swaps 0` (measured below because setup used to); `--inkling-small-card off` (above) leaves the
-three out. `--attn-requant q5_0` stores the attention's matrices in fewer bits and `--loop-bf16` the loop
+three out. `--attn-requant q5_k` stores the attention's matrices in fewer bits and `--loop-bf16` the loop
 controllers: lossy rounding. `--tail-skip 4` does not compute some of a token's experts at all: on the 8 GB cards
 below, with the other three settings, 9% to 27% of a token's expert picks. The answers differ measurably from the model's without them
 (the same most likely token at 94.3-95.0% of the steps with all four, against 98.2-99.0% for a second run without
 them), and with `--tail-skip` the engine's "experts from VRAM" figure counts the skipped experts as found in VRAM, so
 it reads high.
 
-To turn them off, delete `"--attn-requant", "q5_0", "--loop-bf16", "--tail-skip", "4"` from
+To turn them off, delete `"--attn-requant", "q5_k", "--loop-bf16", "--tail-skip", "4"` from
 the `"args"` list of the model's run config, `strata-inkling-<size>.json` in the install's `terminal` folder (for
 example `strata-inkling-ud-q3_k_xl.json`), and restart the server. To keep the rounding but compute every expert,
 change the `4` after `--tail-skip` to `0`, or add `"env": {"STRATA_ROUTE_TAIL_SKIP": "0"}` to the config. Running
@@ -148,9 +156,9 @@ the group ranks it fifth or lower.
 
 | Setting | What it does | Kind |
 | --- | --- | --- |
-| `--attn-requant q5_0` | the attention's matrices in 5 bits instead of 8: fewer bytes a token, and more VRAM for experts | rounding |
+| `--attn-requant q5_k` | the attention's matrices in 5 bits (Q5_K) instead of 8: fewer bytes a token, and more VRAM for experts | rounding |
 | `--loop-bf16` | the loop controllers in BF16 instead of F32 | rounding |
-| `--expert-swaps 0` | no expert moves into VRAM while an answer is written (default 64 on their way at a time) | rounding: the same experts, but more of them on the CPU, which rounds a little differently |
+| `--expert-swaps 0` | no expert moves into VRAM while an answer is written (default 128 on their way at a time for Inkling 2, 64 on Metal) | rounding: the same experts, but more of them on the CPU, which rounds a little differently |
 | `--tail-skip 4` | a token's experts ranked 5th to 8th that are not on the card are left out | **skips computation** |
 
 Measured on main d1f711e11, one setting at a time and all four, with ggml-org's IQ4_NL file and with UD-Q2_K_XL
@@ -236,8 +244,8 @@ the bus once for the group instead of once for every call and every pass of the 
 `--kv fp8` keeps the attention caches in 8 bits instead of 16, which leaves about 0.7 GB more VRAM for the experts at
 a 32K context.
 `--kv fp8` needs an NVIDIA card from Ampere on. `--kv q8_0` saves about the same (Q8_0 blocks: 8-bit codes and a
-16-bit scale for every 32 values) without FP8 hardware: checked on Turing by its kernel test; AMD not run yet, and a
-Mac refuses it. Both are opt-in and change the answers slightly.
+16-bit scale for every 32 values) without FP8 hardware: checked on Turing by its kernel test; ran on AMD Windows
+([#347](https://github.com/simplexai-labs/PolyStrata/issues/347), RX 9070 XT up to 256K/512K); a Mac refuses it. Both are opt-in and change the answers slightly.
 With `--kv q8_0`, `STRATA_KV_INT8=1` (the name of Kolibri's opt-in) takes the attention scores of a written token that
 reads 32,768 keys or more (only the full-attention layers' tokens do) by `__dp4a`, with the queries quantized to Q8_0
 codes too. Written tokens are a token alone (the prompt's last token is read so too) or a window of guessed ones; the
@@ -247,13 +255,19 @@ from 1.76 to 1.57 ms; with the IQ4_NL file, a 131K context and the experts held 
 about 1e-6 a token at prompts of 40K to 131K. Off by default: it changes the arithmetic.
 
 On a Mac it runs on strata-poly's Metal engine, as a beta. Measured on an Apple M5 Ultra with 256 GB of unified memory,
-UD-Q3_K_XL, the README's benchmark on setup's settings with a 40,960-token context: 256 tokens written, the most likely
-one each time. Other programs were using the GPU at the same time. Two runs of the same prompts given to the engine
-alone wrote 73-74 and 60-61 tokens/s and read 2,411 tokens/s.
+UD-Q3_K_XL (`--metal-optimize --metal-memory balanced`, greedy, the median of three rounds run in turn): a 23-token
+chat prompt, a 3,845-token editing prompt (256 tokens written) and prompts of 8,192 to 65,536 tokens (64 tokens
+written), with setup's default DSpark drafter (`dspark-Inkling-2-Mini-Q8_0.gguf`, which writes the same greedy tokens)
+and without it (`--no-draft` at setup):
 
-| UD-Q3_K_XL | Writes in a short chat | Reads a 32,787-token prompt | Writes after it |
+| Prompt | Reads the prompt | Writes (default, with DSpark) | Writes without DSpark |
 | --- | ---: | ---: | ---: |
-| M5 Ultra | 74 tokens/s | 2,440 tokens/s | 61 tokens/s |
+| **23 tokens** (short chat) | — | 104.7 tokens/s | 85.4 tokens/s |
+| **3,845 tokens** (editing) | 2,451 tokens/s | 178.3 tokens/s | 81.8 tokens/s |
+| **8,192 tokens** | 2,631 tokens/s | 116.2 tokens/s | 76.2 tokens/s |
+| **16,384 tokens** | 2,611 tokens/s | 112.7 tokens/s | 77.1 tokens/s |
+| **32,768 tokens** | 2,442 tokens/s | 107.3 tokens/s | 73.1 tokens/s |
+| **65,536 tokens** | 2,118 tokens/s | 87.5 tokens/s | 67.7 tokens/s |
 
 Given the 128 tokens the CUDA engine wrote after a 4,526-token prompt (UD-Q3_K_XL), it picks the same most likely token
 at 126 of the 128 steps. UD-Q2_K_XL has run there too (73 tokens/s in the short chat). UD-Q4_K_XL has not been measured
@@ -266,7 +280,7 @@ rows took 3.4 s.
 | --- | --- |
 | **Graphics card** | One **NVIDIA** card with **8 GB of VRAM or more**. It has run on an RTX 5090 (32 GB) and on an RTX 4070 Laptop (8 GB). About 3.7 GB are taken before any expert at a 32K context. Or an **Apple Silicon Mac** (beta): it has run on an M5 Ultra. |
 | **RAM** | About **21, 17 or 13 GB** beside an 8 GB card for UD-Q4_K_XL, UD-Q3_K_XL and UD-Q2_K_XL, the installer's estimate. A 32 GB card holds any of them whole. On a Mac, setup takes UD-Q3_K_XL from 32 GB of unified memory and UD-Q2_K_XL below that. |
-| **Disk** | 9.1 to 17.6 GB for the model file. |
+| **Disk** | 9.5 to 18.0 GB (the model file and its 0.4 GB DSpark drafter). |
 | **System** | Linux or Windows 10 / 11, and a current NVIDIA driver; or macOS 15 or newer. |
 
 **AMD (HIP), experimental, not ready:** the engine builds for RDNA3 and RDNA4 (gfx1100, gfx1200, gfx1201). It has run
@@ -277,12 +291,20 @@ every expert on the CPU the answers match an RTX 2070 Super's: on the RX 7900 XT
 64 of 64 steps after a 302-token prompt, and at 15 to 16 of 16 after 2,048 tokens. On RDNA4 the prompt's FP16 products
 go through hipBLASLt, which rounds them differently: after one 2,048-token prompt that is unusually sensitive, the RX
 9070 XT's answers differed from CUDA's more than the RX 7900 XT's, and with `ROCBLAS_USE_HIPBLASLT=0` as much as the
-RX 7900 XT's; after 302 and 8,192 tokens they match CUDA's. Use an NVIDIA card or a Mac for now.
+RX 7900 XT's; after 302 and 8,192 tokens they match CUDA's. With some experts in RAM a decode token is routed on
+the card, which hands the experts it lacks to the CPU through the doorbell, as on NVIDIA: no wait for the host at
+each layer. The card's routing rounds a little differently from the host's; `STRATA_POLY_BELL=0` routes on the host
+as before. Users have since run it without a container: an RX 9070
+XT on Windows 11 with the engine setup built ([#323](https://github.com/simplexai-labs/PolyStrata/issues/323), [#347](https://github.com/simplexai-labs/PolyStrata/issues/347)), an
+RX 9060 XT on Linux ([#309](https://github.com/simplexai-labs/PolyStrata/issues/309)), and an RX 9070 XT on Linux ([#342](https://github.com/simplexai-labs/PolyStrata/pull/342)). Use an NVIDIA card or a Mac for now.
 
-Not run yet: an AMD card on native Linux or Windows, `--expert-gpu` on two cards (built but not run), `--layer-split`
+Not run yet: `--expert-gpu` on two cards (built but not run), `--layer-split`
 on two unequal cards (below; it has run on two RTX 2070 Super), UD-Q4_K_XL on the 8 GB card and UD-Q4_K_XL on a Mac.
-Pictures go through Unsloth's mmproj-F16.gguf, read on the CPU (`--vision cpu`) or the card; on a Mac, on the CPU. The
-draft file is an option (`--draft-model`). Several requests at once (`"parallel"`, see [BATCHING.md](../BATCHING.md))
+Pictures go through Unsloth's mmproj-F16.gguf, read on the CPU (`--vision cpu`) or the card; on a Mac, on the CPU.
+Setup downloads the DSpark drafter (`dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB) and enables `--draft-model` by default on
+a Mac or an NVIDIA card that holds all of the model's experts (`--no-draft` or `--mtp off` at setup leaves it off; on a
+card that holds only part of the experts it stays off by default so it does not crowd out cached experts, and `--mtp on`
+opts in; it is also left off on AMD, with `--layer-split`, and when `"parallel"` is 2 or more). Several requests at once (`"parallel"`, see [BATCHING.md](../BATCHING.md))
 are opt-in on an NVIDIA card (up to 16 slots), not with the draft file, not with `--layer-split` and not on AMD. With
 `--tail-skip` (setup's small-card flags) a chat's answer can then depend on the other chats writing at the same time.
 On a Mac the engine takes one request at a time for this model, and the installer writes `"parallel": 1` there. Its
@@ -300,11 +322,12 @@ Add `--model UD-Q3_K_XL` or `--model UD-Q2_K_XL` for a smaller size.
 
 | Size | What it is | Download | RAM beside an 8 GB card |
 | --- | --- | ---: | ---: |
-| **UD-Q4_K_XL** | 4-bit experts, 8-bit where they write ([Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)) | 17.6 GB | about 21 GB |
-| **UD-Q3_K_XL** | 3- and 4-bit experts mixed | 13.6 GB | about 17 GB |
-| **UD-Q2_K_XL** | 1- to 2-bit experts: the smallest | 9.1 GB | about 13 GB |
+| **UD-Q4_K_XL** | 4-bit experts, 8-bit where they write ([Unsloth](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF)) | 18.0 GB | about 21 GB |
+| **UD-Q3_K_XL** | 3- and 4-bit experts mixed | 14.0 GB | about 17 GB |
+| **UD-Q2_K_XL** | 1- to 2-bit experts: the smallest | 9.5 GB | about 13 GB |
 
-The installer downloads the files under the repository's `Mainline_Support` folder, the layout llama.cpp runs
+Each download includes the 0.4 GB DSpark draft model (`dspark-Inkling-2-Mini-Q8_0.gguf`), fetched from the top of the
+repository. The installer downloads the main files under the repository's `Mainline_Support` folder, the layout llama.cpp runs
 (`inkling2_loop`). The files at the top of the repository (architecture `inkling2`, for example UD-IQ3_XXS) are
 Unsloth's layout of the same weights: the engine reads them too. Setup takes them with `--gguf-dir` or
 `--custom-gguf`; the engine run by hand takes the file as its `--model`.
@@ -338,6 +361,16 @@ them into the same reasoning, content and tool calls as for the other models, so
 as they do elsewhere. A request that asks for no thinking has its prompt end inside the text block, because the
 model otherwise opens a thinking block now and then. More in
 [BACKENDS.md](../BACKENDS.md#inkling-2-mini-one-card).
+
+Thinking effort can be set per request (`reasoning_effort`) or in the run config using `none` (`0`), `minimal`
+(`0.1`), `low` (`0.2`), `medium` (`0.4`), `high` (`0.9`), `xhigh` / `max` (`0.99`), or any explicit number from `0` to
+`0.99` (for example `0.7`). When omitted, `UD-Q2_K_XL` defaults to `low` (`0.2`) and `UD-Q3_K_XL` / `UD-Q4_K_XL`
+default to `0.4`, keeping thinking concise and avoiding long loops.
+
+Optional LoopCD-Hidden extrapolation at the loop core exit can be enabled with `--loopcd-hidden F` (`0` to `1`,
+default `0` = off; `STRATA_INK_LOOPCD_HIDDEN=F` overrides it). For example, `--loopcd-hidden 0.2` on `UD-Q2_K_XL` or
+at `low` thinking effort extrapolates the final loop pass away from the first pass with negligible decode overhead and
+stays compatible with DSpark speculative decoding across CUDA, HIP, and Metal.
 
 ## Checking a change to the engine
 

@@ -5,7 +5,9 @@
 #include "runtime.hpp"
 #include "strata/poly/kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
-#if !defined(STRATA_GPU_METAL)
+#if defined(STRATA_GPU_METAL)
+#include "strata/gpu/metal.hpp"
+#else
 #include "strata/kernels/iq_kernels.hpp"
 #endif
 
@@ -128,14 +130,13 @@ void Inkling2::load_geometry() {
     one_sequence(false, "on Metal");
 #endif
 #if defined(STRATA_USE_HIP)
-    // the _rows kernels are the fused q/k/v and clips kernels HIP does not run (inkling2.cu: clips_apart())
+    // the _rows kernels are the fused q/k/v and clips kernels HIP does not run (inkling2.cu: clips_hip())
     one_sequence(false, "on AMD");
 #endif
     one_sequence(opt_.draft_model.empty(), "with --draft-model");
     // On several cards (--layer-split) a card runs a run of the layers, and the loop's (core_start_ to core_end_ - 1)
     // are on one card: next_layer() runs them again for a later pass.  Engine::open() starts no card inside them.
-    // The drafter stays on one card: its features are three layer runs' inputs, which may be another card's.
-    need(!split_ || opt_.draft_model.empty(), "Inkling 2's --draft-model runs on one card (no --layer-split)");
+    // The drafter's three taps cross to the next card beside the residual streams (carry_rows(), carried()).
     // --batch with --layer-split has not been run
     one_sequence(!split_, "on several cards (--layer-split)");
     need(opt_.kv_format == KvFmt::kFp16 || opt_.kv_format == KvFmt::kFp8 || opt_.kv_format == KvFmt::kQ8_0,
@@ -222,15 +223,37 @@ void Inkling2::load_geometry() {
     // --attn-requant: the attention's six matrices quantized again to that type at load (kGuessMat), fewer bytes a
     // token than their Q8_0.  --loop-bf16: the loop controllers' matrices as BF16, half the bytes of their F32.
     const std::string& a = opt_.attn_requant;
-    attn_type_ = a == "q4_0" ? 2 : a == "q5_0" ? 6 : a == "iq4_nl" ? 20 : 0;
+    attn_type_ = a == "q4_0"   ? 2
+                 : a == "q5_0" ? 6
+                 : a == "q5_k" ? 13
+                 : a == "q6_k" ? 14
+                 : a == "iq4_nl" ? 20
+                                 : 0;
     if (attn_type_) guess_type_ = attn_type_;
     ctrl_bf16_ = opt_.loop_bf16;
+    loopcd_hidden_ = opt_.loopcd_hidden;
+    if (const char* v = std::getenv("STRATA_INK_LOOPCD_HIDDEN"); v && *v) {
+        char* end = nullptr;
+        const float x = std::strtof(v, &end);
+        if (end == v || *end != '\0' || !std::isfinite(x) || x < 0.f || x > 1.f)
+            throw std::runtime_error(std::string("invalid STRATA_INK_LOOPCD_HIDDEN (expected 0 to 1): ") + v);
+        loopcd_hidden_ = x;
+    }
+    need(std::isfinite(loopcd_hidden_) && loopcd_hidden_ >= 0.f && loopcd_hidden_ <= 1.f,
+         "--loopcd-hidden must be between 0 and 1");
+    if (loopcd_hidden_ != 0.f) {
+        need(n_pass_ >= 2, "LoopCD-Hidden requires at least 2 loop passes");
+        std::fprintf(stderr, "strata-poly: LoopCD-Hidden active (omega=%.4f, passes=%d)\n", loopcd_hidden_, n_pass_);
+    }
 #if !defined(STRATA_GPU_METAL)
     // Turing's prompt products on the int8 kernel that Ampere and newer take by default (i8_mma.cuh), only with
     // --prompt-int8: on Turing it gave the same most likely token as the halves at 560 of 576 steps (97.2%), under
-    // the 97.8% a default change needs, so the halves and cuBLAS stay Turing's default (STRATA_PF_I8MMA=0 turns the
-    // kernel off on every card)
-    kernels::gemm_iq_i8_turing(opt_.prompt_int8 == 1);
+    // the 97.8% a default change needs, so the halves and cuBLAS stay Turing's default.  On AMD's RDNA3 / RDNA4 the
+    // kernel is the default and --no-prompt-int8 turns it off.  STRATA_PF_I8MMA=0 turns the kernel off on every card.
+#if defined(STRATA_USE_HIP)
+    if (opt_.prompt_int8 >= 0)   // on AMD the int8 kernel is the default: only --no-prompt-int8 (or --prompt-int8) says
+#endif
+        kernels::gemm_iq_i8_turing(opt_.prompt_int8 == 1);
     // STRATA_PREFILL_IQ1S=int8: IQ1_S (UD-Q2_K_XL's gate|up in 6 layers) on the int8 prompt kernel, as the file's
     // other types are on Ampere and newer (i8_mma.cuh: activations int8 a 32 values).  Opt-in: on a 302-token prompt
     // it cost more KL a matrix than those types do.  Unset or =fp16: the FP16 kernel, as before.  Other models never
@@ -246,6 +269,11 @@ void Inkling2::load_geometry() {
         const char* v = std::getenv("STRATA_PREFILL_MXFP4");
         kernels::gemm_iq_i8_allow(39, !(v && std::string(v) == "fp16"));
     }
+    // Q2_0 matrices whose rows are whole 64-value blocks but not whole stages of 256 (UD-Q2_K_XL's down in 12 layers,
+    // rows of 1,152) on the int8 prompt kernel, as the type already is in rows of whole 256s and as the file's other
+    // types are (on Turing with --prompt-int8).  Other models never ask, so their Q2_0 rows of that kind stay on the
+    // FP16 kernel.
+    kernels::gemm_iq_i8_allow(42, true);
     // On Turing, int8 products on (--prompt-int8): a prompt batch's cached experts in a launch a class of rows
     // (Engine::expert_tiles_), the same numbers in fewer launches; STRATA_POLY_EXPERT_TILES=0: a launch a run of slots
     // again.  Not from Ampere on, where the runs' launches were not measured slower.
@@ -371,7 +399,8 @@ void Inkling2::ds_load() {
     const auto mat = [&](const std::string& name, uint64_t n_in, uint64_t n_out) {
         const TensorInfo* t = f.find(name);
         const uint32_t type = t ? t->type : 0;
-        find(name, type == kTypeBF16 ? kTypeBF16 : 8u, n_in, n_out);   // BF16 or Q8_0
+        // BF16, or a type the card's products take (lin(): Q8_0 as published, or a smaller quantization of it)
+        find(name, type == kTypeBF16 || kernels::native_mmvq_supported((int) type) ? type : 8u, n_in, n_out);
         return Dev{to_dev(t), type, (int) n_in, (int) n_out};
     };
     const uint64_t E = (uint64_t) n_embd_, hq = (uint64_t) n_head_ * head_dim_, kv = (uint64_t) n_kv_ * head_dim_,
@@ -395,10 +424,11 @@ void Inkling2::ds_load() {
         L.q_norm = f32(b + "attn_q_norm.weight", (uint64_t) head_dim_);
         L.k_norm = f32(b + "attn_k_norm.weight", (uint64_t) head_dim_);
         L.k_ctx_norm = f32(b + "attn_k_ctx_norm.weight", (uint64_t) head_dim_);
-        // a window layer's ring holds its window, a block and room past it; a full layer every position
-        L.cap = L.swa ? (int64_t) ds_window_ + 64 : (int64_t) opt_.max_context + 64;
-        L.keys = (uint16_t*) dmalloc((size_t) L.cap * cell, "the drafter's caches");
-        L.vals = (uint16_t*) dmalloc((size_t) L.cap * cell, "the drafter's caches");
+        // a window layer's ring holds its window, a block and room past it; a full layer every position (in the
+        // growing caches alloc_caches() gave it, where it did)
+        L.cap = L.swa ? (int64_t) ds_window_ + 64 : L.keys ? (int64_t) opt_.max_context : (int64_t) opt_.max_context + 64;
+        if (!L.keys) L.keys = (uint16_t*) dmalloc((size_t) L.cap * cell, "the drafter's caches");
+        if (!L.vals) L.vals = (uint16_t*) dmalloc((size_t) L.cap * cell, "the drafter's caches");
         if (L.swa) {   // a conversation taken up again from an earlier place finds later positions in the ring
             L.tags = (long long*) dmalloc((size_t) L.cap * sizeof(long long), "the drafter's caches");
             ck(cudaMemset(L.tags, 0xff, (size_t) L.cap * sizeof(long long)), "the drafter's caches");
@@ -466,13 +496,19 @@ void Inkling2::ds_load() {
     h_ds_row_ = (float*) hmalloc(E * 4, "pinned memory");
     h_ds_at_ = (long long*) hmalloc((2 * kDsRows + 1) * sizeof(long long), "pinned memory");
     ds_fold();
-    if (output_.type == 8u && ds_screens(n_embd_, ds_rank_)) {   // the pick's screen (ds_screen())
+#if defined(STRATA_GPU_METAL)
+    const bool screen_ok = (output_.type == 8u || output_.type == 13u) && ds_screens(n_embd_, ds_rank_);
+#else
+    const bool screen_ok = (output_.type == 8u || output_.type == 12u || output_.type == 13u) &&
+                           ds_screens(n_embd_, ds_rank_) && every_expert_fits();
+#endif
+    if (screen_ok) {   // the pick's screen (ds_screen())
         const int64_t n = n_unpadded_;
         ds_head_sc_ = dmalloc(ds_screen_bytes(n_embd_, n), "the drafter");
         ds_fold_sc_ = dmalloc(ds_screen_bytes(ds_rank_, n), "the drafter");
         ds_fold_bp_ = (float*) dmalloc((size_t) ds_screen_rows(n) * 4, "the drafter");
-        ds_screen_pack(output_.p, n_embd_, n, ds_head_sc_, st_);
-        ds_screen_pack(ds_fold_.p, ds_rank_, n, ds_fold_sc_, st_);
+        ds_screen_pack(output_.p, n_embd_, n, ds_head_sc_, st_, output_.type);
+        ds_screen_pack(ds_fold_.p, ds_rank_, n, ds_fold_sc_, st_, 8u);
         ds_screen_order(ds_fold_b_, n, ds_fold_bp_, st_);
         ck(cudaStreamSynchronize(cs(st_)), "the drafter's screen");
     }
@@ -517,6 +553,7 @@ DsScreen Inkling2::ds_screen() const {
     h.fold_sc = ds_fold_sc_;
     h.n_rows = n_unpadded_;
     h.cap = ds_cap_;
+    h.head_type = output_.type;
     return h;
 }
 
@@ -524,11 +561,11 @@ DsScreen Inkling2::ds_screen() const {
 // mixed into each drafter layer's keys and values at the rows' positions and the Markov head's context.
 void Inkling2::ds_commit(int n) {
     const size_t E = (size_t) n_embd_;
-    output_rows(0, n, ds_tap_ + 3 * (size_t) rows_ * E);
+    output_rows(0, n, ds_tap_ + 3 * (size_t) buf_rows_ * E);
     const DsPos p{recording_ ? at_ : nullptr, (long long) pos_};
     DsMix m;
     m.tap = ds_tap_;
-    m.tap_stride = (size_t) rows_ * E;
+    m.tap_stride = (size_t) buf_rows_ * E;
     m.alpha = ds_alpha_;
     for (int l = 0; l < 3; ++l) m.norm[l] = ds_[(size_t) l].dflare;
     m.norm[3] = ds_mnorm_;
@@ -551,12 +588,19 @@ void Inkling2::ds_commit(int n) {
 // block's 123 kernels spanned 1.55 ms of an RTX 5090's time, 1.33 ms of it busy.
 void Inkling2::guess_block(int32_t token) {
     block_n_ = 0;
-    const int nb = (int) std::min<int64_t>({(int64_t) ds_block_, (int64_t) opt_.window, opt_.max_context - pos_});
+#if defined(STRATA_GPU_METAL)
+    const int cap = std::min(ds_block_, 4);
+#else
+    const int cap = ds_block_;
+#endif
+    const int nb = (int) std::min<int64_t>({(int64_t) cap, (int64_t) opt_.window, opt_.max_context - pos_});
     if (!ds_file_ || nb < 2 || pos_ < 1) return;
     input(token, pos_, h_ds_row_);
     for (int t = 0; t < kDsRows; ++t) h_ds_at_[2 * t] = pos_ + t;
     h_ds_at_[2 * kDsRows] = token;
-    if (opt_.graphs && !prompt_scratch_) {   // the recording holds the few tokens' scratch
+    // (unrecorded where the card has no VRAM for the recording: instantiate(), graph_room())
+    // (the recording holds the few tokens' scratch)
+    if (opt_.graphs && !prompt_scratch_ && (ds_graph_[nb] || (rec_off_ == 0 && !rec_short_))) {
         void*& g = ds_graph_[nb];
         if (!g) {
             cudaGraph_t graph = nullptr;
@@ -569,15 +613,14 @@ void Inkling2::guess_block(int32_t token) {
                 throw;
             }
             ck(cudaStreamEndCapture(cs(st_), &graph), "cudaStreamEndCapture");
-            cudaGraphExec_t exec = nullptr;
-            const cudaError_t made = cudaGraphInstantiateWithFlags(&exec, graph, 0);
+            void* exec = instantiate(graph);
             cudaGraphDestroy(graph);
-            ck(made, "cudaGraphInstantiate");
-            graphs_.push_back(exec);
+            if (exec) graphs_.push_back(exec);
             g = exec;
             recorded_ = true;
         }
-        ck(cudaGraphLaunch((cudaGraphExec_t) g, cs(st_)), "the drafter");
+        if (g) ck(cudaGraphLaunch((cudaGraphExec_t) g, cs(st_)), "the drafter");
+        else ds_block(nb);
     } else {
         ds_block(nb);
     }
@@ -599,14 +642,135 @@ void Inkling2::ds_block(int nb) {
     ds_block_in(ds_x_, ds_mask_, n_embd_, nb, p, ds_at_ + 2 * kDsRows, ds_state_, ds_rank_, ds_prev_, ds_ring_,
                 kDsRing, ds_frc_, st_);
     const float scale = 1.f / std::sqrt((float) head_dim_);
-    for (DsLayer& L : ds_) {
+    const bool screen = ds_head_sc_ != nullptr;
+#if defined(STRATA_GPU_METAL)
+    if (!ds_.empty()) {
+        const float* x0[1] = {ds_x_};
+        const float* w0[1] = {ds_[0].attn_norm};
+        float* y0[1] = {ds_y_};
+        void* q0[1] = {ds_yq_};
+        ink_norm_many_q8_rows(x0, w0, y0, q0, 1, n_embd_, nb, ds_eps_, st_);
+    }
+    for (size_t l = 0; l < ds_.size(); ++l) {
+        DsLayer& L = ds_[l];
+        if (nb >= 2 && L.wq.type == L.wk.type && L.wq.type == L.wv.type && L.wq.scale == 1.0f &&
+            L.wk.scale == 1.0f && L.wv.scale == 1.0f) {
+            kernels::NativeMmvqMany m{};
+            m.w[0] = L.wq.p, m.x_q8_1[0] = ds_yq_, m.y[0] = ds_q_, m.n_out[0] = L.wq.n_out;
+            m.w[1] = L.wk.p, m.x_q8_1[1] = ds_yq_, m.y[1] = ds_k_, m.n_out[1] = L.wk.n_out;
+            m.w[2] = L.wv.p, m.x_q8_1[2] = ds_yq_, m.y[2] = ds_v_, m.n_out[2] = L.wv.n_out;
+            m.count = 3;
+            if (kernels::native_mmvq_many_rows_fits((int) L.wq.type, m, n_embd_, nb)) {
+                kernels::native_mmvq_many_rows((int) L.wq.type, m, n_embd_, nb, st_);
+            } else {
+                gpu::metal::ParallelScope par(static_cast<gpu::Stream>(st_));
+                lin(L.wq, ds_y_, ds_q_, nb, ds_yq_);
+                lin_pair(L.wk, L.wv, ds_y_, ds_k_, ds_v_, nb, ds_yq_);
+            }
+        } else {
+            gpu::metal::ParallelScope par(static_cast<gpu::Stream>(st_));
+            lin(L.wq, ds_y_, ds_q_, nb, ds_yq_);
+            lin_pair(L.wk, L.wv, ds_y_, ds_k_, ds_v_, nb, ds_yq_);
+        }
+        {
+            gpu::metal::ParallelScope par(static_cast<gpu::Stream>(st_));
+            ds_rope(ds_q_, n_head_, nb, L.q_norm, ds_eps_, ds_theta_, p, nullptr, 0, nullptr, nullptr, st_);
+            ds_rope(ds_k_, n_kv_, nb, L.k_norm, ds_eps_, ds_theta_, p, L.keys, L.cap, ds_v_, L.vals, st_, L.tags);
+        }
+        ds_attend_q8(ds_q_, L.keys, L.vals, L.tags, L.cap, p, L.swa ? ds_window_ : 0, nb, n_head_, n_kv_, scale,
+                     ds_part_, ds_att_, st_, ds_gq_);
+        lin(L.wo, ds_att_, ds_y_, nb, ds_gq_);
+        ink_add_norm_q8_rows(ds_x_, ds_y_, L.ffn_norm, ds_y_, ds_yq_, n_embd_, nb, ds_eps_, st_);
+        {
+            gpu::metal::ParallelScope par(static_cast<gpu::Stream>(st_));
+            lin_pair(L.gate, L.up, ds_y_, ds_g_, ds_u_, nb, ds_yq_);
+        }
+        kernels::native_swiglu_quantize_q8_1(ds_g_, ds_u_, ds_gq_, ds_ff_, nb, st_);
+        lin(L.down, ds_g_, ds_y_, nb, ds_gq_);
+        if (l + 1 < ds_.size()) {
+            ink_add_norm_q8_rows(ds_x_, ds_y_, ds_[l + 1].attn_norm, ds_y_, ds_yq_, n_embd_, nb, ds_eps_, st_);
+        } else {
+            ink_add_norm_q8_rows(ds_x_ + E, ds_y_ + E, ds_norm_, ds_h_, ds_hq_, n_embd_, nd, ds_eps_, st_);
+        }
+    }
+    if (ds_.empty()) {
+        rms_norm(ds_x_ + E, ds_norm_, ds_h_, n_embd_, nd, ds_eps_, st_);
+        kernels::native_quantize_q8_1(ds_h_, ds_hq_, n_embd_ * nd, 1, st_);
+    } else if (!screen) {
+        // ds_hq_ was already populated by the last layer's ink_add_norm_q8_rows
+    }
+    if (screen) {
+        gpu::metal::ParallelScope par(static_cast<gpu::Stream>(st_), ds_wh_.scale == 1.0f && ds_wf_.scale == 1.0f);
+        ds_head_base(ds_screen(), ds_hq_, nd, ds_approx_, st_);
+        lin(ds_wh_, ds_h_, ds_ctxh_, nd);
+        lin(ds_wf_, ds_frc_, ds_ctxf_, 1);
+    } else {
+        gpu::metal::ParallelScope par(static_cast<gpu::Stream>(st_),
+                                      output_.scale == 1.0f && ds_wh_.scale == 1.0f && ds_wf_.scale == 1.0f);
+        lin(output_, ds_h_, ds_base_, nd, ds_hq_);
+        lin(ds_wh_, ds_h_, ds_ctxh_, nd, ds_hq_);
+        lin(ds_wf_, ds_frc_, ds_ctxf_, 1);
+    }
+#else
+    static const bool ds_fuse = !std::getenv("STRATA_DS_FUSE") || std::getenv("STRATA_DS_FUSE")[0] != '0';
+    const bool ds_fuse_ok = ds_fuse && !ds_.empty() && sum_threads(n_embd_) == 1024 && n_embd_ % 32 == 0;
+    if (ds_fuse_ok) {
+        kernels::native_add_rms_norm_q8_1(ds_x_, nullptr, ds_[0].attn_norm, ds_h_, ds_yq_, n_embd_, nb, ds_eps_,
+                                          sum_threads(n_embd_), st_);
+    }
+    for (size_t l = 0; l < ds_.size(); ++l) {
+        DsLayer& L = ds_[l];
+        if (ds_fuse_ok) {
+            bool qkv_done = false;
+            if (nb >= 2 && nb <= 8 && L.wq.scale == 1.0f && L.wk.scale == 1.0f && L.wv.scale == 1.0f) {
+                kernels::NativeMmvqMany m{};
+                int types[8] = {(int) L.wq.type, (int) L.wk.type, (int) L.wv.type};
+                m.w[0] = L.wq.p, m.x_q8_1[0] = ds_yq_, m.y[0] = ds_q_, m.n_out[0] = L.wq.n_out;
+                m.w[1] = L.wk.p, m.x_q8_1[1] = ds_yq_, m.y[1] = ds_k_, m.n_out[1] = L.wk.n_out;
+                m.w[2] = L.wv.p, m.x_q8_1[2] = ds_yq_, m.y[2] = ds_v_, m.n_out[2] = L.wv.n_out;
+                m.count = 3;
+                if (kernels::native_mmvq_mixed_rows_fits(types, m, n_embd_, nb)) {
+                    kernels::native_mmvq_mixed_rows(types, m, n_embd_, nb, st_);
+                    qkv_done = true;
+                }
+            }
+            if (!qkv_done) {
+                lin(L.wq, ds_h_, ds_q_, nb, ds_yq_);
+                lin_pair(L.wk, L.wv, ds_h_, ds_k_, ds_v_, nb, ds_yq_);
+            }
+            ds_rope_qkv(ds_q_, ds_k_, ds_v_, n_head_, n_kv_, nb, L.q_norm, L.k_norm, ds_eps_, ds_theta_, p, L.keys,
+                        L.vals, L.cap, L.tags, st_);
+            ds_attend(ds_q_, L.keys, L.vals, L.tags, L.cap, p, L.swa ? ds_window_ : 0, nb, n_head_, n_kv_, scale,
+                      ds_part_, ds_att_, st_, ds_gq_);
+            lin(L.wo, ds_att_, ds_y_, nb, ds_gq_);
+            kernels::native_add_rms_norm_q8_1(ds_x_, ds_y_, L.ffn_norm, ds_h_, ds_yq_, n_embd_, nb, ds_eps_,
+                                              sum_threads(n_embd_), st_);
+            lin_pair(L.gate, L.up, ds_h_, ds_g_, ds_u_, nb, ds_yq_);
+            const bool down_q = L.down.type != kTypeF32 && L.down.type != kTypeBF16 &&
+                                kernels::native_mmvq_supported((int) L.down.type) && ds_ff_ % 32 == 0;
+            if (down_q) {
+                kernels::native_swiglu_quantize_q8_1(ds_g_, ds_u_, ds_gq_, ds_ff_, nb, st_);
+                lin(L.down, ds_g_, ds_y_, nb, ds_gq_);
+            } else {
+                ds_swiglu(ds_g_, ds_u_, (size_t) nb * ds_ff_, st_);
+                lin(L.down, ds_g_, ds_y_, nb);
+            }
+            if (l + 1 < ds_.size()) {
+                kernels::native_add_rms_norm_q8_1(ds_x_, ds_y_, ds_[l + 1].attn_norm, ds_h_, ds_yq_, n_embd_, nb,
+                                                  ds_eps_, sum_threads(n_embd_), st_);
+            } else {
+                kernels::native_add_rms_norm_q8_1(ds_x_ + E, ds_y_ + E, ds_norm_, ds_h_, ds_hq_, n_embd_, nd, ds_eps_,
+                                                  sum_threads(n_embd_), st_);
+            }
+            continue;
+        }
         rms_norm(ds_x_, L.attn_norm, ds_y_, n_embd_, nb, ds_eps_, st_);
         kernels::native_quantize_q8_1(ds_y_, ds_yq_, n_embd_ * nb, 1, st_);
         lin(L.wq, ds_y_, ds_q_, nb, ds_yq_);
         lin_pair(L.wk, L.wv, ds_y_, ds_k_, ds_v_, nb, ds_yq_);
+        // a window layer's context is the window before the block, a full one's every position; and the block
         ds_rope(ds_q_, n_head_, nb, L.q_norm, ds_eps_, ds_theta_, p, nullptr, 0, nullptr, nullptr, st_);
         ds_rope(ds_k_, n_kv_, nb, L.k_norm, ds_eps_, ds_theta_, p, L.keys, L.cap, ds_v_, L.vals, st_, L.tags);
-        // a window layer's context is the window before the block, a full one's every position; and the block
         ds_attend(ds_q_, L.keys, L.vals, L.tags, L.cap, p, L.swa ? ds_window_ : 0, nb, n_head_, n_kv_, scale,
                   ds_part_, ds_att_, st_);
         lin(L.wo, ds_att_, ds_y_, nb);
@@ -618,17 +782,37 @@ void Inkling2::ds_block(int nb) {
         lin(L.down, ds_g_, ds_y_, nb);
         axpy(ds_y_, 1.f, ds_x_, nb * n_embd_, true, st_);
     }
-    rms_norm(ds_x_ + E, ds_norm_, ds_h_, n_embd_, nd, ds_eps_, st_);
-    const bool screen = ds_head_sc_ != nullptr;
+    if (!ds_fuse_ok) {
+        rms_norm(ds_x_ + E, ds_norm_, ds_h_, n_embd_, nd, ds_eps_, st_);
+        if (screen) kernels::native_quantize_q8_1(ds_h_, ds_hq_, n_embd_ * nd, 1, st_);
+    }
     if (screen) {
-        kernels::native_quantize_q8_1(ds_h_, ds_hq_, n_embd_ * nd, 1, st_);
         ds_head_base(ds_screen(), ds_hq_, nd, ds_approx_, st_);
     } else {
-        lin(output_, ds_h_, ds_base_, nd);
+        lin(output_, ds_h_, ds_base_, nd, ds_fuse_ok ? ds_hq_ : nullptr);
     }
     lin(ds_wh_, ds_h_, ds_ctxh_, nd);
     lin(ds_wf_, ds_frc_, ds_ctxf_, 1);
+    const bool markov_fused =
+        ds_fuse && ds_wsp_.type == kTypeBF16 && ds_wsp_.scale == 1.0f && ds_rank_ % 32 == 0 && ds_rank_ <= 512;
+#endif
     for (int i = 0; i < nd; ++i) {
+#if !defined(STRATA_GPU_METAL)
+        if (markov_fused) {
+            float* st_in = (i & 1) ? ds_in_ : ds_state_;
+            float* st_out = (i & 1) ? ds_state_ : ds_in_;
+            ds_markov_fused(st_in, ds_w1_, ds_prev_, (const uint16_t*) ds_wsp_.p, ds_ctxh_ + (size_t) i * 3 * R,
+                            ds_ctxf_, ds_jb_, st_out, ds_lat_, screen ? ds_latq_ : nullptr, ds_rank_, st_);
+            if (screen) {
+                ds_head_pick(ds_screen(), ds_hq_, ds_latq_, ds_approx_, i, ds_hscr_, ds_prev_, ds_pick_ + i, st_);
+            } else {
+                lin(ds_fold_, ds_lat_, ds_fy_, 1);
+                ds_pick(ds_base_ + (size_t) i * V, ds_fy_, ds_fold_b_, n_unpadded_, ds_cap_, ds_z_, ds_pick_ + i,
+                        ds_prev_, st_);
+            }
+            continue;
+        }
+#endif
         ds_markov_in(ds_state_, ds_w1_, ds_prev_, ds_in_, ds_rank_, st_);
         lin(ds_wsp_, ds_in_, ds_sp_, 1);
         ds_markov_step(ds_ctxh_ + (size_t) i * 3 * R, ds_ctxf_, ds_jb_, ds_sp_, ds_state_, ds_lat_, ds_rank_, st_);
@@ -656,7 +840,8 @@ void Inkling2::load_layer(int il) {
     const int64_t e = n_embd_, hq = (int64_t) n_head_ * head_dim_, kv = (int64_t) n_kv_ * head_dim_;
 
     if (il == lo_) {   // beside the card's first layer: the input's norm on the first card, the output's mix on the last
-        if (lo_ == 0) tok_norm_ = upload(gg_->find("token_embd_norm.weight"), "token_embd_norm.weight", e, 1, kF32);
+        if (lo_ == 0 || (ds_file_ && hi_ == n_layer_))
+            tok_norm_ = upload(gg_->find("token_embd_norm.weight"), "token_embd_norm.weight", e, 1, kF32);
         if (hi_ == n_layer_)
             out_query_ = upload(gg_->find("output_res_query.weight"), "output_res_query.weight", e, 1, kF32);
     }
@@ -700,7 +885,7 @@ void Inkling2::load_layer(int il) {
         auto ctl = [&](const std::string& n, int64_t a, int64_t b) {
             return ctrl_bf16_ ? upload(tensor(il, n.c_str()), blk(il, n.c_str()), a, b, kFloatMat,
                                        [](float v) { return v; })
-                              : f32(n.c_str(), a, b);
+                              : upload(tensor(il, n.c_str()), blk(il, n.c_str()), a, b, kExactBF16);
         };
         for (int c = 0; c < kCtrl; ++c) {
             const std::string pre = std::string("loop_") + kCtrlName[c] + "_ctrl_";
@@ -724,15 +909,15 @@ void Inkling2::load_layer(int il) {
 
 size_t Inkling2::recurrent_floats() const { return slots_.size() * past_floats(); }
 
-// ROCm on Linux gives VRAM back only with its addresses (Engine::vmm_unmap()), and a prompt's lent buffers crashed
-// strata-poly there (an RX 9070 XT, Inkling 2 Mini IQ4_NL with some experts in RAM): the prompt batch's scratch stays
-// out of them, in one layout as before.  With the experts frozen (STRATA_FREEZE_EXPERTS, --check-batch) lend_prompt()
+// A HIP build lends no prompt buffers (STRATA_VMM_NO_PROMPT_LEND): lent, they crashed strata-poly inside the HIP
+// runtime (an RX 9070 XT, Inkling 2 Mini IQ4_NL with some experts in RAM), so the prompt batch's scratch stays out of
+// them, in one layout as before.  With the experts frozen (STRATA_FREEZE_EXPERTS, --check-batch) lend_prompt()
 // lends nothing, and the small layout would only take VRAM from the expert cache for the whole run.
 bool Inkling2::scores_apart() const {
-#ifdef STRATA_VMM_RELEASE_WITH_ADDRESSES
+#ifdef STRATA_VMM_NO_PROMPT_LEND
     return false;
 #else
-    return !ds_file_ && !freeze_experts_asked_ && mmq_ && vmm_ && !split_ && rows_ >= kStageRows;
+    return !freeze_experts_asked_ && mmq_ && vmm_ && !split_ && rows_ >= kStageRows;
 #endif
 }
 
@@ -750,7 +935,8 @@ bool Inkling2::every_expert_fits() const {
         all += (size_t) n_expert_ * (L.gu2() + L.d_bytes);
     }
     const size_t need = all + scratch_at_ * sizeof(float) + (size_t(2) << 30);
-    return (size_t) vram_free_mib() << 20 >= need;
+    const int64_t avail_mib = vram_free_mib() - std::max<int64_t>(0, opt_.vram_reserve_mib);
+    return avail_mib > 0 && ((size_t) avail_mib << 20) >= need;
 }
 
 bool Inkling2::scratch_layouts() const { return scores_apart() && !every_expert_fits(); }
@@ -776,6 +962,23 @@ void Inkling2::alloc_caches() {
             s.vals = (uint16_t*) kv_alloc(row, 1);
         }
     }
+#if !defined(STRATA_GPU_METAL)
+    // The drafter's full layers keep a row a position too (fp16 whatever --kv says), and grow with the target's
+    // caches (cover()): sized for the whole context from the start, they took 128 MiB at 32K and 512 MiB at 128K
+    // that the expert cache did without.  The rows a block writes stay inside the context (guess_block()'s nb), so
+    // max_context rows hold them.  Skip on non-last split cards (where ds_load() never runs), with --kv-resident,
+    // and when max_context is small enough that VMM piece granularity would exceed a plain allocation.
+    const bool is_last = end_ < 0 || end_ >= n_layer_;
+    const size_t ds_cell = (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
+    if (is_last && vmm_ && opt_.kv_grow && opt_.kv_resident <= 0 &&
+        (size_t) opt_.max_context * ds_cell >= 2 * grain_) {
+        for (DsLayer& L : ds_)
+            if (!L.swa) {
+                L.keys = (uint16_t*) kv_alloc(ds_cell, 1);
+                L.vals = (uint16_t*) kv_alloc(ds_cell, 1);
+            }
+    }
+#endif
 }
 
 // Per-token buffers hold buf_rows_ tokens, row after row.
@@ -787,16 +990,20 @@ void Inkling2::assign_scratch() {
     std::copy(bl_, bl_ + kBlocks, home_);
     home_[kBlocks] = bank_;
     home_[kBlocks + 1] = bank_out_;
+    if (loopcd_hidden_ != 0.f) {
+        cd_h1_ = cd_home_[0] = fbuf(e);
+        cd_bl2_ = cd_home_[1] = fbuf(e);
+    }
     for (float*& b : in_) b = fbuf(e);
     for (float*& b : xin_) b = fbuf(e);
     for (float*& b : msg_) b = fbuf(e);
+    const size_t few = (size_t) std::min(buf_rows_, kStageRows);
     msgs_.assign((size_t) (core_end_ - core_start_) * kCtrl, nullptr);
-    for (float*& b : msgs_) b = fbuf((size_t) n_embd_);
+    for (float*& b : msgs_) b = fbuf(few * n_embd_);
     cat_ = fbuf(2 * e);
     ch_ = fbuf(n * rank_);
     gain_ = fbuf(e);
     forget_ = fbuf(e);
-    const size_t few = (size_t) std::min(buf_rows_, kStageRows);
     for (int j = 0; j < 3; ++j) {
         cat3_[j] = fbuf(2 * few * n_embd_);
         ch3_[j] = fbuf(few * rank_);
@@ -827,7 +1034,10 @@ void Inkling2::assign_scratch() {
         score_ = fbuf(score_n_);
     }
     zeros_ = fbuf((size_t) n_head_);
-    xqo_ = fbuf((kernels::native_q8_1_bytes(n_head_ * head_dim_) + sizeof(float) - 1) / sizeof(float));
+    xqo_ = fbuf((few * kernels::native_q8_1_bytes(n_head_ * head_dim_) + sizeof(float) - 1) / sizeof(float));
+#if defined(STRATA_GPU_METAL)
+    if (scratch_) ink_warmup();
+#endif
     // a prompt batch's attention; none in the few tokens' layout, where the batch layout's may be lent
     awork_ = buf_rows_ >= kStageRows ? fbuf(heads + heads / 2 + 1 + 3 * n * n_head_) : nullptr;
     kvw_ = nullptr;
@@ -837,38 +1047,42 @@ void Inkling2::assign_scratch() {
         kvw_halves_ = (size_t) std::min<int64_t>(opt_.max_context, kKvq8WorkRows) * n_kv_ * head_dim_;
         kvw_ = fbuf(kvw_halves_);   // 2 * kvw_halves_ halves
     }
-    if (ds_file_) {   // the drafter's: a call's features and mixes, and a block's rows
+    if (ds_file_) {   // the drafter's: a call's features (every split card), and mixes/block scratch (last card only)
         const size_t E = (size_t) n_embd_, hq = (size_t) n_head_ * head_dim_, kv = (size_t) n_kv_ * head_dim_,
                      B = (size_t) ds_block_, V = (size_t) n_vocab_, R = (size_t) ds_rank_;
-        ds_tap_ = fbuf(4 * n * E);
-        ds_mix_ = fbuf(3 * n * E);
-        ds_k_ = fbuf(std::max(n, B) * kv);
-        ds_v_ = fbuf(std::max(n, B) * kv);
-        ds_x_ = fbuf(B * E);
-        ds_y_ = fbuf(B * E);
-        ds_q_ = fbuf(B * hq);
-        ds_att_ = fbuf(B * hq);
-        ds_g_ = fbuf(B * ds_ff_);
-        ds_u_ = fbuf(B * ds_ff_);
-        ds_h_ = fbuf(B * E);
-        ds_base_ = fbuf(B * V);
-        ds_z_ = fbuf(V);
-        ds_fy_ = fbuf(V);
-        ds_part_ = fbuf(ds_attend_floats(n_kv_));
-        ds_ctxh_ = fbuf(B * 3 * R);
-        ds_ctxf_ = fbuf(3 * R);
-        ds_in_ = fbuf(2 * R);
-        ds_sp_ = fbuf(3 * R);
-        ds_state_ = fbuf(R);
-        ds_lat_ = fbuf(R);
-        ds_frc_ = fbuf(E);
-        const auto bytes = [&](size_t n) { return (void*) fbuf((n + sizeof(float) - 1) / sizeof(float)); };
-        ds_yq_ = bytes(B * kernels::native_q8_1_bytes(n_embd_));
-        ds_hq_ = bytes(B * kernels::native_q8_1_bytes(n_embd_));
-        ds_latq_ = bytes(kernels::native_q8_1_bytes(ds_rank_));
-        ds_approx_ = fbuf(B * (size_t) ds_screen_rows(n_unpadded_));
-        ds_hscr_ = (float*) bytes(ds_screen_scratch_bytes(n_unpadded_));
-        if (!ds_ring_ && scratch_) ds_load();
+        ds_tap_ = ds_home_ = fbuf(kDsTaps * n * E);
+        const bool is_last = end_ < 0 || end_ >= n_layer_;
+        if (is_last) {
+            ds_mix_ = fbuf(3 * n * E);
+            ds_k_ = fbuf(std::max(n, B) * kv);
+            ds_v_ = fbuf(std::max(n, B) * kv);
+            ds_x_ = fbuf(B * E);
+            ds_y_ = fbuf(B * E);
+            ds_q_ = fbuf(B * hq);
+            ds_att_ = fbuf(B * hq);
+            ds_g_ = fbuf(B * ds_ff_);
+            ds_u_ = fbuf(B * ds_ff_);
+            ds_h_ = fbuf(B * E);
+            ds_base_ = fbuf(B * V);
+            ds_z_ = fbuf(V);
+            ds_fy_ = fbuf(V);
+            ds_part_ = fbuf(ds_attend_floats(n_kv_));
+            ds_ctxh_ = fbuf(B * 3 * R);
+            ds_ctxf_ = fbuf(3 * R);
+            ds_in_ = fbuf(2 * R);
+            ds_sp_ = fbuf(3 * R);
+            ds_state_ = fbuf(R);
+            ds_lat_ = fbuf(R);
+            ds_frc_ = fbuf(E);
+            const auto bytes = [&](size_t sz) { return (void*) fbuf((sz + sizeof(float) - 1) / sizeof(float)); };
+            ds_yq_ = bytes(B * kernels::native_q8_1_bytes(n_embd_));
+            ds_hq_ = bytes(B * kernels::native_q8_1_bytes(n_embd_));
+            ds_latq_ = bytes(kernels::native_q8_1_bytes(ds_rank_));
+            ds_gq_ = bytes(B * kernels::native_q8_1_bytes((int) std::max(hq, (size_t) ds_ff_)));
+            ds_approx_ = fbuf(B * (size_t) ds_screen_rows(n_unpadded_));
+            ds_hscr_ = (float*) bytes(ds_screen_scratch_bytes(n_unpadded_));
+            if (!ds_ring_ && scratch_) ds_load();
+        }
     }
     if (!side_) {
         cudaStream_t s = nullptr;
@@ -940,15 +1154,86 @@ void Inkling2::control(const float* cur, const float* msg, const Ctrl& c, float*
         const int outs[2] = {n_embd_, n_embd_};
         gemv_set(w, x, y, outs, 2, rank_, n, st_);
     } else {
+#if defined(STRATA_USE_HIP)
+        // a prompt's: lin_pair()'s two hipblasSgemm calls and the gate in one launch, the same bits
+        if (up_gate_ok(c, n) && ink_ctrl_up_gate(cur, msg, ch_, c.gain.p, c.forget.p, out, n_embd_, rank_, n, st_,
+                                                 c.gain.type == kTypeBF16))
+            return;
+#endif
         lin_pair(c.gain, c.forget, ch_, gain_, forget_, n, nullptr);
     }
     ink_gate(cur, msg, gain_, forget_, out, (size_t) n * n_embd_, st_);
 }
 
+#if defined(STRATA_USE_HIP)
+// Where lin_pair() takes a controller's gain and forget through gemm_f32()'s hipblasSgemm (a prompt batch of F32, or
+// of BF16 widened into wf_; more than the 256 outputs gemm_f32() keeps for its own kernels), whose bits
+// ink_ctrl_up_gate() has.
+bool Inkling2::up_gate_ok(const Ctrl& c, int n) const {
+    const auto blas = [&](const Dev& d) {
+        return d.scale == 1.0f && d.n_in == rank_ && d.n_out == n_embd_ &&
+               (d.type == kTypeF32 || (d.type == kTypeBF16 && wf_ && (size_t) d.n_in * d.n_out <= bf16_max_));
+    };
+    return n >= kStageRows && n_embd_ > 256 && c.gain.type == c.forget.type && blas(c.gain) && blas(c.forget);
+}
+#endif
+
 // A later pass's FFN controller for one token (control() on mixf_), its gate in the launch of the experts' input
 // norm and quantization (native_add_rms_norm_q8_1()'s): the same bytes.  False, with nothing launched, where
 // control() and that norm do it.  `row`: the token's row of mixf_, msg, xn_ and xq_ (step()'s rows, one at a time).
-bool Inkling2::control_ffn(const float* msg, const Ctrl& c, const Block& B, int row) {
+bool Inkling2::control_ffn(const float* msg, const Ctrl& c, const Block& B, int rows) {
+    if (rows > 1) {
+        if (c.down.type == kTypeBF16) {
+            if (c.gain.type != kTypeBF16 || c.forget.type != kTypeBF16 || c.down.scale != 1.0f || c.gain.scale != 1.0f ||
+                c.forget.scale != 1.0f || rank_ >= 128)
+                return false;
+            const float* cur = mixf_;
+            const void* down = c.down.p;
+            float* ch = ch_;
+            if (!ink_ctrl_down(&cur, &msg, &down, &ch, 1, n_embd_, rank_, rows, st_, true)) return false;
+            const float* chs = ch_;
+            const void* g = c.gain.p;
+            const void* f = c.forget.p;
+            float* out = mixf_;
+            ink_control3_gate_rows(&cur, &msg, &chs, &g, &f, &out, n_embd_, rank_, rows, st_, 1, true);
+#if defined(STRATA_GPU_METAL)
+            const float* nx = mixf_;
+            const float* nw = fp(B.ffn_norm);
+            float* ny = xn_;
+            void* nq = xq_;
+            ink_norm_many_q8_rows(&nx, &nw, &ny, &nq, 1, n_embd_, rows, rms_eps_, st_);
+#else
+            kernels::native_add_rms_norm_q8_1(mixf_, nullptr, fp(B.ffn_norm), xn_, xq_, n_embd_, rows, rms_eps_,
+                                              sum_threads(n_embd_), st_);
+#endif
+            return true;
+        }
+        if (c.gain.type == kTypeF32 && c.forget.type == kTypeF32 && c.gain.scale == 1.0f && c.forget.scale == 1.0f &&
+            sum_threads(n_embd_) == 1024) {
+            const float* cur = mixf_;
+            const void* down = fp(c.down);
+            float* ch = ch_;
+            if (c.down.type != kTypeF32 || c.down.scale != 1.0f ||
+                !ink_ctrl_down(&cur, &msg, &down, &ch, 1, n_embd_, rank_, rows, st_)) {
+                ink_cat_norm(mixf_, msg, cat_, n_embd_, rows, st_);
+                lin(c.down, cat_, ch_, rows);
+            }
+            const float* w[2] = {fp(c.gain), fp(c.forget)};
+            const float* x[2] = {ch_, ch_};
+            float* y[2] = {gain_, forget_};
+            const int outs[2] = {n_embd_, n_embd_};
+            gemv_set(w, x, y, outs, 2, rank_, rows, st_);
+            ink_gate_norm_q8_rows(mixf_, msg, gain_, forget_, mixf_, fp(B.ffn_norm), xn_, xq_, n_embd_, rows, rms_eps_,
+                                  st_);
+            return true;
+        }
+    }
+    for (int row = 0; row < rows; ++row)
+        if (!control_ffn_row(msg, c, B, row)) return false;
+    return true;
+}
+
+bool Inkling2::control_ffn_row(const float* msg, const Ctrl& c, const Block& B, int row) {
     float* const mixf = mixf_ + (size_t) row * n_embd_;
     float* const xn = xn_ + (size_t) row * n_embd_;
     void* const xq = (uint8_t*) xq_ + (size_t) row * kernels::native_q8_1_bytes(n_embd_);
@@ -966,8 +1251,16 @@ bool Inkling2::control_ffn(const float* msg, const Ctrl& c, const Block& B, int 
         const void* f = c.forget.p;
         float* out = mixf;
         ink_control3_gate(&cur, &msg, &chs, &g, &f, &out, n_embd_, rank_, st_, 1, true);
+#if defined(STRATA_GPU_METAL)
+        const float* nx = mixf;
+        const float* nw = fp(B.ffn_norm);
+        float* ny = xn;
+        void* nq = xq;
+        ink_norm_many_q8(&nx, &nw, &ny, &nq, 1, n_embd_, rms_eps_, st_);
+#else
         kernels::native_add_rms_norm_q8_1(mixf, nullptr, fp(B.ffn_norm), xn, xq, n_embd_, 1, rms_eps_,
                                           sum_threads(n_embd_), st_);
+#endif
         return true;
     }
     if (c.gain.type != kTypeF32 || c.forget.type != kTypeF32 || c.gain.scale != 1.0f || c.forget.scale != 1.0f ||
@@ -1012,17 +1305,24 @@ bool Inkling2::project(const Block& B, const float* const* x, int n, bool quanti
     constexpr bool kOneType = true;
 #endif
 #if !defined(STRATA_GPU_METAL) && !defined(STRATA_USE_HIP)
-    // one launch of several types: a token's, on CUDA (native_mmvq_mixed() takes no other; HIP keeps its launches)
+    // one launch of several types: 1..8 tokens on CUDA (HIP keeps its launches)
     static const bool mixed_on = [] {
         const char* v = std::getenv("STRATA_INK_PROJECT_MIXED");
         return v == nullptr || v[0] != '0';
     }();
-    const bool mixed = n == 1 && mixed_on;
+    const bool mixed = (n >= 1 && n <= 8) && mixed_on;
 #else
     constexpr bool mixed = false;
 #endif
+#if defined(STRATA_USE_HIP)
+    // a token's on HIP: a launch for each type among the five, as on Metal (below)
+    const bool by_type = n == 1;
+#else
+    constexpr bool by_type = false;
+#endif
     for (const Dev* d : w)
-        if ((kOneType && !mixed && d->type != w[0]->type) || d->n_in != n_embd_ || d->scale != 1.0f) return false;
+        if ((kOneType && !mixed && !by_type && d->type != w[0]->type) || d->n_in != n_embd_ || d->scale != 1.0f)
+            return false;
     const float* xs[3];
     void* qs[3];
     int nx = 0, slot[3];
@@ -1037,10 +1337,11 @@ bool Inkling2::project(const Block& B, const float* const* x, int n, bool quanti
         slot[j] = k;
     }
 #if defined(STRATA_GPU_METAL)
-    // A token's: native_mmvq_many() of the matrices of each type among the five (Unsloth's files mix Q8_0 with K-quants
-    // and i-quants in a layer), on the inputs quantized once; a type it does not take, lin() of each.
-    if (n == 1) {
-        if (!quantized) kernels::native_quantize_q8_1_many(xs, qs, nx, n_embd_, st_);
+    // 1 to 8 tokens: native_mmvq_many_rows() merges matrices of each type among the five (plus sink / dynamic conv taps
+    // when extras is requested), all running concurrently without barriers.
+    if (n >= 1 && n <= 8) {
+        if (!quantized) kernels::native_quantize_q8_1_many(xs, qs, nx, n_embd_ * n, st_);
+        gpu::metal::ParallelScope par(static_cast<gpu::Stream>(st_));
         bool done[5] = {};
         for (int i = 0; i < 5; ++i) {
             if (done[i]) continue;
@@ -1057,17 +1358,112 @@ bool Inkling2::project(const Block& B, const float* const* x, int n, bool quanti
             }
             m.count = c;
             if (w[i]->type != kTypeF32 && w[i]->type != kTypeBF16 &&
-                kernels::native_mmvq_many_fits((int) w[i]->type, m, n_embd_)) {
-                kernels::native_mmvq_many((int) w[i]->type, m, n_embd_, st_);
+                kernels::native_mmvq_many_rows_fits((int) w[i]->type, m, n_embd_, n)) {
+                kernels::native_mmvq_many_rows((int) w[i]->type, m, n_embd_, n, st_);
                 continue;
             }
             for (int k = 0; k < c; ++k) lin(*w[at[k]], x[from[at[k]]], y[at[k]], n, qs[slot[from[at[k]]]]);
         }
+        if (extras && B.sink.p && B.sink.scale == 1.0f &&
+            (B.swa || (B.k_dyn.p && B.v_dyn.p && B.k_dyn.scale == 1.0f && B.v_dyn.scale == 1.0f))) {
+            lin(B.sink, x[0], sink_, n, qs[slot[0]]);
+            if (!B.swa) {
+                lin(B.k_dyn, x[1], kdyn_, n, qs[slot[1]]);
+                lin(B.v_dyn, x[2], vdyn_, n, qs[slot[2]]);
+            }
+            *extras = true;
+        }
+        flush_pending_convs();
         return true;
+    }
+#endif
+#if defined(STRATA_USE_HIP)
+    // A token's on HIP: native_mmvq_many() of the matrices of each type among the five (plus sink and taps when
+    // quantized), on the inputs quantized once; a type it does not take falls back to lin() with the quantized input.
+    if (n == 1) {
+        const Dev* wa[8] = {w[0], w[1], w[2], w[3], w[4]};
+        float* ya[8] = {y[0], y[1], y[2], y[3], y[4]};
+        int fa[8] = {from[0], from[1], from[2], from[3], from[4]};
+        int count = 5;
+        const auto plain = [&](const Dev& d) {
+            return d.p && d.type != kTypeF32 && d.type != kTypeBF16 && d.n_in == n_embd_ && d.scale == 1.0f;
+        };
+        if (extras && plain(B.sink) && (B.swa || (plain(B.k_dyn) && plain(B.v_dyn)))) {
+            wa[count] = &B.sink, ya[count] = sink_, fa[count++] = 0;
+            if (!B.swa) {
+                wa[count] = &B.k_dyn, ya[count] = kdyn_, fa[count++] = 1;
+                wa[count] = &B.v_dyn, ya[count] = vdyn_, fa[count++] = 2;
+            }
+            *extras = true;
+        }
+        if (!quantized) kernels::native_quantize_q8_1_many(xs, qs, nx, n_embd_, st_);
+        bool done[8] = {};
+        for (int i = 0; i < count; ++i) {
+            if (done[i]) continue;
+            kernels::NativeMmvqMany m{};
+            int at[8], c = 0;
+            for (int j = i; j < count; ++j) {
+                if (done[j] || wa[j]->type != wa[i]->type) continue;
+                m.w[c] = wa[j]->p;
+                m.x_q8_1[c] = qs[slot[fa[j]]];
+                m.y[c] = ya[j];
+                m.n_out[c] = wa[j]->n_out;
+                at[c++] = j;
+                done[j] = true;
+            }
+            m.count = c;
+            if (wa[i]->type != kTypeF32 && wa[i]->type != kTypeBF16 &&
+                kernels::native_mmvq_many_fits((int) wa[i]->type, m, n_embd_)) {
+                kernels::native_mmvq_many((int) wa[i]->type, m, n_embd_, st_);
+                continue;
+            }
+            for (int k = 0; k < c; ++k) lin(*wa[at[k]], x[fa[at[k]]], ya[at[k]], n, qs[slot[fa[at[k]]]]);
+        }
+        return true;
+    }
+#endif
+#if !defined(STRATA_GPU_METAL)
+    if (n >= 2 && n <= 8 && mixed) {
+        const Dev* all[8] = {w[0], w[1], w[2], w[3], w[4]};
+        float* ys[8] = {y[0], y[1], y[2], y[3], y[4]};
+        int src[8] = {from[0], from[1], from[2], from[3], from[4]};
+        int count = 5;
+        const auto plain = [&](const Dev& d) {
+            return d.p && d.type != kTypeF32 && d.type != kTypeBF16 && d.n_in == n_embd_ && d.scale == 1.0f;
+        };
+        if (extras && plain(B.sink) && (B.swa || (plain(B.k_dyn) && plain(B.v_dyn)))) {
+            all[count] = &B.sink, ys[count] = sink_, src[count++] = 0;
+            if (!B.swa) {
+                all[count] = &B.k_dyn, ys[count] = kdyn_, src[count++] = 1;
+                all[count] = &B.v_dyn, ys[count] = vdyn_, src[count++] = 2;
+            }
+        }
+        const int tries[2] = {count, 5};
+        for (int t = 0; t < (count > 5 ? 2 : 1); ++t) {
+            const int c = tries[t];
+            kernels::NativeMmvqMany m{};
+            int types[8];
+            for (int i = 0; i < c; ++i) {
+                m.w[i] = all[i]->p;
+                m.x_q8_1[i] = qs[slot[src[i]]];
+                m.y[i] = ys[i];
+                m.n_out[i] = all[i]->n_out;
+                types[i] = (int) all[i]->type;
+            }
+            m.count = c;
+            if (!kernels::native_mmvq_mixed_rows_fits(types, m, n_embd_, n)) continue;
+            if (!quantized) kernels::native_quantize_q8_1_many(xs, qs, nx, n_embd_ * n, st_);
+            kernels::native_mmvq_mixed_rows(types, m, n_embd_, n, st_);
+            if (extras) *extras = c > 5;
+            return true;
+        }
     }
 #endif
     if (n > 1 || !kOneType) {   // a window's: each input quantized once, in one launch, as lin() quantizes it
         if (!quantized) kernels::native_quantize_q8_1_many(xs, qs, nx, n_embd_ * n, st_);
+#if defined(STRATA_GPU_METAL)
+        gpu::metal::ParallelScope par(static_cast<gpu::Stream>(st_));
+#endif
         bool done[5] = {};   // two products of one input a launch (lin_pair())
         for (int i = 0; i < 5; ++i) {
             if (done[i]) continue;
@@ -1078,6 +1474,17 @@ bool Inkling2::project(const Block& B, const float* const* x, int n, bool quanti
             done[i] = true;
             if (j < 5) done[j] = true;
         }
+#if defined(STRATA_GPU_METAL)
+        if (extras && B.sink.p && B.sink.scale == 1.0f &&
+            (B.swa || (B.k_dyn.p && B.v_dyn.p && B.k_dyn.scale == 1.0f && B.v_dyn.scale == 1.0f))) {
+            lin(B.sink, x[0], sink_, n, qs[slot[0]]);
+            if (!B.swa) {
+                lin(B.k_dyn, x[1], kdyn_, n, qs[slot[1]]);
+                lin(B.v_dyn, x[2], vdyn_, n, qs[slot[2]]);
+            }
+            *extras = true;
+        }
+#endif
         return true;
     }
 #if !defined(STRATA_GPU_METAL)
@@ -1131,9 +1538,8 @@ bool Inkling2::project(const Block& B, const float* const* x, int n, bool quanti
 // rows (each a token of its own sequence) the BF16 controllers' gates are a token's launch a row.
 bool Inkling2::control3(const float* const* cur, float* const* msg, const Ctrl* c, float* const* out, int n) {
     if (n >= kStageRows) return false;
-    const bool bf = c[0].down.type == kTypeBF16;   // --loop-bf16: a token's only, control() the others
-    const bool per_row = bf && rows_of_ && n > 1;
-    if (bf && !((n == 1 || per_row) && rank_ < 128)) return false;
+    const bool bf = c[0].down.type == kTypeBF16;   // --loop-bf16
+    if (bf && rank_ >= 128) return false;
     for (int j = 0; j < 3; ++j)
         for (const Dev* d : {&c[j].down, &c[j].gain, &c[j].forget})
             if (d->type != (bf ? kTypeBF16 : kTypeF32) || d->scale != 1.0f) return false;
@@ -1155,9 +1561,17 @@ bool Inkling2::control3(const float* const* cur, float* const* msg, const Ctrl* 
         ink_cat_norm_set(cur, m, cat3_, 3, n_embd_, n, st_);
         gemv_set(w, x, y, outs, 3, 2 * n_embd_, n, st_);
     }
-    if ((n == 1 || per_row) && rank_ < 128) {   // the gain and forget products and the gates in one launch
+    // The gain and forget products and the gates in one launch: a window's rows (and step()'s) get the bits a token's
+    // controllers give it alone, so a guess is checked against what the token would have been.
+    if (rank_ < 128) {
         const void* gw[3] = {c[0].gain.p, c[1].gain.p, c[2].gain.p};
         const void* fw[3] = {c[0].forget.p, c[1].forget.p, c[2].forget.p};
+#if defined(STRATA_GPU_METAL)
+        if (n > 1) {   // all rows in one launch, each bit-identical to one row
+            const float* ch[3] = {ch3_[0], ch3_[1], ch3_[2]};
+            ink_control3_gate_rows(cur, m, ch, gw, fw, out, n_embd_, rank_, n, st_, 3, bf);
+            return true;
+        }
         for (int i = 0; i < n; ++i) {   // a row at a time
             const size_t e = (size_t) i * n_embd_, r = (size_t) i * rank_;
             const float* ci[3] = {cur[0] + e, cur[1] + e, cur[2] + e};
@@ -1167,6 +1581,11 @@ bool Inkling2::control3(const float* const* cur, float* const* msg, const Ctrl* 
             ink_control3_gate(ci, mi, ch, gw, fw, oi, n_embd_, rank_, st_, 3, bf);
         }
         return true;
+#else
+        const float* ch[3] = {ch3_[0], ch3_[1], ch3_[2]};
+        ink_control3_gate_rows(cur, m, ch, gw, fw, out, n_embd_, rank_, n, st_, 3, bf);
+        return true;
+#endif
     }
     for (int j = 0; j < 3; ++j) {
         w[2 * j] = fp(c[j].gain);
@@ -1183,16 +1602,51 @@ bool Inkling2::control3(const float* const* cur, float* const* msg, const Ctrl* 
     return true;
 }
 
+void Inkling2::flush_pending_convs() {
+    if (pending_aconv_.x && pending_fconv_.x) {
+        ink_conv_state_update2(pending_aconv_.x, pending_aconv_.state, pending_aconv_.snap, pending_aconv_.rows,
+                               pending_fconv_.x, pending_fconv_.state, pending_fconv_.snap, pending_fconv_.rows,
+                               n_embd_, taps_, rec_n_, snap_bits_, st_);
+    } else if (pending_aconv_.x) {
+        ink_conv_state_update(pending_aconv_.x, pending_aconv_.state, n_embd_, taps_, pending_aconv_.rows,
+                              pending_aconv_.snap, rec_n_, snap_bits_, st_);
+    } else if (pending_fconv_.x) {
+        ink_conv_state_update(pending_fconv_.x, pending_fconv_.state, n_embd_, taps_, pending_fconv_.rows,
+                              pending_fconv_.snap, rec_n_, snap_bits_, st_);
+    }
+    pending_aconv_.x = nullptr;
+    pending_fconv_.x = nullptr;
+}
+
+void Inkling2::reset_call() {
+    pass_ = 0;
+    attn_mixed_il_ = -1;
+    attn_mixed_pass_ = 0;
+    pending_aconv_ = {};
+    pending_fconv_ = {};
+}
+
 // A layer from its input to its router's copy: the attention, the block's residual, and the experts' input.
 void Inkling2::layer_head(Layer& L, int il, int n) {
     // A call starts at its card's first layer.  A card that starts at the loop's first layer comes back to it for
     // each later pass, so it keeps the pass there: next_layer() leaves it 0 after the last pass.
-    if (il == lo_ && il != core_start_) pass_ = 0;
+    if (il == lo_ && (il != core_start_ || pass_ == 0)) {
+        if (il != core_start_) pass_ = 0;
+        attn_mixed_il_ = -1;
+        pending_aconv_ = {};
+        pending_fconv_ = {};
+#if !defined(STRATA_GPU_METAL)
+    } else if (whole_first_layers() > 0 && pass_ == 0 && il == lo_ + whole_first_layers()) {
+        attn_mixed_il_ = -1;
+        pending_aconv_ = {};
+        pending_fconv_ = {};
+#endif
+    }
     Block& B = blocks_[(size_t) il];
     if (ds_file_) {   // the drafter's features: the inputs of three layer runs
         const int visit = visit_of(il, pass_of(il));
         for (int k = 0; k < 3; ++k)
-            if (visit == ds_visit_[k]) copy_rows(r_, ds_tap_ + (size_t) k * rows_ * n_embd_, n);
+            if (visit == ds_visit_[k]) copy_rows(r_, ds_tap_ + (size_t) k * buf_rows_ * n_embd_, n);
     }
     Slot& S = slots_[(size_t) slot_of(il, pass_of(il))];
     const size_t ne = (size_t) n * n_embd_;
@@ -1223,13 +1677,13 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         copy_rows(r_, bank_out_, n);
         copy_rows(bl_[core_block], r_, n);
         const int core = core_end_ - core_start_;
-        if (n == 1 && core <= 12) {   // the pass's messages of every core layer, in one launch
+        if (n < kStageRows && core <= 12) {   // the pass's messages of every core layer, in one launch
             InkStates bank;
             if (n_bank > 0) bank.p[bank.n++] = bank_;
             bank.p[bank.n++] = bank_out_;
             const float* q[12];
             for (int k = 0; k < core; ++k) q[k] = fp(blocks_[(size_t) (core_start_ + k)].msg_query);
-            ink_mix_many(bank, q, kCtrl, msgs_.data(), core, n_embd_, st_);
+            ink_mix_many(bank, q, kCtrl, msgs_.data(), core, n_embd_, st_, n);
         }
     }
 
@@ -1240,17 +1694,22 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     // a window layer outside a later pass has one input, normed in the mix's launch
     const bool mix_normed = il > 0 && B.swa && !looped && sum_threads(n_embd_) == 1024;
     if (il > 0) {
-        float* out[3] = {in_[0], in_[1], in_[2]};
-        ink_mix_norm(streams_of((il - 1) / blk_ + 1, 0), fp(B.attn_query), B.swa ? 1 : 3, out, n_embd_, n,
-                     mix_normed ? fp(B.attn_norm) : nullptr, mix_normed ? xin_[0] : nullptr, rms_eps_, st_,
-                     mix_normed && n == 1 ? xq3_[0] : nullptr);
+        if (attn_mixed_il_ == il && attn_mixed_pass_ == pass_of(il)) {
+            attn_mixed_il_ = -1;
+        } else {
+            float* out[3] = {in_[0], in_[1], in_[2]};
+            const bool q8_mix = mix_normed && n < kStageRows;
+            ink_mix_norm(streams_of((il - 1) / blk_ + 1, 0), fp(B.attn_query), B.swa ? 1 : 3, out, n_embd_, n,
+                         mix_normed ? fp(B.attn_norm) : nullptr, mix_normed ? xin_[0] : nullptr, rms_eps_, st_,
+                         q8_mix ? xq3_[0] : nullptr);
+        }
         in[0] = in_[0];
         in[1] = B.swa ? in_[0] : in_[1];
         in[2] = B.swa ? in_[0] : in_[2];
     }
     float* const* msg = msg_;   // the pass's messages for this layer
     if (looped) {
-        if (n == 1 && core_end_ - core_start_ <= 12) {
+        if (n < kStageRows && core_end_ - core_start_ <= 12) {
             msg = msgs_.data() + (size_t) (il - core_start_) * kCtrl;
         } else {
             InkStates bank;
@@ -1268,7 +1727,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     if (B.swa && !looped) {
         if (!mix_normed) rms_norm(in[0], fp(B.attn_norm), xin_[0], n_embd_, n, rms_eps_, st_);
         x[0] = x[1] = x[2] = xin_[0];
-        quantized = mix_normed && n == 1;
+        quantized = mix_normed && n < kStageRows;
     } else {   // three inputs, normed in one launch
         const float* w[3] = {fp(B.attn_norm), fp(B.attn_norm), fp(B.attn_norm)};
         if (!B.swa) {
@@ -1278,6 +1737,9 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         }
         if (n == 1) {
             ink_norm_many_q8(in, w, xin_, xq3_, 3, n_embd_, rms_eps_, st_);
+            quantized = true;
+        } else if (n < kStageRows) {
+            ink_norm_many_q8_rows(in, w, xin_, xq3_, 3, n_embd_, n, rms_eps_, st_);
             quantized = true;
         } else {
             rms_norm_many(in, w, xin_, 3, n_embd_, n, rms_eps_, st_);
@@ -1290,25 +1752,30 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     // an output, the card's memory idle: in a whole pass's recording they run beside the Q8_0 ones, a branch off
     // the stream that it joins after them.  gemv_bf16() is lin()'s launch for them.  Not on Metal: a recording there
     // is the capturing stream's alone, so the branch's launches ran once as it was made and never in its replays (the
-    // sink and the taps stayed the recording token's), and each event committed a command buffer.
+    // sink and the taps stayed the recording token's), and each event committed a command buffer.  Not on HIP: there
+    // the branch and its join inside the recording made a token slower, not faster (UD-Q2_K_XL's BF16 sink and taps,
+    // 256 tokens after 302: RX 9070 XT 60.0 tokens/s with it, 83.7 without; RX 7800 XT 38.0 and 65.7).
     const auto plain_bf16 = [](const Dev& d) { return !d.p || (d.type == kTypeBF16 && d.scale == 1.0f); };
-#if defined(STRATA_GPU_METAL)
+#if defined(STRATA_GPU_METAL) || defined(STRATA_USE_HIP)
     constexpr bool kBranch = false;
 #else
     constexpr bool kBranch = true;
 #endif
-    const bool branch = kBranch && n == 1 && whole_rec_ && plain_bf16(B.sink) && plain_bf16(B.k_dyn) &&
-                        plain_bf16(B.v_dyn);
+    const bool branch = kBranch && n >= 1 && n < kStageRows && whole_rec_ && plain_bf16(B.sink) &&
+                        plain_bf16(B.k_dyn) && plain_bf16(B.v_dyn);
     if (branch) {
         fork();
-        gemv_bf16((const uint16_t*) B.sink.p, x[0], sink_, B.sink.n_in, B.sink.n_out, B.sink.n_out, 1, side_);
+        gemv_bf16((const uint16_t*) B.sink.p, x[0], sink_, B.sink.n_in, B.sink.n_out, B.sink.n_out, n, side_);
         if (!B.swa) {
-            gemv_bf16((const uint16_t*) B.k_dyn.p, x[1], kdyn_, B.k_dyn.n_in, B.k_dyn.n_out, B.k_dyn.n_out, 1, side_);
-            gemv_bf16((const uint16_t*) B.v_dyn.p, x[2], vdyn_, B.v_dyn.n_in, B.v_dyn.n_out, B.v_dyn.n_out, 1, side_);
+            gemv_bf16((const uint16_t*) B.k_dyn.p, x[1], kdyn_, B.k_dyn.n_in, B.k_dyn.n_out, B.k_dyn.n_out, n, side_);
+            gemv_bf16((const uint16_t*) B.v_dyn.p, x[2], vdyn_, B.v_dyn.n_in, B.v_dyn.n_out, B.v_dyn.n_out, n, side_);
         }
     }
     bool extras = false;   // the sink's and the taps' products in project()'s launch
     if (!project(B, x, n, quantized, branch ? nullptr : &extras)) {
+#if defined(STRATA_GPU_METAL)
+        flush_pending_convs();
+#endif
         lin(B.wq, x[0], q_, n);
         lin(B.wk, x[1], kraw_, n);
         lin(B.wv, x[2], vraw_, n);
@@ -1383,6 +1850,41 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
 #endif
             ink_qkv(c, st_);
         }
+    } else if (n <= kConvFew && head_dim_ <= 128 && n_rel_ <= 128) {
+        InkQkv c;
+        c.q = q_;
+        c.q_scale = fp(B.q_clip);
+        c.r = rr_;
+        c.r_scale = fp(B.rel_clip);
+        c.kraw = kraw_;
+        c.vraw = vraw_;
+        c.kstate = past_k(S);
+        c.vstate = past_v(S);
+        c.kw = fp(B.k_conv);
+        c.vw = fp(B.v_conv);
+        c.kdyn = kd;
+        c.vdyn = vd;
+        c.k = k_;
+        c.v = v_;
+        c.keys = S.keys;
+        c.vals = S.vals;
+        c.at = at;
+        c.pos = pos_;
+        c.qk_thr = qk_clip_;
+        c.rel_thr = rel_clip_;
+        c.alpha = alpha;
+        c.floor = log_floor_;
+        c.eps = rms_eps_;
+        c.n_head = n_head_;
+        c.n_kv = n_kv_;
+        c.dim = head_dim_;
+        c.n_rel = n_rel_;
+        c.taps = taps_;
+        c.ring = B.swa ? ring_ : 0;
+        c.kv8 = kv8_;
+        c.kvq8 = kvq8_;
+        ink_qkv_win(c, n, snap_bits_ ? snap_of(past_k(S)) : nullptr, snap_bits_ ? snap_of(past_v(S)) : nullptr, rec_n_,
+                    snap_bits_, st_);
     } else {
         if (n <= kConvFew) {   // a window's K and V convolutions in one launch
             InkConv ck, cv;
@@ -1451,6 +1953,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     // STRATA_KV_INT8 for decode only: a token alone or a window's (guessed tokens checked), not a prompt's rows,
     // which a chunk of fewer than kStageRows also brings here (a short turn, the end of a long prompt)
     a.int8_dot = int8_dot_ && (n == 1 || windowed_);
+    bool att_q8 = false;
     if (rows_launch) {   // step()'s rows: each over its own sequence's caches, at its position, as it is alone
 #if !defined(STRATA_GPU_METAL)
         InkAttnRows c;
@@ -1487,7 +1990,10 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
             b.at = at ? at + 2 * i : nullptr;
             b.room = at ? room(1) : 0;
             b.rows = 1;
-            if (n == 1) b.q8 = xqo_;   // and the output quantized for wo
+            if (n == 1) {
+                b.q8 = xqo_;   // and the output quantized for wo
+                att_q8 = true;
+            }
             ink_attend(b, st_);
         }
         pos_ = keep;
@@ -1517,11 +2023,117 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
                      kw, kw ? kw + kvw_halves_ : nullptr, kvw_halves_, zeros_, nullptr, &bias);
         ink_mul_sigmoid(att_, gate_, (size_t) n * hq, st_);
     } else {
-        if (n == 1) a.q8 = xqo_;   // and the output quantized for wo
+        if (n <= kConvFew) {
+            a.q8 = xqo_;   // and the output quantized for wo
+            att_q8 = true;
+        }
         ink_attend(a, st_);
     }
-    lin(B.wo, att_, aoraw_, n, n == 1 && n < kStageRows ? xqo_ : nullptr);
+    lin(B.wo, att_, aoraw_, n, att_q8 ? xqo_ : nullptr);
     // the first layer of a block starts a new stream from the attention's output; the one it had joins the mixes
+#if defined(STRATA_GPU_METAL)
+    if (n == 1 && !per_row && n_embd_ <= 4096) {
+        const int mode = il % blk_ != 0 ? 0 : il == core_start_ && looped ? 2 : 1;
+        float* const keep = mode == 1 ? bl_[il / blk_] : nullptr;
+        float* mixed[1] = {mixf_};
+        const bool ffn_normed = !looped && sum_threads(n_embd_) == 1024;
+        ink_conv_mix(aoraw_, past_a(run_slot(il, 0)), fp(B.a_conv), ao_, r_, keep, 1.f, mode, taps_,
+                     streams_of(il / blk_ + 1, 0), fp(B.ffn_query), 1, mixed, n_embd_,
+                     ffn_normed ? fp(B.ffn_norm) : nullptr, ffn_normed ? xn_ : nullptr, rms_eps_, st_,
+                     ffn_normed ? xq_ : nullptr);
+        dbg("attn", il, ao_, n_embd_);
+        if (!ffn_normed) {
+            bool ffn_done = looped && n < kStageRows && control_ffn(msg[3], B.ctrl[3], B, 1);
+            if (!ffn_done) {
+                if (looped) control(mixf_, msg[3], B.ctrl[3], mixf_, n);
+                kernels::native_add_rms_norm_q8_1(mixf_, nullptr, fp(B.ffn_norm), xn_, xq_, n_embd_, n, rms_eps_,
+                                                  sum_threads(n_embd_), st_);
+            }
+        }
+        dbg("ffn_in", il, xn_, n_embd_);
+        if (!batched(L, n)) moe_router(L, n);
+        return;
+    }
+    if (n > 1 && n <= kConvFew && !per_row && n_embd_ <= 4096) {
+        const int mode = il % blk_ != 0 ? 0 : il == core_start_ && looped ? 2 : 1;
+        float* const keep = mode == 1 ? bl_[il / blk_] : nullptr;
+        float* mixed[1] = {mixf_};
+        const bool ffn_normed = !looped && sum_threads(n_embd_) == 1024;
+        ink_conv_mix_rows(aoraw_, past_a(S), fp(B.a_conv), ao_, r_, keep, 1.f, mode, taps_,
+                          streams_of(il / blk_ + 1, 0), fp(B.ffn_query), 1, mixed, n_embd_, n,
+                          ffn_normed ? fp(B.ffn_norm) : nullptr, ffn_normed ? xn_ : nullptr, rms_eps_, st_,
+                          ffn_normed ? xq_ : nullptr);
+        dbg("attn", il, ao_, n_embd_);
+        if (!ffn_normed) {
+            bool ffn_done = looped && n < kStageRows && control_ffn(msg[3], B.ctrl[3], B, n);
+            if (!ffn_done) {
+                if (looped) control(mixf_, msg[3], B.ctrl[3], mixf_, n);
+                kernels::native_add_rms_norm_q8_1(mixf_, nullptr, fp(B.ffn_norm), xn_, xq_, n_embd_, n, rms_eps_,
+                                                  sum_threads(n_embd_), st_);
+            }
+        }
+        dbg("ffn_in", il, xn_, n_embd_);
+        if (moe_sum_later(n) && L.moe) {
+            pending_aconv_ = {aoraw_, past_a(S), snap_bits_ ? snap_of(past_a(S)) : nullptr, n};
+        } else {
+            ink_conv_state_update(aoraw_, past_a(S), n_embd_, taps_, n, snap_bits_ ? snap_of(past_a(S)) : nullptr,
+                                  rec_n_, snap_bits_, st_);
+        }
+        if (!batched(L, n)) moe_router(L, n);
+        return;
+    }
+#else
+    if (n == 1 && !per_row && n_embd_ <= 3072 && sum_threads(n_embd_) == 1024) {
+        const int mode = il % blk_ != 0 ? 0 : il == core_start_ && looped ? 2 : 1;
+        float* const keep = mode == 1 ? bl_[il / blk_] : nullptr;
+        float* mixed[1] = {mixf_};
+        const bool ffn_normed = !looped;
+        ink_conv_mix(aoraw_, past_a(run_slot(il, 0)), fp(B.a_conv), ao_, r_, keep, 1.f, mode, taps_,
+                     streams_of(il / blk_ + 1, 0), fp(B.ffn_query), 1, mixed, n_embd_,
+                     ffn_normed ? fp(B.ffn_norm) : nullptr, ffn_normed ? xn_ : nullptr, rms_eps_, st_,
+                     ffn_normed ? xq_ : nullptr, ffn_normed);
+        dbg("attn", il, ao_, n_embd_);
+        if (!ffn_normed) {
+            const bool ffn_done = looped && control_ffn(msg[3], B.ctrl[3], B, 1);
+            if (!ffn_done) {
+                if (looped) control(mixf_, msg[3], B.ctrl[3], mixf_, n);
+                kernels::native_add_rms_norm_q8_1(mixf_, nullptr, fp(B.ffn_norm), xn_, xq_, n_embd_, n, rms_eps_,
+                                                  sum_threads(n_embd_), st_);
+            }
+        }
+        dbg("ffn_in", il, xn_, n_embd_);
+        if (!batched(L, n)) moe_router(L, n);
+        return;
+    }
+    if (n > 1 && n <= kConvFew && !per_row && n_embd_ <= 3072 && sum_threads(n_embd_) == 1024) {
+        const int mode = il % blk_ != 0 ? 0 : il == core_start_ && looped ? 2 : 1;
+        float* const keep = mode == 1 ? bl_[il / blk_] : nullptr;
+        float* mixed[1] = {mixf_};
+        const bool ffn_normed = !looped;
+        ink_conv_mix_rows(aoraw_, past_a(S), fp(B.a_conv), ao_, r_, keep, 1.f, mode, taps_,
+                          streams_of(il / blk_ + 1, 0), fp(B.ffn_query), 1, mixed, n_embd_, n,
+                          ffn_normed ? fp(B.ffn_norm) : nullptr, ffn_normed ? xn_ : nullptr, rms_eps_, st_,
+                          ffn_normed ? xq_ : nullptr, ffn_normed);
+        dbg("attn", il, ao_, n_embd_);
+        if (!ffn_normed) {
+            const bool ffn_done = looped && control_ffn(msg[3], B.ctrl[3], B, n);
+            if (!ffn_done) {
+                if (looped) control(mixf_, msg[3], B.ctrl[3], mixf_, n);
+                kernels::native_add_rms_norm_q8_1(mixf_, nullptr, fp(B.ffn_norm), xn_, xq_, n_embd_, n, rms_eps_,
+                                                  sum_threads(n_embd_), st_);
+            }
+        }
+        dbg("ffn_in", il, xn_, n_embd_);
+        if (moe_sum_later(n) && L.moe) {
+            pending_aconv_ = {aoraw_, past_a(S), snap_bits_ ? snap_of(past_a(S)) : nullptr, n};
+        } else {
+            ink_conv_state_update(aoraw_, past_a(S), n_embd_, taps_, n, snap_bits_ ? snap_of(past_a(S)) : nullptr,
+                                  rec_n_, snap_bits_, st_);
+        }
+        if (!batched(L, n)) moe_router(L, n);
+        return;
+    }
+#endif
     if (n == 1 || per_row) {   // the convolution and the stream's update in one launch (a launch a row of step()'s)
         const int mode = il % blk_ != 0 ? 0 : il == core_start_ && looped ? 2 : 1;
         float* const keep = mode == 1 ? bl_[il / blk_] : nullptr;
@@ -1562,14 +2174,15 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
 
     // the experts' input
     float* mixed[1] = {mixf_};
-    if (n == 1 && !looped && sum_threads(n_embd_) == 1024) {   // the mix, add_rms_norm_q8_1's norm and quantization
+    const bool ffn_mix_q8 = n < kStageRows && !looped && sum_threads(n_embd_) == 1024;
+    if (ffn_mix_q8) {   // the mix, add_rms_norm_q8_1's norm and quantization
         ink_mix_norm(streams_of(il / blk_ + 1, 0), fp(B.ffn_query), 1, mixed, n_embd_, n, fp(B.ffn_norm), xn_,
                      rms_eps_, st_, xq_, true);
     } else {
         ink_mix(streams_of(il / blk_ + 1, 0), fp(B.ffn_query), 1, mixed, n_embd_, n, st_);
-        // a token's controller (step()'s rows: a row at a time; each takes it or none does)
-        bool ffn_done = looped && (n == 1 || per_row) && control_ffn(msg[3], B.ctrl[3], B, 0);
-        for (int i = 1; i < n && ffn_done; ++i) control_ffn(msg[3], B.ctrl[3], B, i);
+        // a token's controller, a row at a time for a window's rows and step()'s (each takes it or none does): each
+        // row the bits it gets alone
+        const bool ffn_done = looped && n < kStageRows && control_ffn(msg[3], B.ctrl[3], B, n);
         if (!ffn_done) {
             if (looped) control(mixf_, msg[3], B.ctrl[3], mixf_, n);
             kernels::native_add_rms_norm_q8_1(mixf_, nullptr, fp(B.ffn_norm), xn_, xq_, n_embd_, n, rms_eps_,
@@ -1583,16 +2196,128 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
 // The experts' sum through its convolution, onto the stream; after the last layer, the drafter's features.
 void Inkling2::layer_tail(Layer&, int il, int n) {
     tail_rows(il, n);
+    if (loopcd_hidden_ != 0.f && il == core_end_ - 1) {
+        const int core_block = core_start_ / blk_;
+        const int n_bank = (core_end_ - core_start_) / blk_ - 1;
+        if (pass_ == 0) {
+            copy_rows(r_, cd_h1_, n);
+            if (n_bank > 0) copy_rows(bl_[core_block + 1], cd_bl2_, n);
+        } else if (pass_ == n_pass_ - 1) {
+            const size_t ne = (size_t) n * n_embd_;
+            ink_loopcd_extrap(r_, cd_h1_, loopcd_hidden_, ne, st_);
+            if (n_bank > 0) ink_loopcd_extrap(bl_[core_block + 1], cd_bl2_, loopcd_hidden_, ne, st_);
+        }
+    }
     if (ds_file_ && il == n_layer_ - 1) ds_commit(n);
 }
 
 void Inkling2::tail_rows(int il, int n) {
     const Slot& S = slots_[(size_t) slot_of(il, pass_of(il))];
-    if (n == 1 && std::exchange(moe_left_, false)) {   // moe_card() left the experts' sum here
+    if (std::exchange(moe_left_, false)) {   // moe_card() left the experts' sum here
+#if defined(STRATA_GPU_METAL)
+        const bool loop_restart = il == core_end_ - 1 && pass_ + 1 < n_pass_;
+        const bool cd_block_fuse = loopcd_hidden_ != 0.f && il == core_end_ - 1;
+        const int next_il = il + 1;
+        if (n > 1) {
+            if (n <= kConvFew && whole_rec_ && !rows_of_ && !loop_restart && !cd_block_fuse && next_il < hi_ && n_embd_ <= 4096) {
+                const Block& NB = blocks_[(size_t) next_il];
+                const int next_pass = next_il >= core_start_ && next_il < core_end_ ? pass_ : 0;
+                const bool next_looped = next_pass > 0;
+                const bool next_mix_normed = NB.swa && !next_looped && sum_threads(n_embd_) == 1024;
+                float* out[3] = {in_[0], in_[1], in_[2]};
+                ink_moe_sum_rows(d_, d_wts_, moe_left_scale_, d_ids_, n_used_, fo_, n_embd_, n, st_);
+                ink_conv_mix_rows(fo_, past_f(S), fp(blocks_[(size_t) il].f_conv), fc_, r_, nullptr, 1.f, 0, taps_,
+                                  streams_of((next_il - 1) / blk_ + 1, 0), fp(NB.attn_query), NB.swa ? 1 : 3, out,
+                                  n_embd_, n, next_mix_normed ? fp(NB.attn_norm) : nullptr,
+                                  next_mix_normed ? xin_[0] : nullptr, rms_eps_, st_,
+                                  next_mix_normed ? xq3_[0] : nullptr);
+                pending_fconv_ = {fo_, past_f(S), snap_bits_ ? snap_of(past_f(S)) : nullptr, n};
+                attn_mixed_il_ = next_il;
+                attn_mixed_pass_ = next_pass;
+                return;
+            }
+            if (pending_aconv_.x) {
+                gpu::metal::ParallelScope par(static_cast<gpu::Stream>(st_));
+                flush_pending_convs();
+                ink_moe_conv_add_rows(d_, d_wts_, moe_left_scale_, d_ids_, n_used_, fo_, past_f(S),
+                                      fp(blocks_[(size_t) il].f_conv), fc_, r_, 1.f, n_embd_, taps_, n, st_,
+                                      snap_of(past_f(S)), rec_n_, snap_bits_);
+                return;
+            }
+            ink_moe_conv_add_rows(d_, d_wts_, moe_left_scale_, d_ids_, n_used_, fo_, past_f(S),
+                                  fp(blocks_[(size_t) il].f_conv), fc_, r_, 1.f, n_embd_, taps_, n, st_,
+                                  snap_of(past_f(S)), rec_n_, snap_bits_);
+            return;
+        }
+        if (whole_rec_ && !loop_restart && !cd_block_fuse && next_il < hi_ && n_embd_ <= 4096) {
+            const Block& NB = blocks_[(size_t) next_il];
+            const int next_pass = next_il >= core_start_ && next_il < core_end_ ? pass_ : 0;
+            const bool next_looped = next_pass > 0;
+            const bool next_mix_normed = NB.swa && !next_looped && sum_threads(n_embd_) == 1024;
+            float* out[3] = {in_[0], in_[1], in_[2]};
+            ink_moe_conv_mix(d_, d_wts_, moe_left_scale_, d_ids_, n_used_, fo_, past_f(run_slot(il, 0)),
+                             fp(blocks_[(size_t) il].f_conv), fc_, r_, 1.f, taps_,
+                             streams_of((next_il - 1) / blk_ + 1, 0), fp(NB.attn_query), NB.swa ? 1 : 3, out, n_embd_,
+                             next_mix_normed ? fp(NB.attn_norm) : nullptr, next_mix_normed ? xin_[0] : nullptr,
+                             rms_eps_, st_, next_mix_normed ? xq3_[0] : nullptr);
+            attn_mixed_il_ = next_il;
+            attn_mixed_pass_ = next_pass;
+            return;
+        }
+#else
+        const bool loop_restart = il == core_end_ - 1 && pass_ + 1 < n_pass_;
+        const int next_il = il + 1;
+        const bool graph_split = whole_first_layers() > 0 && pass_ == 0 && next_il == lo_ + whole_first_layers();
+        const bool can_fuse_next = whole_rec_ && !rows_of_ && !loop_restart && !graph_split && next_il < hi_ &&
+                                   !(loopcd_hidden_ != 0.f && il == core_end_ - 1) &&
+                                   n_embd_ <= 3072 && sum_threads(n_embd_) == 1024;
+        if (n > 1) {
+            if (n <= kConvFew && can_fuse_next) {
+                const Block& NB = blocks_[(size_t) next_il];
+                const int next_pass = next_il >= core_start_ && next_il < core_end_ ? pass_ : 0;
+                const bool next_looped = next_pass > 0;
+                const bool next_mix_normed = NB.swa && !next_looped;
+                float* out[3] = {in_[0], in_[1], in_[2]};
+                ink_moe_sum_rows(d_, d_wts_, moe_left_scale_, d_ids_, n_used_, fo_, n_embd_, n, st_);
+                ink_conv_mix_rows(fo_, past_f(S), fp(blocks_[(size_t) il].f_conv), fc_, r_, nullptr, 1.f, 0, taps_,
+                                  streams_of((next_il - 1) / blk_ + 1, 0), fp(NB.attn_query), NB.swa ? 1 : 3, out,
+                                  n_embd_, n, next_mix_normed ? fp(NB.attn_norm) : nullptr,
+                                  next_mix_normed ? xin_[0] : nullptr, rms_eps_, st_,
+                                  next_mix_normed ? xq3_[0] : nullptr, false);
+                pending_fconv_ = {fo_, past_f(S), snap_bits_ ? snap_of(past_f(S)) : nullptr, n};
+                flush_pending_convs();
+                attn_mixed_il_ = next_il;
+                attn_mixed_pass_ = next_pass;
+                return;
+            }
+            flush_pending_convs();
+            ink_moe_conv_add_rows(d_, d_wts_, moe_left_scale_, d_ids_, n_used_, fo_, past_f(S),
+                                  fp(blocks_[(size_t) il].f_conv), fc_, r_, 1.f, n_embd_, taps_, n, st_,
+                                  snap_bits_ ? snap_of(past_f(S)) : nullptr, rec_n_, snap_bits_);
+            return;
+        }
+        flush_pending_convs();
+        if (can_fuse_next) {
+            const Block& NB = blocks_[(size_t) next_il];
+            const int next_pass = next_il >= core_start_ && next_il < core_end_ ? pass_ : 0;
+            const bool next_looped = next_pass > 0;
+            const bool next_mix_normed = NB.swa && !next_looped;
+            float* out[3] = {in_[0], in_[1], in_[2]};
+            ink_moe_conv_mix(d_, d_wts_, moe_left_scale_, d_ids_, n_used_, fo_, past_f(run_slot(il, 0)),
+                             fp(blocks_[(size_t) il].f_conv), fc_, r_, 1.f, taps_,
+                             streams_of((next_il - 1) / blk_ + 1, 0), fp(NB.attn_query), NB.swa ? 1 : 3, out, n_embd_,
+                             next_mix_normed ? fp(NB.attn_norm) : nullptr, next_mix_normed ? xin_[0] : nullptr,
+                             rms_eps_, st_, next_mix_normed ? xq3_[0] : nullptr);
+            attn_mixed_il_ = next_il;
+            attn_mixed_pass_ = next_pass;
+            return;
+        }
+#endif
         ink_moe_conv_add(d_, d_wts_, moe_left_scale_, d_ids_, n_used_, fo_, past_f(run_slot(il, 0)),
                          fp(blocks_[(size_t) il].f_conv), fc_, r_, 1.f, n_embd_, taps_, st_);
         return;
     }
+    flush_pending_convs();
     if (n == 1 || rows_of_) {   // step()'s rows: each with its own sequence's state, in one launch
 #if !defined(STRATA_GPU_METAL)
         if (rows_of_ && n > 1) {
@@ -1620,6 +2345,21 @@ void Inkling2::tail_rows(int il, int n) {
     ink_conv(fo_, past_f(S), fp(blocks_[(size_t) il].f_conv), nullptr, fc_, n_embd_, 1, taps_, n, st_,
              snap_of(past_f(S)), rec_n_, snap_bits_);
     axpy(fc_, 1.f, r_, n * n_embd_, true, st_);
+}
+
+int Inkling2::swap_half() const {
+    static const int half = [] {
+        const char* v = std::getenv("STRATA_SWAP_HALF");
+        if (!v || !v[0]) return 32;
+        const int n = std::atoi(v);
+        if (n < 1 || n > 65536) {
+            std::fprintf(stderr, "strata-poly: STRATA_SWAP_HALF=%s is not 1 to 65536 tokens: the default, 32\n", v);
+            return 32;
+        }
+        std::fprintf(stderr, "strata-poly: the expert cache's uses halve every %d tokens (STRATA_SWAP_HALF)\n", n);
+        return n;
+    }();
+    return half;
 }
 
 // After the core's last layer, its first again, until the passes are done.  Called for every layer a call runs,
@@ -1747,14 +2487,37 @@ size_t Inkling2::extra_bytes() const {
 }
 
 // On a layer split the next card goes on from these and r_: what crosses is the stream, the four blocks' starts the
-// mixes read and the loop's bank (64.5 KB a token at Inkling 2 Mini's width).
-float* Inkling2::carried(int i) { return i < kBlocks ? bl_[i] : i == kBlocks ? bank_ : bank_out_; }
+// mixes read, the loop's bank and the drafter's taps (ds_tap_).
+float* Inkling2::carried(int i) {
+    if (i < kBlocks) return bl_[i];
+    if (i == kBlocks) return bank_;
+    if (i == kBlocks + 1) return bank_out_;
+    int k = i - (kBlocks + 2);
+    if (ds_file_) {
+        if (k < kDsTaps) return ds_tap_ ? ds_tap_ + (size_t) k * buf_rows_ * n_embd_ : nullptr;
+        k -= kDsTaps;
+    }
+    if (loopcd_hidden_ != 0.f) {
+        if (k == 0) return cd_h1_;
+        if (k == 1) return cd_bl2_;
+    }
+    return nullptr;
+}
 
 void Inkling2::carry_at(float* at) {
     const auto place = [&](int i) { return at ? at + (size_t) i * rows_ * n_embd_ : home_[i]; };
     for (int i = 0; i < kBlocks; ++i) bl_[i] = place(i);
     bank_ = place(kBlocks);
     bank_out_ = place(kBlocks + 1);
+    int off = kBlocks + 2;
+    if (ds_file_) {
+        ds_tap_ = at ? at + (size_t) off * rows_ * n_embd_ : ds_home_;
+        off += kDsTaps;
+    }
+    if (loopcd_hidden_ != 0.f) {
+        cd_h1_ = at ? at + (size_t) off * rows_ * n_embd_ : cd_home_[0];
+        cd_bl2_ = at ? at + (size_t) (off + 1) * rows_ * n_embd_ : cd_home_[1];
+    }
 }
 
 void Inkling2::save_layer(int il, int64_t pos, uint8_t* dst) { save_slots(il, -1, pos, dst); }
@@ -1833,6 +2596,16 @@ void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, i
     if (from < 0 || first < from || n < 0 || first + n > from + count || first + n > opt_.max_context)
         throw std::logic_error("load_rows: the rows are outside what was saved");
     cover(first + n);
+#if !defined(STRATA_GPU_METAL)
+    // The drafter's full layers' rows are not saved with a conversation: those of the rows brought back may be VRAM
+    // the expert cache had (cover() maps it again), whose bytes can read as NaN halves.  Zeros, as fresh VRAM had.
+    for (const DsLayer& L : ds_)
+        if (!L.swa && L.keys && L.vals && n > 0) {
+            const size_t cell = (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
+            for (uint16_t* c : {L.keys, L.vals})
+                ck(cudaMemsetAsync((uint8_t*) c + (size_t) first * cell, 0, (size_t) n * cell, cs(st_)), "load rows");
+        }
+#endif
     ck(cudaStreamSynchronize(cs(st_)), "load rows");
     const size_t row = kv_row();
     for (const Slot& s : slots_) {

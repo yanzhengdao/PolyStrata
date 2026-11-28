@@ -345,40 +345,16 @@ __device__ __forceinline__ void mix_row(const MixArgs& a, int n_embd) {
 
 constexpr int kMixHeld = 3;   // the values of a row a thread of mix_held() holds: rows of up to 3 * kMixThreads
 
-// mix_row() for NS states and NQ queries, a row of up to kMixHeld * kMixThreads values: a thread keeps the states'
-// values it reads, and the outputs it writes, for what comes after (the outputs and the norm) instead of reading
-// them again.  Every sum is mix_row()'s, term for term and in its order.
+// mix_held()'s reduction, softmax, output writes and optional norm/q8, shared by mix_held, ink_conv_mix,
+// ink_conv_mix_rows and ink_moe_conv_mix.  Every sum is mix_row()'s, term for term and in its order.
 template <int NS, int NQ>
-__device__ __forceinline__ void mix_held(const MixArgs& a, int n_embd) {
+__device__ __forceinline__ void mix_finish_held(const MixArgs& a, const float (&x)[kMixHeld][NS],
+                                                float (&sum)[NS][1 + NQ], int n_embd) {
     __shared__ float part[InkStates::kMax * kMixSums][kMixThreads / WARP];
     __shared__ float whole[InkStates::kMax * kMixSums];
     __shared__ float coef[InkStates::kMax * kQueries];
     const size_t row = size_t(blockIdx.x) * n_embd;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    float x[kMixHeld][NS];
-    float sum[NS][1 + NQ];
-#pragma unroll
-    for (int s = 0; s < NS; ++s) {
-#pragma unroll
-        for (int k = 0; k <= NQ; ++k) sum[s][k] = 0.0f;
-    }
-#pragma unroll
-    for (int h = 0; h < kMixHeld; ++h) {
-        const int i = tid + h * kMixThreads;
-        if (i < n_embd) {
-            float q[NQ];
-#pragma unroll
-            for (int j = 0; j < NQ; ++j) q[j] = a.query[size_t(j) * n_embd + i];
-#pragma unroll
-            for (int s = 0; s < NS; ++s) {
-                const float v = a.s[s][row + i];
-                x[h][s] = v;
-                sum[s][0] += v * v;
-#pragma unroll
-                for (int j = 0; j < NQ; ++j) sum[s][1 + j] += v * q[j];
-            }
-        }
-    }
 #pragma unroll
     for (int s = 0; s < NS; ++s) {
 #pragma unroll
@@ -469,6 +445,40 @@ __device__ __forceinline__ void mix_held(const MixArgs& a, int n_embd) {
             if (a.q8) q8_put(a.q8 + size_t(blockIdx.x) * (n_embd / 32), i, y);
         }
     }
+}
+
+// mix_row() for NS states and NQ queries, a row of up to kMixHeld * kMixThreads values: a thread keeps the states'
+// values it reads, and the outputs it writes, for what comes after (the outputs and the norm) instead of reading
+// them again.  Every sum is mix_row()'s, term for term and in its order.
+template <int NS, int NQ>
+__device__ __forceinline__ void mix_held(const MixArgs& a, int n_embd) {
+    const size_t row = size_t(blockIdx.x) * n_embd;
+    const int tid = threadIdx.x;
+    float x[kMixHeld][NS];
+    float sum[NS][1 + NQ];
+#pragma unroll
+    for (int s = 0; s < NS; ++s) {
+#pragma unroll
+        for (int k = 0; k <= NQ; ++k) sum[s][k] = 0.0f;
+    }
+#pragma unroll
+    for (int h = 0; h < kMixHeld; ++h) {
+        const int i = tid + h * kMixThreads;
+        if (i < n_embd) {
+            float q[NQ];
+#pragma unroll
+            for (int j = 0; j < NQ; ++j) q[j] = a.query[size_t(j) * n_embd + i];
+#pragma unroll
+            for (int s = 0; s < NS; ++s) {
+                const float v = a.s[s][row + i];
+                x[h][s] = v;
+                sum[s][0] += v * v;
+#pragma unroll
+                for (int j = 0; j < NQ; ++j) sum[s][1 + j] += v * q[j];
+            }
+        }
+    }
+    mix_finish_held<NS, NQ>(a, x, sum, n_embd);
 }
 
 // mix_held() where it takes the row, else mix_row()
@@ -634,6 +644,84 @@ __global__ void __launch_bounds__(kDownThreads) ink_ctrl_down_kernel(CtrlDown d,
         d.y[j][size_t(blockIdx.y) * rank + o] = sum;
     }
 }
+
+#if !defined(__HIPCC__)
+// Multi-row (2..8) templated ink_ctrl_down_kernel: reads each down-matrix weight ONCE across ROWS tokens with zero
+// stack spills (compile-time ROWS unroll), keeping the exact norm/dot/reduction order per row (0 ULP).
+template <typename W, int ROWS>
+__global__ void __launch_bounds__(kDownThreads) ink_ctrl_down_rows_kernel(CtrlDown d, int n_embd, int rank) {
+    pdl_trigger();
+    pdl_wait();
+    __shared__ float pa[kCatThreads / WARP], pb[kCatThreads / WARP], part[32];
+    __shared__ float sia[ROWS], sib[ROWS];
+    const int j = blockIdx.x / rank, o = blockIdx.x % rank, tid = threadIdx.x;
+    const float* __restrict__ cur_base = j == 0 ? d.cur[0] : (j == 1 ? d.cur[1] : d.cur[2]);
+    const float* __restrict__ msg_base = j == 0 ? d.msg[0] : (j == 1 ? d.msg[1] : d.msg[2]);
+    const W* __restrict__ wr =
+        static_cast<const W*>(j == 0 ? d.w[0] : (j == 1 ? d.w[1] : d.w[2])) + size_t(o) * 2 * n_embd;
+    float* __restrict__ y_base = j == 0 ? d.y[0] : (j == 1 ? d.y[1] : d.y[2]);
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        if (tid < kCatThreads) {
+            const size_t roff = size_t(r) * n_embd;
+            float a, b;
+            cat_squares(cur_base + roff, msg_base + roff, n_embd, tid, a, b);
+            a = warp_sum(a);
+            b = warp_sum(b);
+            if ((tid & 31) == 0) pa[tid >> 5] = a, pb[tid >> 5] = b;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float sa = 0.0f, sb = 0.0f;
+            for (int k = 0; k < kCatThreads / WARP; ++k) sa += pa[k];
+            for (int k = 0; k < kCatThreads / WARP; ++k) sb += pb[k];
+            sia[r] = cat_scale(sa, n_embd);
+            sib[r] = cat_scale(sb, n_embd);
+        }
+        __syncthreads();
+    }
+    const int n_in = 2 * n_embd;
+    float acc0[ROWS], acc1[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) acc0[r] = 0.0f, acc1[r] = 0.0f;
+    for (int i = tid; i < n_in; i += 2 * kDownThreads) {
+        const float w0 = wval(wr, i);
+        if (i < n_embd) {
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) acc0[r] += w0 * (cur_base[size_t(r) * n_embd + i] * sia[r]);
+        } else {
+            const int im = i - n_embd;
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) acc0[r] += w0 * (msg_base[size_t(r) * n_embd + im] * sib[r]);
+        }
+        const int i1 = i + kDownThreads;
+        if (i1 < n_in) {
+            const float w1 = wval(wr, i1);
+            if (i1 < n_embd) {
+#pragma unroll
+                for (int r = 0; r < ROWS; ++r) acc1[r] += w1 * (cur_base[size_t(r) * n_embd + i1] * sia[r]);
+            } else {
+                const int im1 = i1 - n_embd;
+#pragma unroll
+                for (int r = 0; r < ROWS; ++r) acc1[r] += w1 * (msg_base[size_t(r) * n_embd + im1] * sib[r]);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        const float a0 = warp_sum(acc0[r]);
+        const float a1 = warp_sum(acc1[r]);
+        if ((tid & 31) == 0) part[tid >> 5] = a0, part[(tid >> 5) + kDownThreads / WARP] = a1;
+        __syncthreads();
+        if (tid == 0) {
+            float sum = 0.0f;
+            for (int k = 0; k < 2 * kDownThreads / WARP; ++k) sum += part[k];
+            y_base[size_t(r) * rank + o] = sum;
+        }
+        __syncthreads();
+    }
+}
+#endif
 
 // STRATA_INK_FAST_CTRL=1 (opt-in, other bits): ink_ctrl_down_kernel in one pass over cur and msg.  An output's block
 // of kFastDownThreads takes, in one read of the two rows, the down row's products with cur and with msg and the two
@@ -921,6 +1009,281 @@ __global__ void ink_moe_conv_add_kernel(const float* x, const float* w, const fl
     acc[i] = acc[i] + y * a;
 }
 
+__global__ void ink_moe_conv_add_rows_kernel(const float* x, const float* w, const float* __restrict__ scale,
+                                             const int* ids, int n_used, float* fo, float* state,
+                                             const float* __restrict__ cw, float* __restrict__ out, float* acc, float a,
+                                             int channels, int taps, int rows, float norm, float* snap,
+                                             size_t snap_stride, unsigned snap_bits) {
+    pdl_trigger();
+    pdl_wait();
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= channels) return;
+    for (int t = 0; t < rows; ++t) {
+        float s = 0.0f;
+        const int base = t * n_used;
+        for (int k = 0; k < n_used; ++k) {
+            const float wk = scale ? w[base + k] * scale[ids[base + k]] : w[base + k];
+            s += wk * x[size_t(base + k) * channels + i];
+        }
+        const size_t idx = size_t(t) * channels + i;
+        fo[idx] = 0.0f + s;
+        const float y = conv_value(fo, state, cw, nullptr, channels, 1, taps, t, i, norm);
+        out[idx] = y;
+        acc[idx] = acc[idx] + y * a;
+    }
+    if (snap && snap_bits) {
+        int k = 0;
+        for (unsigned b = snap_bits; b; b &= b - 1, ++k)
+            conv_state_into(fo, state, snap + size_t(k) * snap_stride, channels, taps, __ffs(b), i);
+    }
+    conv_state_at(fo, state, channels, taps, rows, i);
+}
+
+__global__ void ink_moe_sum_rows_kernel(const float* x, const float* w, const float* __restrict__ scale, const int* ids,
+                                        int n_used, float* fo, int channels, int rows) {
+    pdl_trigger();
+    pdl_wait();
+    const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= size_t(rows) * channels) return;
+    const int t = int(idx / channels), i = int(idx % channels);
+    float s = 0.0f;
+    const int base = t * n_used;
+    for (int k = 0; k < n_used; ++k) {
+        const float wk = scale ? w[base + k] * scale[ids[base + k]] : w[base + k];
+        s += wk * x[size_t(base + k) * channels + i];
+    }
+    fo[idx] = 0.0f + s;
+}
+
+__global__ void ink_conv_state_update_kernel(const float* __restrict__ x, float* state, float* snap, size_t stride,
+                                             unsigned bits, int channels, int taps, int rows) {
+    pdl_trigger();
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    if (snap && bits) {
+        int k = 0;
+        for (unsigned b = bits; b; b &= b - 1, ++k)
+            conv_state_into(x, state, snap + size_t(k) * stride, channels, taps, __ffs(b), c);
+    }
+    conv_state_at(x, state, channels, taps, rows, c);
+}
+
+__global__ void ink_conv_state_update2_kernel(const float* __restrict__ x0, float* state0, float* snap0, int rows0,
+                                              const float* __restrict__ x1, float* state1, float* snap1, int rows1,
+                                              size_t stride, unsigned bits, int channels, int taps) {
+    pdl_trigger();
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const float* x = blockIdx.y ? x1 : x0;
+    float* state = blockIdx.y ? state1 : state0;
+    float* snap = blockIdx.y ? snap1 : snap0;
+    const int rows = blockIdx.y ? rows1 : rows0;
+    if (snap && bits) {
+        int k = 0;
+        for (unsigned b = bits; b; b &= b - 1, ++k)
+            conv_state_into(x, state, snap + size_t(k) * stride, channels, taps, __ffs(b), c);
+    }
+    conv_state_at(x, state, channels, taps, rows, c);
+}
+
+struct ConvMixArgs {
+    MixArgs m;
+    const float* cx;
+    float* state;
+    const float* cw;
+    float* ao;
+    float* acc;
+    float* keep;
+    float a_scale;
+    float cnorm;
+    int mode;
+    int taps;
+};
+
+template <int NS, int NQ>
+__global__ void __launch_bounds__(kMixThreads) ink_conv_mix_kernel(ConvMixArgs c, int n_embd) {
+    pdl_trigger();
+    pdl_wait();
+    const int tid = threadIdx.x;
+    float x[kMixHeld][NS];
+    float sum[NS][1 + NQ];
+#pragma unroll
+    for (int s = 0; s < NS; ++s)
+#pragma unroll
+        for (int k = 0; k <= NQ; ++k) sum[s][k] = 0.0f;
+#pragma unroll
+    for (int h = 0; h < kMixHeld; ++h) {
+        const int i = tid + h * kMixThreads;
+        if (i < n_embd) {
+            const float x0 = c.cx[i];
+            float cacc = 0.0f;
+            for (int j = 0; j < c.taps - 1; ++j)
+                cacc += c.state[size_t(j) * n_embd + i] * c.cw[size_t(i) * c.taps + j];
+            cacc += x0 * c.cw[size_t(i) * c.taps + (c.taps - 1)];
+            const float y = (x0 + cacc) * c.cnorm;
+            c.ao[i] = y;
+            conv_state_at(c.cx, c.state, n_embd, c.taps, 1, i);
+            const float old_r = c.acc[i];
+            float new_r;
+            if (c.mode == 0) {
+                new_r = old_r + y * c.a_scale;
+            } else {
+                if (c.mode == 1) c.keep[i] = old_r;
+                new_r = y;
+            }
+            c.acc[i] = new_r;
+            float q[NQ];
+#pragma unroll
+            for (int j = 0; j < NQ; ++j) q[j] = c.m.query[size_t(j) * n_embd + i];
+#pragma unroll
+            for (int s = 0; s < NS; ++s) {
+                const float v = (s == NS - 1) ? new_r : (c.mode == 1 && s == NS - 2) ? old_r : c.m.s[s][i];
+                x[h][s] = v;
+                sum[s][0] += v * v;
+#pragma unroll
+                for (int j = 0; j < NQ; ++j) sum[s][1 + j] += v * q[j];
+            }
+        }
+    }
+    mix_finish_held<NS, NQ>(c.m, x, sum, n_embd);
+}
+
+template <int NS, int NQ>
+__global__ void __launch_bounds__(kMixThreads) ink_conv_mix_rows_kernel(ConvMixArgs c, int n_embd) {
+    pdl_trigger();
+    pdl_wait();
+    const int t = int(blockIdx.x), tid = threadIdx.x;
+    const size_t row = size_t(t) * n_embd;
+    float x[kMixHeld][NS];
+    float sum[NS][1 + NQ];
+#pragma unroll
+    for (int s = 0; s < NS; ++s)
+#pragma unroll
+        for (int k = 0; k <= NQ; ++k) sum[s][k] = 0.0f;
+#pragma unroll
+    for (int h = 0; h < kMixHeld; ++h) {
+        const int i = tid + h * kMixThreads;
+        if (i < n_embd) {
+            float cacc = 0.0f;
+            for (int j = 0; j < c.taps; ++j) {
+                const int u = t - (c.taps - 1 - j);
+                const float pv = u >= 0 ? c.cx[size_t(u) * n_embd + i] : c.state[size_t(c.taps - 1 + u) * n_embd + i];
+                cacc += pv * c.cw[size_t(i) * c.taps + j];
+            }
+            const float y = (c.cx[row + i] + cacc) * c.cnorm;
+            c.ao[row + i] = y;
+            const float old_r = c.acc[row + i];
+            float new_r;
+            if (c.mode == 0) {
+                new_r = old_r + y * c.a_scale;
+            } else {
+                if (c.mode == 1) c.keep[row + i] = old_r;
+                new_r = y;
+            }
+            c.acc[row + i] = new_r;
+            float q[NQ];
+#pragma unroll
+            for (int j = 0; j < NQ; ++j) q[j] = c.m.query[size_t(j) * n_embd + i];
+#pragma unroll
+            for (int s = 0; s < NS; ++s) {
+                const float v = (s == NS - 1) ? new_r : (c.mode == 1 && s == NS - 2) ? old_r : c.m.s[s][row + i];
+                x[h][s] = v;
+                sum[s][0] += v * v;
+#pragma unroll
+                for (int j = 0; j < NQ; ++j) sum[s][1 + j] += v * q[j];
+            }
+        }
+    }
+    mix_finish_held<NS, NQ>(c.m, x, sum, n_embd);
+}
+
+struct MoeConvMixArgs {
+    MixArgs m;
+    const float* mx;
+    const float* mw;
+    const float* mscale;
+    const int* mids;
+    float* fo;
+    float* state;
+    const float* cw;
+    float* fc;
+    float* acc;
+    float a_scale;
+    float cnorm;
+    int n_used;
+    int taps;
+};
+
+template <int NS, int NQ>
+__global__ void __launch_bounds__(kMixThreads) ink_moe_conv_mix_kernel(MoeConvMixArgs c, int n_embd) {
+    pdl_trigger();
+    pdl_wait();
+    const int tid = threadIdx.x;
+    float x[kMixHeld][NS];
+    float sum[NS][1 + NQ];
+#pragma unroll
+    for (int s = 0; s < NS; ++s)
+#pragma unroll
+        for (int k = 0; k <= NQ; ++k) sum[s][k] = 0.0f;
+#pragma unroll
+    for (int h = 0; h < kMixHeld; ++h) {
+        const int i = tid + h * kMixThreads;
+        if (i < n_embd) {
+            float ms = 0.0f;
+            for (int k = 0; k < c.n_used; ++k) {
+                const float wk = c.mscale ? c.mw[k] * c.mscale[c.mids[k]] : c.mw[k];
+                ms += wk * c.mx[size_t(k) * n_embd + i];
+            }
+            const float f0 = 0.0f + ms;
+            c.fo[i] = f0;
+            float cacc = 0.0f;
+            for (int j = 0; j < c.taps - 1; ++j)
+                cacc += c.state[size_t(j) * n_embd + i] * c.cw[size_t(i) * c.taps + j];
+            cacc += f0 * c.cw[size_t(i) * c.taps + (c.taps - 1)];
+            const float y = (f0 + cacc) * c.cnorm;
+            c.fc[i] = y;
+            conv_state_at(c.fo, c.state, n_embd, c.taps, 1, i);
+            const float new_r = c.acc[i] + y * c.a_scale;
+            c.acc[i] = new_r;
+            float q[NQ];
+#pragma unroll
+            for (int j = 0; j < NQ; ++j) q[j] = c.m.query[size_t(j) * n_embd + i];
+#pragma unroll
+            for (int s = 0; s < NS; ++s) {
+                const float v = (s == NS - 1) ? new_r : c.m.s[s][i];
+                x[h][s] = v;
+                sum[s][0] += v * v;
+#pragma unroll
+                for (int j = 0; j < NQ; ++j) sum[s][1 + j] += v * q[j];
+            }
+        }
+    }
+    mix_finish_held<NS, NQ>(c.m, x, sum, n_embd);
+}
+
+template <int NS, int NQ>
+struct ConvMixOne {
+    static void launch(dim3 grid, cudaStream_t s, const ConvMixArgs& c, int n_embd) {
+        launch_pdl(ink_conv_mix_kernel<NS, NQ>, grid, dim3(kMixThreads), 0, s, c, n_embd);
+    }
+};
+
+template <int NS, int NQ>
+struct ConvMixRows {
+    static void launch(dim3 grid, cudaStream_t s, const ConvMixArgs& c, int n_embd) {
+        launch_pdl(ink_conv_mix_rows_kernel<NS, NQ>, grid, dim3(kMixThreads), 0, s, c, n_embd);
+    }
+};
+
+template <int NS, int NQ>
+struct MoeConvMixOne {
+    static void launch(dim3 grid, cudaStream_t s, const MoeConvMixArgs& c, int n_embd) {
+        launch_pdl(ink_moe_conv_mix_kernel<NS, NQ>, grid, dim3(kMixThreads), 0, s, c, n_embd);
+    }
+};
+
 struct QkvArgs {
     InkQkv a;
     float k_norm, v_norm;
@@ -996,6 +1359,72 @@ __global__ void ink_qkv_rows_kernel(QkvArgs g, InkQkvRows r) {
     qkv_block<KV>(a, g.k_norm, g.v_norm, part);
 }
 
+#if !defined(__HIPCC__)
+// Window (2..8 contiguous rows of one sequence) fused K/V conv + snapshots + Q/K/V/R clips + KV store.
+// Grid: 2 * rows * n_head + 2 * n_kv blocks, 128 threads.  Bit-identical to ink_conv_few + ink_clips.
+template <int KV>
+__global__ void ink_qkv_win_kernel(QkvArgs g, int rows, float* ksnap, float* vsnap, size_t snap_stride,
+                                   unsigned snap_bits) {
+    pdl_trigger();
+    pdl_wait();
+    __shared__ float part[128 / WARP];
+    const InkQkv& a = g.a;
+    int b = int(blockIdx.x);
+    if (b < rows * a.n_head) {
+        const int row = b / a.n_head, head = b % a.n_head;
+        const long long p = a.at ? a.at[2 * row] : (long long) a.pos + row;
+        clip_head(a.q + (size_t(row) * a.n_head + head) * a.dim,
+                  a.q_scale ? a.q_scale + size_t(head) * a.dim : nullptr, a.qk_thr, a.dim, a.alpha, a.floor, p, part);
+        return;
+    }
+    b -= rows * a.n_head;
+    if (b < 2 * a.n_kv) {
+        const bool is_v = b >= a.n_kv;
+        const int h = is_v ? b - a.n_kv : b, channels = a.n_kv * a.dim, i = threadIdx.x;
+        const float* x = is_v ? a.vraw : a.kraw;
+        float* state = is_v ? a.vstate : a.kstate;
+        const float* cw = is_v ? a.vw : a.kw;
+        const float* dyn = is_v ? a.vdyn : a.kdyn;
+        float* out = is_v ? a.v : a.k;
+        const float cnorm = is_v ? g.v_norm : g.k_norm;
+        void* cache = is_v ? (void*) a.vals : (void*) a.keys;
+        for (int t = 0; t < rows; ++t) {
+            if (i < a.dim) {
+                const int c = h * a.dim + i;
+                out[size_t(t) * channels + c] = conv_value(x, state, cw, dyn, channels, a.n_kv, a.taps, t, c, cnorm);
+            }
+            __syncthreads();
+            float* head = out + (size_t(t) * a.n_kv + h) * a.dim;
+            const long long pt = a.at ? a.at[2 * t] : (long long) a.pos + t;
+            if (is_v) rms_head(head, a.dim, a.eps, part);
+            else clip_head(head, nullptr, a.qk_thr, a.dim, 0.0f, 1.0f, pt, part);
+            long long cell = (a.at ? a.at[0] : (long long) a.pos) + t;
+            if (a.ring > 0) cell %= a.ring;
+            if (KV != kKvF16) kv_store<KV>(head, cache, cell, a.n_kv, a.dim, h, part);
+            else if (i < a.dim)
+                ((__half*) cache)[size_t(cell) * channels + size_t(h) * a.dim + i] = __float2half(head[i]);
+            __syncthreads();
+        }
+        if (i < a.dim) {
+            const int c = h * a.dim + i;
+            float* snap = is_v ? vsnap : ksnap;
+            if (snap && snap_bits) {
+                int k = 0;
+                for (unsigned sb = snap_bits; sb; sb &= sb - 1, ++k)
+                    conv_state_into(x, state, snap + size_t(k) * snap_stride, channels, a.taps, __ffs(sb), c);
+            }
+            conv_state_at(x, state, channels, a.taps, rows, c);
+        }
+        return;
+    }
+    b -= 2 * a.n_kv;
+    const int row = b / a.n_head, head = b % a.n_head;
+    const long long p = a.at ? a.at[2 * row] : (long long) a.pos + row;
+    clip_head(a.r + (size_t(row) * a.n_head + head) * a.n_rel,
+              a.r_scale ? a.r_scale + size_t(head) * a.n_rel : nullptr, a.rel_thr, a.n_rel, a.alpha, a.floor, p, part);
+}
+#endif
+
 __global__ void ink_mul_sigmoid_kernel(float* x, const float* __restrict__ gate, size_t n) {
     const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) x[i] *= 1.0f / (1.0f + expf(-gate[i]));
@@ -1013,6 +1442,14 @@ __global__ void ink_softcap_kernel(float* logits, int n_keep, int n_all, int row
     const size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= size_t(rows) * n_all) return;
     logits[idx] = (int) (idx % n_all) < n_keep ? cap * tanhf(logits[idx] / cap) : -INFINITY;
+}
+
+__global__ void ink_loopcd_extrap_kernel(float* dst, const float* __restrict__ ref, float omega, size_t n) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float v = dst[i];
+        dst[i] = v + omega * (v - ref[i]);
+    }
 }
 
 constexpr int kAttnThreads = 1024;   // a block of the softmax kernel
@@ -1433,6 +1870,181 @@ __global__ void __launch_bounds__(1024) ink_value_rows_kernel(InkAttn a, int t0,
     pdl_wait();
     value_block<KV>(a, c.vals[t0 + blockIdx.x / a.n_kv], t0, nk_max, parts, n_parts);
 }
+
+#if !defined(__HIPCC__)
+// Multi-row (2..8) full-attention score kernel: reads each key cache row ONCE from VRAM across all m verify tokens
+// in the window (lo == 0, ring == 0), preserving ink_score_kernel's exact FMA and butterfly reduction order (0 ULP).
+template <int KV, int LH>
+__global__ void __launch_bounds__(kScoreWarps * 32) ink_score_win_kernel(InkAttn a, int t0, int m, int nk_max,
+                                                                         int steps) {
+    pdl_trigger();
+    pdl_wait();
+    extern __shared__ __align__(16) float sm[];
+    const int per = a.n_head / a.n_kv;
+    const int g = int(blockIdx.x);
+    const int tid = int(threadIdx.x), lane = tid & 31, warp = tid >> 5;
+    const int sub = lane % kScoreLanes, mine = lane / kScoreLanes;
+    int nk_hi = 0;
+    for (int tt = 0; tt < m; ++tt) {
+        const long long pt = a.at ? a.at[2 * (t0 + tt)] : a.pos + t0 + tt;
+        const int nkt = (int) (pt + 1);
+        if (nkt > nk_hi) nk_hi = nkt;
+    }
+    const int jb = int(blockIdx.y) * kScoreWarps * kScoreKeys * steps;
+    if (jb >= nk_hi) return;
+    float* qs = sm;
+    float* rs = qs + m * per * a.dim;
+    float* sinks = rs + m * per * 32;
+    for (int tt = 0; tt < m; ++tt) {
+        const size_t head0 = size_t(t0 + tt) * a.n_head + size_t(g) * per;
+        float* q_dst = qs + tt * per * a.dim;
+        float* r_dst = rs + tt * per * 32;
+        float* s_dst = sinks + tt * per;
+        for (int i = tid; i < per * a.dim; i += int(blockDim.x)) q_dst[i] = a.q[head0 * a.dim + i] * a.scale;
+        for (int i = tid; i < per * a.n_rel; i += int(blockDim.x))
+            r_dst[(i / a.n_rel) * 32 + (i % a.n_rel)] = a.r[head0 * a.n_rel + i];
+        if (tid < per) s_dst[tid] = a.sink[head0 + tid];
+    }
+    __syncthreads();
+    int j = jb + warp * kScoreKeys + mine;
+    for (int st = 0; st < steps; ++st) {
+        const int jw = j - mine;
+        if (jw >= nk_hi) break;
+        const bool any_here = j < nk_hi;
+        float kx[kScoreShares][kLaneHalves];
+#pragma unroll
+        for (int k = 0; k < kScoreShares; ++k) {
+            const int vl = sub + kScoreLanes * k;
+            if (any_here) {
+                if (KV == kKvFp8) lane_fp8(a.keys, j, a.n_kv, a.dim, g, vl, LH, kx[k]);
+                else if (KV == kKvQ8 || KV == kKvQ8Dot) lane_q8(a.keys, j, a.n_kv, a.dim, g, vl, LH, kx[k]);
+                else lane_halves((const __half*) a.keys + (size_t(j) * a.n_kv + g) * a.dim, vl, LH, kx[k]);
+            } else {
+#pragma unroll
+                for (int c = 0; c < kLaneHalves; ++c) kx[k][c] = 0.0f;
+            }
+        }
+        for (int tt = 0; tt < m; ++tt) {
+            const long long p = a.at ? a.at[2 * (t0 + tt)] : a.pos + t0 + tt;
+            const int nk = (int) (p + 1);
+            if (jw >= nk) continue;
+            const bool here = j < nk;
+            const long long dist = p - j;
+            const bool far = p - (jw + kScoreKeys - 1) >= a.extent;
+            float rb[kScoreShares];
+#pragma unroll
+            for (int k = 0; k < kScoreShares; ++k) {
+                const int vl = sub + kScoreLanes * k;
+                rb[k] = !far && here && vl < a.n_rel && dist < a.extent ? a.rel_bias[size_t(dist) * a.n_rel + vl] : 0.0f;
+            }
+            const float* qt = qs + tt * per * a.dim;
+            const float* rt = rs + tt * per * 32;
+            const float* skt = sinks + tt * per;
+            float* s = a.score + (size_t(tt) * a.n_head + size_t(g) * per) * nk_max;
+#pragma unroll
+            for (int hp = 0; hp < kMaxPer; ++hp) {
+                if (hp < per) {
+                    float sh[kScoreShares];
+#pragma unroll
+                    for (int k = 0; k < kScoreShares; ++k) {
+                        const int vl = sub + kScoreLanes * k;
+                        float q[kLaneHalves];
+                        if (LH == 4) {
+                            const float4 v = *reinterpret_cast<const float4*>(&qt[hp * a.dim + vl * 4]);
+                            q[0] = v.x, q[1] = v.y, q[2] = v.z, q[3] = v.w;
+                        } else {
+#pragma unroll
+                            for (int c = 0; c < kLaneHalves; ++c) q[c] = c < LH ? qt[hp * a.dim + vl * LH + c] : 0.0f;
+                        }
+                        const float rrv = vl < a.n_rel ? rt[hp * 32 + vl] : 0.0f;
+                        float d = __fmaf_rn(rb[k], rrv, __fmul_rn(q[0], kx[k][0]));
+#pragma unroll
+                        for (int c = 1; c < kLaneHalves; ++c) d = __fmaf_rn(q[c], kx[k][c], d);
+                        sh[k] = d;
+                    }
+                    float v = __fadd_rn(__fadd_rn(sh[0], sh[2]), __fadd_rn(sh[1], sh[3]));
+#pragma unroll
+                    for (int o = kScoreLanes / 2; o > 0; o >>= 1)
+                        v = __fadd_rn(v, __shfl_xor_sync(0xffffffff, v, o, WARP));
+                    if (sub == 0 && here) s[size_t(hp) * nk_max + j] = v - skt[hp];
+                }
+            }
+        }
+        j += kScoreWarps * kScoreKeys;
+    }
+}
+
+// Multi-row (2..8) full-attention value kernel: reads each value cache row ONCE from VRAM into registers across all
+// m verify tokens (lo == 0, ring == 0), using identical warps/n_parts/reduction order as ink_value_kernel (0 ULP).
+// Uses zero static shared memory so dynamic sums[] fits the exact 48 KiB kValueShared budget.
+template <int KV>
+__global__ void __launch_bounds__(1024) ink_value_win_kernel(InkAttn a, int t0, int m, int nk_max, float* parts,
+                                                             int n_parts) {
+    pdl_trigger();
+    pdl_wait();
+    extern __shared__ float sums[];
+    const int per = a.n_head / a.n_kv, lh = a.dim / 32;
+    const int g = int(blockIdx.x);
+    const int tid = int(threadIdx.x), lane = tid & 31, warp = tid >> 5, warps = int(blockDim.x) / 32;
+    int nk_hi = 0;
+    for (int tt = 0; tt < m; ++tt) {
+        const long long pt = a.at ? a.at[2 * (t0 + tt)] : a.pos + t0 + tt;
+        const int nkt = (int) (pt + 1);
+        if (nkt > nk_hi) nk_hi = nkt;
+    }
+    const int j0 = (int(blockIdx.y) * warps + warp) * kValueKeys;
+    const int j1_hi = j0 + kValueKeys < nk_hi ? j0 + kValueKeys : nk_hi;
+    float v[kValueKeys][kLaneHalves];
+#pragma unroll
+    for (int u = 0; u < kValueKeys; ++u) {
+        if (j0 + u < j1_hi) {
+            const long long row = j0 + u;
+            if (KV == kKvFp8) lane_fp8(a.vals, row, a.n_kv, a.dim, g, lane, lh, v[u]);
+            else if (KV == kKvQ8) lane_q8(a.vals, row, a.n_kv, a.dim, g, lane, lh, v[u]);
+            else lane_halves((const __half*) a.vals + (size_t(row) * a.n_kv + g) * a.dim, lane, lh, v[u]);
+        }
+    }
+    const int mine = j0 + lane % kValueKeys;
+    for (int tt = 0; tt < m; ++tt) {
+        const long long pt = a.at ? a.at[2 * (t0 + tt)] : a.pos + t0 + tt;
+        const int nk = (int) (pt + 1);
+        const int j1 = j0 + kValueKeys < nk ? j0 + kValueKeys : nk;
+        const size_t head0 = size_t(tt) * a.n_head + size_t(g) * per;
+        const float* s = a.score + head0 * nk_max;
+        const float weight = lane < per * kValueKeys && mine < nk ? s[size_t(lane / kValueKeys) * nk_max + mine] : 0.0f;
+        float acc[kMaxPer][kLaneHalves];
+#pragma unroll
+        for (int hp = 0; hp < kMaxPer; ++hp)
+#pragma unroll
+            for (int c = 0; c < kLaneHalves; ++c) acc[hp][c] = 0.0f;
+#pragma unroll
+        for (int u = 0; u < kValueKeys; ++u) {
+            if (j0 + u < j1) {
+#pragma unroll
+                for (int hp = 0; hp < kMaxPer; ++hp) {
+                    if (hp < per) {
+                        const float w = __shfl_sync(0xffffffff, weight, hp * kValueKeys + u, WARP);
+#pragma unroll
+                        for (int c = 0; c < kLaneHalves; ++c) acc[hp][c] += w * v[u][c];
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int hp = 0; hp < kMaxPer; ++hp)
+#pragma unroll
+            for (int c = 0; c < kLaneHalves; ++c)
+                if (hp < per && c < lh) sums[(size_t(warp) * per + hp) * a.dim + lane * lh + c] = acc[hp][c];
+        __syncthreads();
+        for (int e = tid; e < per * a.dim; e += int(blockDim.x)) {
+            float total = 0.0f;
+            for (int w = 0; w < warps; ++w) total += sums[size_t(w) * per * a.dim + e];
+            parts[((head0 + e / a.dim) * n_parts + blockIdx.y) * a.dim + e % a.dim] = total;
+        }
+        __syncthreads();
+    }
+}
+#endif
 
 // A token's head a block: its first `mine` parts added in their order (of n_parts a head in parts), over its
 // softmax's norm.
@@ -2698,16 +3310,18 @@ __global__ void ink_control3_gate_kernel(Control3 c, int n, int rank) {
     pdl_wait();
     const int i = int(blockIdx.x) * 8 + int(threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (i >= n) return;
+    const size_t roff = size_t(blockIdx.y) * n, rch = size_t(blockIdx.y) * rank;
     float g[3], f[3];
 #pragma unroll
     for (int j = 0; j < 3; ++j) {
         if (j >= c.count) break;
         const W* gr = static_cast<const W*>(c.gw[j]) + size_t(i) * rank;
         const W* fr = static_cast<const W*>(c.fw[j]) + size_t(i) * rank;
+        const float* ch = c.ch[j] + rch;
         float ga = 0.0f, fa = 0.0f;
         for (int k = lane; k < rank; k += 32) {
-            ga += wval(gr, k) * c.ch[j][k];
-            fa += wval(fr, k) * c.ch[j][k];
+            ga += wval(gr, k) * ch[k];
+            fa += wval(fr, k) * ch[k];
         }
         g[j] = 0.0f + warp_sum(ga);
         f[j] = 0.0f + warp_sum(fa);
@@ -2716,10 +3330,10 @@ __global__ void ink_control3_gate_kernel(Control3 c, int n, int rank) {
     float cv[3];
 #pragma unroll
     for (int j = 0; j < 3; ++j)
-        if (j < c.count) cv[j] = c.cur[j][i];
+        if (j < c.count) cv[j] = c.cur[j][roff + i];
 #pragma unroll
     for (int j = 0; j < 3; ++j)
-        if (j < c.count) c.out[j][i] = cv[j] - tanhf(f[j]) * cv[j] + tanhf(g[j]) * c.msg[j][i];
+        if (j < c.count) c.out[j][roff + i] = cv[j] - tanhf(f[j]) * cv[j] + tanhf(g[j]) * c.msg[j][roff + i];
 }
 
 }  // namespace
@@ -2731,14 +3345,16 @@ struct NormMany {
     QB* q[3];
 };
 
-// rms_norm_many_kernel's row (blockIdx.y the input), each value also quantized
+// rms_norm_many_kernel's row (blockIdx.x the row, blockIdx.y the input), each value also quantized
 __global__ void ink_norm_many_q8_kernel(NormMany m, int n, float eps) {
     pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
     pdl_wait();
     __shared__ float part[32];
-    const float* xr = m.x[blockIdx.y];
+    const size_t roff = size_t(blockIdx.x) * n;
+    const float* xr = m.x[blockIdx.y] + roff;
     const float* __restrict__ w = m.w[blockIdx.y];
-    float* yr = m.y[blockIdx.y];
+    float* yr = m.y[blockIdx.y] + roff;
+    QB* qr = m.q[blockIdx.y] + size_t(blockIdx.x) * (n / 32);
     if (n <= kNormHeld * int(blockDim.x)) {   // the values read once and kept for the norm
         float v[kNormHeld];
         float ss = 0.0f;
@@ -2758,7 +3374,7 @@ __global__ void ink_norm_many_q8_kernel(NormMany m, int n, float eps) {
             if (i < n) {
                 const float y = w ? v[h] * scale * w[i] : v[h] * scale;
                 yr[i] = y;
-                q8_put(m.q[blockIdx.y], i, y);
+                q8_put(qr, i, y);
             }
         }
         return;
@@ -2770,17 +3386,25 @@ __global__ void ink_norm_many_q8_kernel(NormMany m, int n, float eps) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const float y = w ? xr[i] * scale * w[i] : xr[i] * scale;
         yr[i] = y;
-        q8_put(m.q[blockIdx.y], i, y);
+        q8_put(qr, i, y);
     }
 }
 
-// ink_gate_kernel's values of one row, then add_rms_q8() of them
+// ink_gate_kernel's values of row blockIdx.x, then add_rms_q8() of them
 __global__ void ink_gate_norm_q8_kernel(const float* cur, const float* msg, const float* gain, const float* forget,
                                         float* out, const float* __restrict__ w,
                                         float* y, QB* q, int n, float eps) {
     pdl_trigger();   // PDL (pdl.hpp): the launch after this one may start
     pdl_wait();
     __shared__ float part[32];
+    const size_t roff = size_t(blockIdx.x) * n;
+    cur += roff;
+    msg += roff;
+    gain += roff;
+    forget += roff;
+    out += roff;
+    y += roff;
+    q += size_t(blockIdx.x) * (n / 32);
     if (n <= kNormHeld * int(blockDim.x)) {   // the gated values kept for the norm
         float o[kNormHeld];
 #pragma unroll
@@ -2802,9 +3426,10 @@ __global__ void ink_gate_norm_q8_kernel(const float* cur, const float* msg, cons
     add_rms_q8(out, w, y, q, n, eps, part);
 }
 
-void ink_norm_many_q8(const float* const* x, const float* const* w, float* const* y, void* const* q8, int count, int n,
-                      float eps, void* stream) {
+void ink_norm_many_q8_rows(const float* const* x, const float* const* w, float* const* y, void* const* q8, int count,
+                           int n, int rows, float eps, void* stream) {
     if (count < 1 || count > 3 || n % 32 != 0) throw std::invalid_argument("ink_norm_many_q8: 1 to 3 rows of 32k");
+    if (rows <= 0) return;
     NormMany m{};
     for (int j = 0; j < count; ++j) {
         m.x[j] = x[j];
@@ -2812,18 +3437,29 @@ void ink_norm_many_q8(const float* const* x, const float* const* w, float* const
         m.y[j] = y[j];
         m.q[j] = (QB*) q8[j];
     }
-    launch_pdl(ink_norm_many_q8_kernel, dim3(1, count), dim3(sum_threads(n)), 0, cs(stream), m, n, eps);
+    launch_pdl(ink_norm_many_q8_kernel, dim3(rows, count), dim3(sum_threads(n)), 0, cs(stream), m, n, eps);
     launched("ink_norm_many_q8");
+}
+
+void ink_norm_many_q8(const float* const* x, const float* const* w, float* const* y, void* const* q8, int count, int n,
+                      float eps, void* stream) {
+    ink_norm_many_q8_rows(x, w, y, q8, count, n, 1, eps, stream);
+}
+
+void ink_gate_norm_q8_rows(const float* cur, const float* msg, const float* gain, const float* forget, float* out,
+                           const float* w, float* y, void* q8, int n, int rows, float eps, void* stream) {
+    const int threads = sum_threads(n);
+    if (n % 32 != 0 || threads != std::min(1024, std::max(threads, n)))   // add_rms_norm_q8_1's block is this one
+        throw std::invalid_argument("ink_gate_norm_q8: not add_rms_norm_q8_1's block");
+    if (rows <= 0) return;
+    launch_pdl(ink_gate_norm_q8_kernel, dim3(rows), dim3(threads), 0, cs(stream), cur, msg, gain, forget, out, w, y,
+               (QB*) q8, n, eps);
+    launched("ink_gate_norm_q8");
 }
 
 void ink_gate_norm_q8(const float* cur, const float* msg, const float* gain, const float* forget, float* out,
                       const float* w, float* y, void* q8, int n, float eps, void* stream) {
-    const int threads = sum_threads(n);
-    if (n % 32 != 0 || threads != std::min(1024, std::max(threads, n)))   // add_rms_norm_q8_1's block is this one
-        throw std::invalid_argument("ink_gate_norm_q8: not add_rms_norm_q8_1's block");
-    launch_pdl(ink_gate_norm_q8_kernel, dim3(1), dim3(threads), 0, cs(stream), cur, msg, gain, forget, out, w, y,
-               (QB*) q8, n, eps);
-    launched("ink_gate_norm_q8");
+    ink_gate_norm_q8_rows(cur, msg, gain, forget, out, w, y, q8, n, 1, eps, stream);
 }
 
 void ink_mix_norm(const InkStates& states, const float* query, int n_query, float* const* out, int n_embd, int rows,
@@ -2844,16 +3480,17 @@ void ink_mix_norm(const InkStates& states, const float* query, int n_query, floa
     a.eps = eps;
     a.q8 = (QB*) q8;
     a.ffn = ffn;
-    if ((q8 || ffn) && (rows != 1 || !norm_out || (ffn && (!q8 || !norm_w))))
-        throw std::invalid_argument("ink_mix_norm: a quantized norm is one row's");
+    if ((q8 || ffn) && (!norm_out || n_embd % 32 != 0 || (ffn && (!q8 || !norm_w))))
+        throw std::invalid_argument("ink_mix_norm: quantized norm needs norm_out and multiple-of-32 width");
     launch_mix<MixOne>(a.n, a.nq, dim3(rows), cs(stream), a, n_embd);
     launched("ink_mix");
 }
 
 void ink_mix_many(const InkStates& states, const float* const* query, int n_query, float* const* out, int jobs,
-                  int n_embd, void* stream) {
+                  int n_embd, void* stream, int rows) {
     if (states.n < 1 || states.n > InkStates::kMax || n_query < 1 || n_query > kQueries || jobs < 1 || jobs > kMixJobs)
         throw std::invalid_argument("ink_mix_many: 1 to 6 states, 1 to 4 queries, 1 to 12 jobs");
+    if (rows <= 0) return;
     MixMany m{};
     for (int k = 0; k < jobs; ++k) {
         MixArgs& a = m.j[k];
@@ -2863,7 +3500,7 @@ void ink_mix_many(const InkStates& states, const float* const* query, int n_quer
         a.nq = n_query;
         for (int j = 0; j < n_query; ++j) a.out[j] = out[k * n_query + j];
     }
-    launch_mix<MixJobs>(states.n, n_query, dim3(1, jobs), cs(stream), m, n_embd);
+    launch_mix<MixJobs>(states.n, n_query, dim3((unsigned) rows, (unsigned) jobs), cs(stream), m, n_embd);
     launched("ink_mix_many");
 }
 
@@ -2914,6 +3551,31 @@ bool ink_ctrl_down(const float* const* cur, const float* const* msg, const void*
         launched("ink_ctrl_down_fast");
         return true;
     }
+#if !defined(__HIPCC__)
+    const auto launch_down_rows = [&](auto dummy_w) {
+        using W = decltype(dummy_w);
+        const dim3 g(count * rank), b(kDownThreads);
+        switch (rows) {
+        case 2: launch_pdl(ink_ctrl_down_rows_kernel<W, 2>, g, b, 0, cs(stream), d, n_embd, rank); return;
+        case 3: launch_pdl(ink_ctrl_down_rows_kernel<W, 3>, g, b, 0, cs(stream), d, n_embd, rank); return;
+        case 4: launch_pdl(ink_ctrl_down_rows_kernel<W, 4>, g, b, 0, cs(stream), d, n_embd, rank); return;
+        case 5: launch_pdl(ink_ctrl_down_rows_kernel<W, 5>, g, b, 0, cs(stream), d, n_embd, rank); return;
+        case 6: launch_pdl(ink_ctrl_down_rows_kernel<W, 6>, g, b, 0, cs(stream), d, n_embd, rank); return;
+        case 7: launch_pdl(ink_ctrl_down_rows_kernel<W, 7>, g, b, 0, cs(stream), d, n_embd, rank); return;
+        default: launch_pdl(ink_ctrl_down_rows_kernel<W, 8>, g, b, 0, cs(stream), d, n_embd, rank); return;
+        }
+    };
+    static const bool down_rows_on = [] {
+        const char* v = std::getenv("STRATA_INK_DOWN_ROWS");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (rows >= 2 && rows <= 8 && down_rows_on) {
+        if (bf16) launch_down_rows(uint16_t{});
+        else launch_down_rows(float{});
+        launched("ink_ctrl_down");
+        return true;
+    }
+#endif
     if (bf16)
         launch_pdl(ink_ctrl_down_kernel<uint16_t>, dim3(count * rank, rows), dim3(kDownThreads), 0, cs(stream), d,
                    n_embd, rank);
@@ -2939,6 +3601,64 @@ void ink_gate_set(const float* const* cur, const float* const* msg, const float*
     s.count = count;
     ink_gate_kernel<<<grid(n, 256), 256, 0, cs(stream)>>>(s, n);
     launched("ink_gate");
+}
+
+// ink_ctrl_up_gate(): a prompt's gain and forget products of a controller and its gate in one launch.  A thread has
+// one output (value o of a row) and its two weight rows in registers, and goes through kUpTokens tokens whose ch rows
+// the block holds.  Each product is one fmaf after the other over the rank in its order from 0, as hipblasSgemm's
+// kernel for these shapes does it (the same bits on gfx1201 under ROCm 7.2 and 10.2; inkling2_test's ctrl_up_gate
+// checks it against lin()'s launches), then ink_gate_kernel's arithmetic on them.
+constexpr int kUpThreads = 256, kUpTokens = 32, kUpRank = 64;
+
+template <typename W>
+__global__ void __launch_bounds__(kUpThreads) ink_ctrl_up_gate_kernel(const float* cur, const float* msg,
+                                                                      const float* __restrict__ ch,
+                                                                      const W* __restrict__ gw,
+                                                                      const W* __restrict__ fw, float* out,
+                                                                      int n_embd, int rows) {
+    __shared__ __align__(16) float sc[kUpTokens][kUpRank];
+    const int o = blockIdx.x * kUpThreads + threadIdx.x, t0 = blockIdx.y * kUpTokens;
+    const int nt = min(kUpTokens, rows - t0);
+    for (int i = threadIdx.x; i < kUpTokens * kUpRank; i += kUpThreads) {
+        const int t = i / kUpRank;
+        sc[t][i % kUpRank] = t < nt ? ch[size_t(t0 + t) * kUpRank + i % kUpRank] : 0.0f;
+    }
+    __syncthreads();
+    if (o >= n_embd) return;
+    float g[kUpRank], f[kUpRank];
+#pragma unroll
+    for (int k = 0; k < kUpRank; ++k) {
+        g[k] = wval(gw, size_t(o) * kUpRank + k);
+        f[k] = wval(fw, size_t(o) * kUpRank + k);
+    }
+    for (int t = 0; t < nt; ++t) {
+        float a = 0.0f, b = 0.0f;
+#pragma unroll
+        for (int k = 0; k < kUpRank; k += 4) {
+            const float4 x = *reinterpret_cast<const float4*>(&sc[t][k]);
+            a = fmaf(x.x, g[k], a), b = fmaf(x.x, f[k], b);
+            a = fmaf(x.y, g[k + 1], a), b = fmaf(x.y, f[k + 1], b);
+            a = fmaf(x.z, g[k + 2], a), b = fmaf(x.z, f[k + 2], b);
+            a = fmaf(x.w, g[k + 3], a), b = fmaf(x.w, f[k + 3], b);
+        }
+        const size_t i = size_t(t0 + t) * n_embd + o;
+        const float c = cur[i];
+        out[i] = c - tanhf(b) * c + tanhf(a) * msg[i];
+    }
+}
+
+bool ink_ctrl_up_gate(const float* cur, const float* msg, const float* ch, const void* gain, const void* forget,
+                      float* out, int n_embd, int rank, int rows, void* stream, bool bf16) {
+    if (rank != kUpRank || rows <= 0) return false;
+    const dim3 g(grid((size_t) n_embd, kUpThreads), grid((size_t) rows, kUpTokens));
+    if (bf16)
+        ink_ctrl_up_gate_kernel<uint16_t><<<g, kUpThreads, 0, cs(stream)>>>(
+            cur, msg, ch, (const uint16_t*) gain, (const uint16_t*) forget, out, n_embd, rows);
+    else
+        ink_ctrl_up_gate_kernel<float><<<g, kUpThreads, 0, cs(stream)>>>(cur, msg, ch, (const float*) gain,
+                                                                          (const float*) forget, out, n_embd, rows);
+    launched("ink_ctrl_up_gate");
+    return true;
 }
 
 void ink_gate(const float* cur, const float* msg, const float* gain, const float* forget, float* out, size_t n,
@@ -3010,43 +3730,212 @@ void ink_moe_conv_add(const float* x, const float* w, const float* scale, const 
     launched("ink_moe_conv_add");
 }
 
-#if defined(__HIPCC__)
-// HIP: ink_clips() as the launches its contract names (ink_clip(), ink_head_rms() and fp16 stores of its jobs), and
-// ink_qkv() as ink_conv() of K and V and then those; the fused kernels are not built there.  ink_clips_kernel and
-// ink_qkv_kernel never finished on an RX 7900 XT (gfx1100) or an RX 9070 XT (gfx1201) under ROCm 7.2.4, the first
-// prompt or token of Inkling 2 Mini with them, and the same code built with any change to ink_clips_kernel finished:
-// the compiler's code for these two kernels, not their arithmetic.  The separate kernels give the same bits
-// (poly_inkling2_test's clips and qkv cases compare them).
-// A Q8_0 cache's rows (kvq8_store()'s), for clips_apart(): a block a row's head, its cell pos + row (at[0] + row
-// with at), % ring when ring > 0.
-__global__ void ink_store_q8_kernel(const float* x, uint8_t* cache, int n_kv, int dim, long long pos,
-                                    const long long* at, int ring) {
-    const int row = blockIdx.x / n_kv, h = blockIdx.x % n_kv;
-    long long cell = (at ? at[0] : pos) + row;
-    if (ring > 0) cell %= ring;
-    kvq8_store(x + (size_t(row) * n_kv + h) * dim, cache, cell, n_kv, dim, h);
+void ink_moe_conv_add_rows(const float* x, const float* w, const float* scale, const int* ids, int n_used, float* fo,
+                           float* state, const float* cw, float* out, float* acc, float a, int channels, int taps,
+                           int rows, void* stream, float* snap, size_t snap_stride, unsigned snap_bits) {
+    if (taps < 2 || taps > 8 || rows < 1 || rows > kConvFew)
+        throw std::invalid_argument("ink_moe_conv_add_rows: 2 to 8 taps, 1 to 8 rows");
+    const float norm = 1.0f / std::sqrt((float) (taps + 1));
+    launch_pdl(ink_moe_conv_add_rows_kernel, dim3(grid((size_t) channels, 256)), dim3(256), 0, cs(stream), x, w, scale,
+               ids, n_used, fo, state, cw, out, acc, a, channels, taps, rows, norm, snap, snap_stride, snap_bits);
+    launched("ink_moe_conv_add_rows");
 }
 
-static void clips_apart(const InkClips& c, void* stream) {
-    if (c.kv8) throw std::logic_error("ink_clips: no FP8 caches under HIP");
-    for (int j = 0; j < 4; ++j) {
-        if (c.heads[j] <= 0) continue;
-        if (c.rms[j])
-            ink_head_rms(c.x[j], c.dim[j], c.heads[j], c.rows, c.eps, stream);
-        else
-            ink_clip(c.x[j], c.scale[j], c.thr[j], c.dim[j], c.heads[j], c.rows, c.pos, c.alpha[j], c.floor[j], stream,
-                     c.at);
-        if (!c.cache[j]) continue;
-        const int n = c.heads[j] * c.dim[j];
-        if (c.kvq8) {
-            if (c.dim[j] % 32) throw std::invalid_argument("ink_clips: Q8_0 caches need heads of whole 32-value blocks");
-            ink_store_q8_kernel<<<c.rows * c.heads[j], 128, 0, cs(stream)>>>(c.x[j], (uint8_t*) c.cache[j], c.heads[j],
-                                                                           c.dim[j], c.pos, c.at, c.ring);
-        } else if (c.at) store_f16_at(c.x[j], c.cache[j], n, c.at, c.rows, c.ring, stream);
-        else if (c.ring > 0) ink_store_ring(c.x[j], c.cache[j], n, c.pos, c.rows, c.ring, stream);
-        else store_f16(c.x[j], c.cache[j], n, c.pos, c.rows, stream);
-        launched("ink_clips' stores");
+void ink_moe_sum_rows(const float* x, const float* w, const float* scale, const int* ids, int n_used, float* fo,
+                      int channels, int rows, void* stream) {
+    if (rows <= 0) return;
+    launch_pdl(ink_moe_sum_rows_kernel, dim3(grid((size_t) rows * channels, 256)), dim3(256), 0, cs(stream), x, w,
+               scale, ids, n_used, fo, channels, rows);
+    launched("ink_moe_sum_rows");
+}
+
+void ink_conv_state_update(const float* x, float* state, int channels, int taps, int rows, float* snap,
+                           size_t snap_stride, unsigned snap_bits, void* stream) {
+    if (taps < 2 || taps > 8 || rows < 1 || rows > kConvFew)
+        throw std::invalid_argument("ink_conv_state_update: 2 to 8 taps, 1 to 8 rows");
+    launch_pdl(ink_conv_state_update_kernel, dim3(grid((size_t) channels, 256)), dim3(256), 0, cs(stream), x, state,
+               snap, snap_stride, snap_bits, channels, taps, rows);
+    launched("ink_conv_state_update");
+}
+
+void ink_conv_state_update2(const float* x0, float* state0, float* snap0, int rows0, const float* x1, float* state1,
+                            float* snap1, int rows1, int channels, int taps, size_t snap_stride, unsigned snap_bits,
+                            void* stream) {
+    if (taps < 2 || taps > 8 || rows0 < 1 || rows0 > kConvFew || rows1 < 1 || rows1 > kConvFew)
+        throw std::invalid_argument("ink_conv_state_update2: 2 to 8 taps, 1 to 8 rows");
+    launch_pdl(ink_conv_state_update2_kernel, dim3(grid((size_t) channels, 256), 2), dim3(256), 0, cs(stream), x0,
+               state0, snap0, rows0, x1, state1, snap1, rows1, snap_stride, snap_bits, channels, taps);
+    launched("ink_conv_state_update2");
+}
+
+void ink_conv_mix(const float* x, float* state, const float* w, float* ao, float* acc, float* keep, float a, int mode,
+                  int taps, const InkStates& states, const float* query, int n_query, float* const* out, int n_embd,
+                  const float* norm_w, float* norm_out, float eps, void* stream, void* q8, bool ffn) {
+    if (states.n < 1 || states.n > InkStates::kMax || n_query < 1 || n_query > kQueries || taps < 2 || taps > 8 ||
+        n_embd > kMixHeld * kMixThreads || sum_threads(n_embd) != kMixThreads)
+        throw std::invalid_argument("ink_conv_mix: unsupported shape");
+    if ((q8 || ffn) && (!norm_out || n_embd % 32 != 0 || (ffn && (!q8 || !norm_w))))
+        throw std::invalid_argument("ink_conv_mix: quantized norm requires norm_out and 32k width");
+    ConvMixArgs c{};
+    for (int s = 0; s < states.n; ++s) c.m.s[s] = states.p[s];
+    c.m.n = states.n;
+    c.m.query = query;
+    c.m.nq = n_query;
+    for (int j = 0; j < n_query; ++j) c.m.out[j] = out[j];
+    c.m.norm_w = norm_w;
+    c.m.norm_out = norm_out;
+    c.m.eps = eps;
+    c.m.q8 = (QB*) q8;
+    c.m.ffn = ffn;
+    c.cx = x;
+    c.state = state;
+    c.cw = w;
+    c.ao = ao;
+    c.acc = acc;
+    c.keep = keep;
+    c.a_scale = a;
+    c.cnorm = 1.0f / std::sqrt((float) (taps + 1));
+    c.mode = mode;
+    c.taps = taps;
+    launch_mix<ConvMixOne>(states.n, n_query, dim3(1), cs(stream), c, n_embd);
+    launched("ink_conv_mix");
+}
+
+void ink_conv_mix_rows(const float* x, const float* state, const float* w, float* ao, float* acc, float* keep, float a,
+                       int mode, int taps, const InkStates& states, const float* query, int n_query, float* const* out,
+                       int n_embd, int rows, const float* norm_w, float* norm_out, float eps, void* stream, void* q8,
+                       bool ffn) {
+    if (rows <= 0) return;
+    if (states.n < 1 || states.n > InkStates::kMax || n_query < 1 || n_query > kQueries || taps < 2 || taps > 8 ||
+        rows > kConvFew || n_embd > kMixHeld * kMixThreads || sum_threads(n_embd) != kMixThreads)
+        throw std::invalid_argument("ink_conv_mix_rows: unsupported shape");
+    if ((q8 || ffn) && (!norm_out || n_embd % 32 != 0 || (ffn && (!q8 || !norm_w))))
+        throw std::invalid_argument("ink_conv_mix_rows: quantized norm requires norm_out and 32k width");
+    ConvMixArgs c{};
+    for (int s = 0; s < states.n; ++s) c.m.s[s] = states.p[s];
+    c.m.n = states.n;
+    c.m.query = query;
+    c.m.nq = n_query;
+    for (int j = 0; j < n_query; ++j) c.m.out[j] = out[j];
+    c.m.norm_w = norm_w;
+    c.m.norm_out = norm_out;
+    c.m.eps = eps;
+    c.m.q8 = (QB*) q8;
+    c.m.ffn = ffn;
+    c.cx = x;
+    c.state = const_cast<float*>(state);
+    c.cw = w;
+    c.ao = ao;
+    c.acc = acc;
+    c.keep = keep;
+    c.a_scale = a;
+    c.cnorm = 1.0f / std::sqrt((float) (taps + 1));
+    c.mode = mode;
+    c.taps = taps;
+    launch_mix<ConvMixRows>(states.n, n_query, dim3(rows), cs(stream), c, n_embd);
+    launched("ink_conv_mix_rows");
+}
+
+void ink_moe_conv_mix(const float* x, const float* w, const float* scale, const int* ids, int n_used, float* fo,
+                      float* state, const float* cw, float* fc, float* acc, float a, int taps, const InkStates& states,
+                      const float* query, int n_query, float* const* out, int n_embd, const float* norm_w,
+                      float* norm_out, float eps, void* stream, void* q8) {
+    if (states.n < 1 || states.n > InkStates::kMax || n_query < 1 || n_query > kQueries || taps < 2 || taps > 8 ||
+        n_embd > kMixHeld * kMixThreads || sum_threads(n_embd) != kMixThreads)
+        throw std::invalid_argument("ink_moe_conv_mix: unsupported shape");
+    if (q8 && (!norm_out || n_embd % 32 != 0))
+        throw std::invalid_argument("ink_moe_conv_mix: quantized norm requires norm_out and 32k width");
+    MoeConvMixArgs c{};
+    for (int s = 0; s < states.n; ++s) c.m.s[s] = states.p[s];
+    c.m.n = states.n;
+    c.m.query = query;
+    c.m.nq = n_query;
+    for (int j = 0; j < n_query; ++j) c.m.out[j] = out[j];
+    c.m.norm_w = norm_w;
+    c.m.norm_out = norm_out;
+    c.m.eps = eps;
+    c.m.q8 = (QB*) q8;
+    c.m.ffn = 0;
+    c.mx = x;
+    c.mw = w;
+    c.mscale = scale;
+    c.mids = ids;
+    c.fo = fo;
+    c.state = state;
+    c.cw = cw;
+    c.fc = fc;
+    c.acc = acc;
+    c.a_scale = a;
+    c.cnorm = 1.0f / std::sqrt((float) (taps + 1));
+    c.n_used = n_used;
+    c.taps = taps;
+    launch_mix<MoeConvMixOne>(states.n, n_query, dim3(1), cs(stream), c, n_embd);
+    launched("ink_moe_conv_mix");
+}
+
+#if defined(__HIPCC__)
+// HIP: ink_clips() in one launch of a kernel of its own, and ink_qkv() as ink_conv_few() of K and V and then that.
+// ink_clips_kernel and ink_qkv_kernel never finished on an RX 7900 XT (gfx1100) or an RX 9070 XT (gfx1201) under
+// ROCm 7.2.4 (the first prompt or token of Inkling 2 Mini with them), and the same code built with any change to
+// ink_clips_kernel finished: the compiler's code for those two, not their arithmetic.  This one picks its job by
+// comparisons and copies the job's fields out, where ink_clips_kernel indexes the arrays by a counted loop; each block
+// is a token's head through the same clip_head() / rms_head() and the same stores, so the bits are those of
+// ink_clip(), ink_head_rms() and store_f16() / store_f16_at() / ink_store_ring() / kvq8_store() one at a time
+// (poly_inkling2_test's clips and qkv cases compare them).
+struct ClipJob {
+    float* x;
+    const float* scale;
+    float thr, alpha, floor_;
+    int dim, heads;
+    bool rms;
+    void* cache;
+};
+
+__device__ __forceinline__ ClipJob clip_job(const InkClips& c, int j) {
+    switch (j) {
+    case 0: return {c.x[0], c.scale[0], c.thr[0], c.alpha[0], c.floor[0], c.dim[0], c.heads[0], c.rms[0], c.cache[0]};
+    case 1: return {c.x[1], c.scale[1], c.thr[1], c.alpha[1], c.floor[1], c.dim[1], c.heads[1], c.rms[1], c.cache[1]};
+    case 2: return {c.x[2], c.scale[2], c.thr[2], c.alpha[2], c.floor[2], c.dim[2], c.heads[2], c.rms[2], c.cache[2]};
+    default: return {c.x[3], c.scale[3], c.thr[3], c.alpha[3], c.floor[3], c.dim[3], c.heads[3], c.rms[3], c.cache[3]};
     }
+}
+
+template <int KV>
+__launch_bounds__(128) __global__ void ink_clips_hip_kernel(InkClips c) {
+    __shared__ float part[128 / WARP];
+    const int e0 = c.rows * c.heads[0], e1 = e0 + c.rows * c.heads[1], e2 = e1 + c.rows * c.heads[2];
+    const int bx = (int) blockIdx.x;
+    const int j = bx < e0 ? 0 : bx < e1 ? 1 : bx < e2 ? 2 : 3;
+    const int b = bx - (j == 0 ? 0 : j == 1 ? e0 : j == 2 ? e1 : e2);
+    const ClipJob J = clip_job(c, j);
+    const int row = b / J.heads, head = b % J.heads;
+    float* v = J.x + (size_t(row) * J.heads + head) * J.dim;
+    if (J.rms) rms_head(v, J.dim, c.eps, part);
+    else
+        clip_head(v, J.scale ? J.scale + size_t(head) * J.dim : nullptr, J.thr, J.dim, J.alpha, J.floor_,
+                  c.at ? c.at[2 * row] : c.pos + row, part);
+    if (!J.cache) return;   // each thread its own values, as clip_head() and rms_head() left them
+    long long cell = (c.at ? c.at[0] : c.pos) + row;
+    if (c.ring > 0) cell %= c.ring;
+    if (KV == kKvQ8) {
+        kvq8_store(v, (uint8_t*) J.cache, cell, J.heads, J.dim, head);
+        return;
+    }
+    __half* to = (__half*) J.cache + (size_t) cell * J.heads * J.dim + (size_t) head * J.dim;
+    for (int i = threadIdx.x; i < J.dim; i += blockDim.x) to[i] = __float2half(v[i]);
+}
+
+static void clips_hip(const InkClips& c, void* stream) {
+    if (c.kv8) throw std::logic_error("ink_clips: no FP8 caches under HIP");
+    if (c.kvq8)
+        for (int j = 0; j < 4; ++j)
+            if (c.cache[j] && c.dim[j] % 32)
+                throw std::invalid_argument("ink_clips: Q8_0 caches need heads of whole 32-value blocks");
+    const int blocks = c.rows * (c.heads[0] + c.heads[1] + c.heads[2] + c.heads[3]);
+    if (blocks <= 0) return;   // no heads: nothing to launch (a grid of 0 blocks is an error)
+    auto* k = c.kvq8 ? ink_clips_hip_kernel<kKvQ8> : ink_clips_hip_kernel<kKvF16>;
+    k<<<blocks, 128, 0, cs(stream)>>>(c);
+    launched("ink_clips");
 }
 #endif
 
@@ -3055,9 +3944,10 @@ void ink_qkv(const InkQkv& a, void* stream) {
         throw std::invalid_argument("ink_qkv: heads of up to 128 values, 2 to 8 taps");
 #if defined(__HIPCC__)
     if (a.kv8) throw std::logic_error("ink_qkv: no FP8 caches under HIP");
-    const int kv = a.n_kv * a.dim;
-    ink_conv(a.kraw, a.kstate, a.kw, a.kdyn, a.k, kv, a.n_kv, a.taps, 1, stream);
-    ink_conv(a.vraw, a.vstate, a.vw, a.vdyn, a.v, kv, a.n_kv, a.taps, 1, stream);
+    InkConv ck, cv;   // ink_conv()'s of each, in one launch
+    ck.x = a.kraw, ck.state = a.kstate, ck.w = a.kw, ck.dyn = a.kdyn, ck.out = a.k;
+    cv.x = a.vraw, cv.state = a.vstate, cv.w = a.vw, cv.dyn = a.vdyn, cv.out = a.v;
+    ink_conv_few(ck, cv, a.n_kv * a.dim, a.n_kv, a.taps, 1, stream, 0, 0);
     InkClips c;
     float* xs[4] = {a.q, a.k, a.v, a.r};
     const float* sc[4] = {a.q_scale, nullptr, nullptr, a.r_scale};
@@ -3078,7 +3968,7 @@ void ink_qkv(const InkQkv& a, void* stream) {
     c.ring = a.ring;
     c.kv8 = a.kv8;
     c.kvq8 = a.kvq8;
-    clips_apart(c, stream);
+    clips_hip(c, stream);
 #else
     QkvArgs g{a, 1.0f / std::sqrt((float) ((a.kdyn ? 2 : 1) * a.taps + 1)),
               1.0f / std::sqrt((float) ((a.vdyn ? 2 : 1) * a.taps + 1))};
@@ -3101,6 +3991,50 @@ void ink_qkv_rows(const InkQkv& a, const InkQkvRows& r, int rows, void* stream) 
     launched("ink_qkv_rows");
 }
 
+void ink_qkv_win(const InkQkv& a, int rows, float* ksnap, float* vsnap, size_t snap_stride, unsigned snap_bits,
+                 void* stream) {
+    if (a.dim > 128 || a.n_rel > 128 || a.taps < 2 || a.taps > 8 || a.n_kv < 1 || rows < 1 || rows > kConvFew)
+        throw std::invalid_argument("ink_qkv_win: heads of up to 128 values, 2 to 8 taps, 1 to 8 rows");
+#if defined(__HIPCC__)
+    if (a.kv8) throw std::logic_error("ink_qkv_win: no FP8 caches under HIP");
+    const int kv = a.n_kv * a.dim;
+    InkConv ck, cv;
+    ck.x = a.kraw, ck.state = a.kstate, ck.w = a.kw, ck.dyn = a.kdyn, ck.out = a.k, ck.snap = snap_bits ? ksnap : nullptr;
+    cv.x = a.vraw, cv.state = a.vstate, cv.w = a.vw, cv.dyn = a.vdyn, cv.out = a.v, cv.snap = snap_bits ? vsnap : nullptr;
+    ink_conv_few(ck, cv, kv, a.n_kv, a.taps, rows, stream, snap_stride, snap_bits);
+    InkClips c;
+    float* xs[4] = {a.q, a.k, a.v, a.r};
+    const float* sc[4] = {a.q_scale, nullptr, nullptr, a.r_scale};
+    const float thr[4] = {a.qk_thr, a.qk_thr, 0.f, a.rel_thr}, al[4] = {a.alpha, 0.f, 0.f, a.alpha};
+    const float fl[4] = {a.floor, 1.f, 1.f, a.floor};
+    const int dims[4] = {a.dim, a.dim, a.dim, a.n_rel}, hs[4] = {a.n_head, a.n_kv, a.n_kv, a.n_head};
+    for (int j = 0; j < 4; ++j) {
+        c.x[j] = xs[j], c.scale[j] = sc[j], c.thr[j] = thr[j], c.alpha[j] = al[j], c.floor[j] = fl[j];
+        c.dim[j] = dims[j], c.heads[j] = hs[j];
+    }
+    c.rms[2] = true;
+    c.eps = a.eps;
+    c.pos = a.pos;
+    c.at = a.at;
+    c.rows = rows;
+    c.cache[1] = a.keys;
+    c.cache[2] = a.vals;
+    c.ring = a.ring;
+    c.kv8 = a.kv8;
+    c.kvq8 = a.kvq8;
+    clips_hip(c, stream);
+#else
+    QkvArgs g{a, 1.0f / std::sqrt((float) ((a.kdyn ? 2 : 1) * a.taps + 1)),
+              1.0f / std::sqrt((float) ((a.vdyn ? 2 : 1) * a.taps + 1))};
+    launch_pdl(a.kvq8  ? ink_qkv_win_kernel<kKvQ8>
+               : a.kv8 ? ink_qkv_win_kernel<kKvFp8>
+                       : ink_qkv_win_kernel<kKvF16>,
+               dim3(2 * rows * a.n_head + 2 * a.n_kv), dim3(128), 0, cs(stream), g, rows, ksnap, vsnap, snap_stride,
+               snap_bits);
+    launched("ink_qkv_win");
+#endif
+}
+
 void ink_clip(float* x, const float* scale, float thr, int dim, int heads, int rows, int64_t pos, float alpha,
               float floor, void* stream, const long long* at) {
     if (rows <= 0) return;
@@ -3112,7 +4046,7 @@ void ink_clip(float* x, const float* scale, float thr, int dim, int heads, int r
 void ink_clips(const InkClips& c, void* stream) {
     if (c.rows <= 0) return;
 #if defined(__HIPCC__)
-    clips_apart(c, stream);
+    clips_hip(c, stream);
 #else
     auto* k = c.kvq8 ? ink_clips_kernel<kKvQ8> : c.kv8 ? ink_clips_kernel<kKvFp8> : ink_clips_kernel<kKvF16>;
     k<<<c.rows * (c.heads[0] + c.heads[1] + c.heads[2] + c.heads[3]), 128, 0, cs(stream)>>>(c);
@@ -3143,6 +4077,12 @@ void ink_softcap(float* logits, int n_keep, int n_all, int rows, float cap, void
     if (rows <= 0) return;
     ink_softcap_kernel<<<grid((size_t) rows * n_all, 256), 256, 0, cs(stream)>>>(logits, n_keep, n_all, rows, cap);
     launched("ink_softcap");
+}
+
+void ink_loopcd_extrap(float* dst, const float* ref, float omega, size_t n, void* stream) {
+    if (n == 0 || omega == 0.0f) return;
+    ink_loopcd_extrap_kernel<<<grid(n, 256), 256, 0, cs(stream)>>>(dst, ref, omega, n);
+    launched("ink_loopcd_extrap");
 }
 
 // The warps of a block of the value kernel: as many as have their sums in a block's shared memory.
@@ -3215,9 +4155,34 @@ static void attend(const InkAttn& a, const InkAttnRows* rows, void* stream) {
     const size_t value_shared = (size_t) warps * group * a.dim * sizeof(float);
     for (int t0 = 0; t0 < a.rows; t0 += chunk) {
         const int m = std::min(chunk, a.rows - t0);
+#if !defined(__HIPCC__)
+        static const bool attn_win_on = [] {
+            const char* v = std::getenv("STRATA_INK_ATTN_WIN");
+            return v == nullptr || v[0] != '0';
+        }();
+        const bool win_full = !rows && m >= 2 && m <= 8 && a.window == 0 && a.ring == 0 && attn_win_on;
+        const bool score_win = win_full && !(a.kvq8 && a.int8_dot && nk_max >= kInt8From);
+#else
+        const bool win_full = false, score_win = false;
+#endif
         if (rows)
             launch_pdl(a.kv8 ? ink_score_rows_kernel<kKvFp8> : ink_score_rows_kernel<kKvF16>,
                        dim3(m * a.n_kv, score_blocks), dim3(kScoreWarps * 32), 0, cs(stream), a, t0, nk_max, *rows);
+#if !defined(__HIPCC__)
+        else if (score_win) {
+            const int steps = score_steps(a.n_kv, nk_max), keys = kScoreWarps * kScoreKeys * steps;
+            const size_t sm = (size_t) m * group * (size_t) (a.dim + 33) * sizeof(float);
+            auto* k = a.dim == 128
+                          ? (a.kvq8 ? ink_score_win_kernel<kKvQ8, 4>
+                             : a.kv8 ? ink_score_win_kernel<kKvFp8, 4>
+                                     : ink_score_win_kernel<kKvF16, 4>)
+                          : (a.kvq8 ? ink_score_win_kernel<kKvQ8, 2>
+                             : a.kv8 ? ink_score_win_kernel<kKvFp8, 2>
+                                     : ink_score_win_kernel<kKvF16, 2>);
+            launch_pdl(k, dim3(a.n_kv, (nk_max + keys - 1) / keys), dim3(kScoreWarps * 32), sm, cs(stream), a, t0, m,
+                       nk_max, steps);
+        }
+#endif
         else {
             const int steps = score_steps(m * a.n_kv, nk_max), keys = kScoreWarps * kScoreKeys * steps;
             launch_pdl(score_kernel(a), dim3(m * a.n_kv, (nk_max + keys - 1) / keys), dim3(kScoreWarps * 32), 0,
@@ -3229,6 +4194,14 @@ static void attend(const InkAttn& a, const InkAttnRows* rows, void* stream) {
         if (rows)
             launch_pdl(a.kv8 ? ink_value_rows_kernel<kKvFp8> : ink_value_rows_kernel<kKvF16>, dim3(m * a.n_kv, n_parts),
                        dim3(warps * 32), value_shared, cs(stream), a, t0, nk_max, parts, n_parts, *rows);
+#if !defined(__HIPCC__)
+        else if (win_full)
+            launch_pdl(a.kvq8  ? ink_value_win_kernel<kKvQ8>
+                       : a.kv8 ? ink_value_win_kernel<kKvFp8>
+                               : ink_value_win_kernel<kKvF16>,
+                       dim3(a.n_kv, n_parts), dim3(warps * 32), value_shared, cs(stream), a, t0, m, nk_max, parts,
+                       n_parts);
+#endif
         else
             launch_pdl(a.kvq8  ? ink_value_kernel<kKvQ8>
                        : a.kv8 ? ink_value_kernel<kKvFp8>
@@ -3548,11 +4521,12 @@ bool ink_kv8_ok() {
 #endif
 }
 
-void ink_control3_gate(const float* const* cur, const float* const* msg, const float* const* ch,
-                       const void* const* gain_w, const void* const* forget_w, float* const* out, int n, int rank,
-                       void* stream, int count, bool bf16) {
+void ink_control3_gate_rows(const float* const* cur, const float* const* msg, const float* const* ch,
+                            const void* const* gain_w, const void* const* forget_w, float* const* out, int n, int rank,
+                            int rows, void* stream, int count, bool bf16) {
     if (rank >= 128) throw std::invalid_argument("ink_control3_gate: gemv_set() takes products this wide otherwise");
     if (count < 1 || count > 3) throw std::invalid_argument("ink_control3_gate: 1 to 3 controllers");
+    if (rows <= 0) return;
     Control3 c{};
     c.count = count;
     for (int j = 0; j < count; ++j) {
@@ -3564,10 +4538,16 @@ void ink_control3_gate(const float* const* cur, const float* const* msg, const f
         c.out[j] = out[j];
     }
     if (bf16)
-        launch_pdl(ink_control3_gate_kernel<uint16_t>, dim3((n + 7) / 8), dim3(256), 0, cs(stream), c, n, rank);
+        launch_pdl(ink_control3_gate_kernel<uint16_t>, dim3((n + 7) / 8, rows), dim3(256), 0, cs(stream), c, n, rank);
     else
-        launch_pdl(ink_control3_gate_kernel<float>, dim3((n + 7) / 8), dim3(256), 0, cs(stream), c, n, rank);
+        launch_pdl(ink_control3_gate_kernel<float>, dim3((n + 7) / 8, rows), dim3(256), 0, cs(stream), c, n, rank);
     launched("ink_control3_gate");
+}
+
+void ink_control3_gate(const float* const* cur, const float* const* msg, const float* const* ch,
+                       const void* const* gain_w, const void* const* forget_w, float* const* out, int n, int rank,
+                       void* stream, int count, bool bf16) {
+    ink_control3_gate_rows(cur, msg, ch, gain_w, forget_w, out, n, rank, 1, stream, count, bf16);
 }
 
 void situ_rows(const float* gate_up, float* out, int n, int rows, float beta, float lb, void* stream, void* q8,
@@ -3661,14 +4641,42 @@ __global__ void ds_rope_kernel(float* x, int heads, const float* __restrict__ w,
     if (tags && h == 0 && i == 0) tags[pos % cap] = pos;
 }
 
+// row t (blockIdx.x), head h (blockIdx.y < heads: Q; else K/V): fused ds_rope(q) + ds_rope(k, v)
+__global__ void ds_rope_qkv_kernel(float* q, float* k, const float* v, int heads, int kv_heads,
+                                   const float* __restrict__ qw, const float* __restrict__ kw, float eps, float theta,
+                                   DsPos p, __half* kcache, __half* vcache, long long cap, long long* tags) {
+    __shared__ float part[kDsHead / 32];
+    __shared__ float y[kDsHead];
+    const int t = blockIdx.x, b = blockIdx.y, i = threadIdx.x;
+    const bool is_q = b < heads;
+    const int h = is_q ? b : b - heads;
+    const int nh = is_q ? heads : kv_heads;
+    float* row = (is_q ? q : k) + ((size_t) t * nh + h) * kDsHead;
+    const float* w = is_q ? qw : kw;
+    const float xi = row[i];
+    const float scale = 1.0f / sqrtf(block_sum(xi * xi, part) / (float) kDsHead + eps);
+    y[i] = xi * scale * w[i];
+    __syncthreads();
+    const long long pos = ds_pos(p, t);
+    const int half = kDsHead / 2, idx = i % half;
+    const float freq = powf(theta, -2.0f * (float) idx / (float) kDsHead), ang = (float) pos * freq;
+    const float c = cosf(ang), s = sinf(ang);
+    const float out = i < half ? y[i] * c - y[i + half] * s : y[i - half] * s + y[i] * c;
+    if (is_q) {
+        row[i] = out;
+        return;
+    }
+    const size_t cell = (size_t) (pos % cap) * kv_heads * kDsHead + (size_t) h * kDsHead + i;
+    kcache[cell] = __float2half(out);
+    if (v) vcache[cell] = __float2half(v[((size_t) t * kv_heads + h) * kDsHead + i]);
+    if (tags && h == 0 && i == 0) tags[pos % cap] = pos;
+}
+
 // The block's attention, the keys split among blocks so that a long context is read at once: block (g, s) takes kv
-// head g's query rows (block row t's head g * grp + k as row t * grp + k) over split s of the keys [lo, hi), a warp a
-// key, and softmaxes them online; ds_join_kernel joins the splits.  lo and hi follow the block's first position on
-// the card (a recorded block takes any): a window layer's window before the block and the block, a full layer every
-// position.  The split: the keys over kDsSplits, a whole number of tiles each.
+// head g's query rows (block row t's head g * grp + k as row t * grp + k, one warp per query row) over split s of
+// [lo, hi) with online softmax, zero shared memory and zero per-tile barriers; ds_join_kernel joins the splits.
 constexpr int kDsRows = 24;    // a kv head's query rows at most: 8 block rows of 3 heads
-constexpr int kDsTile = 32;    // keys a tile, read into shared memory at once
-static_assert(kDsTile == 32, "ds_part_kernel scores a tile's keys a lane each");
+constexpr int kDsTile = 32;    // split alignment in keys
 constexpr int kDsSplits = 64;  // splits at most
 constexpr int kDsPart = kDsHead + 2;   // a row's part: its values' weighted sum, its max, its sum
 
@@ -3679,16 +4687,12 @@ __device__ __forceinline__ void ds_span(const DsPos& p, int nb, int window, long
     per = (int) (((nk + kDsSplits - 1) / kDsSplits + kDsTile - 1) / kDsTile * kDsTile);
 }
 
-__global__ void __launch_bounds__(256) ds_part_kernel(const float* q, const __half* keys, const __half* vals,
+constexpr int kDsSmTile = 8;
+
+__global__ void __launch_bounds__(768) ds_part_kernel(const float* q, const __half* keys, const __half* vals,
                                                       const long long* tags, long long cap, DsPos p, int nb,
                                                       int window, int heads, int kv_heads, float scale, float* part) {
-    __shared__ __align__(16) float qs[kDsRows][kDsHead];
-    __shared__ half2 ks[kDsTile][kDsHead / 2 + 1];   // a key a row, a word longer: a warp's lanes read 32 rows
-    __shared__ __align__(16) __half vs[kDsTile][kDsHead];
-    __shared__ float sc[kDsRows][kDsTile];
-    __shared__ float mrun[kDsRows], lrun[kDsRows], corr[kDsRows];
-    __shared__ bool held[kDsTile];   // the key's cell holds its position (a ring after going back holds later ones)
-    const int g = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int g = int(blockIdx.x), s = int(blockIdx.y), lane = int(threadIdx.x), r = int(threadIdx.y);
     const int grp = heads / kv_heads, R = nb * grp;
     long long lo, nk;
     int per;
@@ -3696,76 +4700,90 @@ __global__ void __launch_bounds__(256) ds_part_kernel(const float* q, const __ha
     const long long k0 = (long long) s * per;
     if (k0 >= nk) return;
     const long long k1 = min(nk, k0 + per);
-    for (int i = tid; i < R * kDsHead; i += blockDim.x) {
-        const int r = i / kDsHead, d = i % kDsHead;
-        qs[r][d] = q[((size_t) (r / grp) * heads + g * grp + r % grp) * kDsHead + d] * scale;
-    }
-    if (tid < R) mrun[tid] = -INFINITY, lrun[tid] = 0.0f;
-    const int d = tid % kDsHead, r0 = tid / kDsHead;   // the values: d of rows r0, r0 + 2, ...
-    float acc[kDsRows / 2];
-#pragma unroll
-    for (int i = 0; i < kDsRows / 2; ++i) acc[i] = 0.0f;
-    const size_t at_g = (size_t) g * kDsHead, cell = (size_t) kv_heads * kDsHead;
-    __syncthreads();
-    for (long long t0 = k0; t0 < k1; t0 += kDsTile) {
-        const int nt = (int) min((long long) kDsTile, k1 - t0);
-        for (int i = tid; i < nt * (kDsHead / 8); i += blockDim.x) {   // the tile's keys and values, 8 halves a load
-            const int j = i / (kDsHead / 8), c = i % (kDsHead / 8) * 8;
-            const size_t at = (size_t) ((lo + t0 + j) % cap) * cell + at_g + c;
-            const uint4 kw = *(const uint4*) (keys + at);
-            ks[j][c / 2] = *(const half2*) &kw.x, ks[j][c / 2 + 1] = *(const half2*) &kw.y;
-            ks[j][c / 2 + 2] = *(const half2*) &kw.z, ks[j][c / 2 + 3] = *(const half2*) &kw.w;
-            *(uint4*) &vs[j][c] = *(const uint4*) (vals + at);
-        }
-        if (tid < nt) held[tid] = !tags || tags[(lo + t0 + tid) % cap] == lo + t0 + tid;
-        __syncthreads();
-        for (int r = warp; r < R && lane < nt; r += 8) {   // a warp a query row, a lane a key
-            float x = 0.0f;
-#pragma unroll 16
-            for (int c = 0; c < kDsHead / 2; ++c) {
-                const float2 k = __half22float2(ks[lane][c]), qv = *(const float2*) &qs[r][2 * c];
-                x += qv.x * k.x + qv.y * k.y;
+    const float* qr = q + ((size_t) (r / grp) * heads + g * grp + r % grp) * kDsHead + lane * 4;
+    const float q0 = r < R ? qr[0] * scale : 0.0f;
+    const float q1 = r < R ? qr[1] * scale : 0.0f;
+    const float q2 = r < R ? qr[2] * scale : 0.0f;
+    const float q3 = r < R ? qr[3] * scale : 0.0f;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    const size_t cell_stride = (size_t) kv_heads * kDsHead, g_off = (size_t) g * kDsHead;
+    const int tid = r * 32 + lane, nthreads = int(blockDim.y) * 32;
+    __shared__ __align__(16) __half sk[kDsSmTile][kDsHead];
+    __shared__ __align__(16) __half sv[kDsSmTile][kDsHead];
+    __shared__ long long s_cell[kDsSmTile];
+    __shared__ uint8_t s_valid[kDsSmTile];
+    for (long long kt = k0; kt < k1; kt += kDsSmTile) {
+        const int n_t = (int) min((long long) kDsSmTile, k1 - kt);
+        if (tid < kDsSmTile) {
+            if (tid < n_t) {
+                const long long au = lo + kt + tid;
+                const long long cu = au % cap;
+                s_cell[tid] = cu;
+                s_valid[tid] = (!tags || tags[cu] == au) ? 1 : 0;
+            } else {
+                s_valid[tid] = 0;
             }
-            sc[r][lane] = held[lane] ? x : -INFINITY;
         }
         __syncthreads();
-        if (tid < R) {
-            float m = mrun[tid];
-            for (int j = 0; j < nt; ++j) m = fmaxf(m, sc[tid][j]);
-            corr[tid] = m == -INFINITY ? 1.0f : expf(mrun[tid] - m);
-            mrun[tid] = m;
+        for (int idx = tid; idx < n_t * (kDsHead / 8); idx += nthreads) {
+            const int u = idx >> 4, v8 = (idx & 15) * 8;
+            if (s_valid[u]) {
+                const size_t o = (size_t) s_cell[u] * cell_stride + g_off + v8;
+                *reinterpret_cast<uint4*>(&sk[u][v8]) = *reinterpret_cast<const uint4*>(keys + o);
+                *reinterpret_cast<uint4*>(&sv[u][v8]) = *reinterpret_cast<const uint4*>(vals + o);
+            }
         }
         __syncthreads();
-        for (int i = tid; i < R * kDsTile; i += blockDim.x) {
-            const int r = i / kDsTile, j = i % kDsTile;
-            if (j < nt) sc[r][j] = sc[r][j] == -INFINITY ? 0.0f : expf(sc[r][j] - mrun[r]);
-        }
-        __syncthreads();
-        if (tid < R) {
-            float l = 0.0f;
-            for (int j = 0; j < nt; ++j) l += sc[tid][j];
-            lrun[tid] = lrun[tid] * corr[tid] + l;
-        }
+        if (r < R) {
+            float ds[kDsSmTile];
+            float tm = m;
 #pragma unroll
-        for (int i = 0; i < kDsRows / 2; ++i)
-            if (r0 + 2 * i < R) acc[i] *= corr[r0 + 2 * i];
-        for (int j = 0; j < nt; ++j) {
-            const float v = __half2float(vs[j][d]);
+            for (int u = 0; u < kDsSmTile; ++u) {
+                if (s_valid[u]) {
+                    const __half2* kp = reinterpret_cast<const __half2*>(&sk[u][lane * 4]);
+                    const float2 kf0 = __half22float2(kp[0]), kf1 = __half22float2(kp[1]);
+                    const float d = warp_sum(q0 * kf0.x + q1 * kf0.y + q2 * kf1.x + q3 * kf1.y);
+                    ds[u] = d;
+                    tm = fmaxf(tm, d);
+                } else {
+                    ds[u] = -INFINITY;
+                }
+            }
+            if (tm > -INFINITY) {
+                const float keep = m == -INFINITY ? 0.0f : expf(m - tm);
+                l *= keep;
+                a0 *= keep, a1 *= keep, a2 *= keep, a3 *= keep;
+                m = tm;
 #pragma unroll
-            for (int i = 0; i < kDsRows / 2; ++i)
-                if (r0 + 2 * i < R) acc[i] += sc[r0 + 2 * i][j] * v;
+                for (int u = 0; u < kDsSmTile; ++u) {
+                    if (s_valid[u]) {
+                        const float w = expf(ds[u] - m);
+                        l += w;
+                        const __half2* vp = reinterpret_cast<const __half2*>(&sv[u][lane * 4]);
+                        const float2 vf0 = __half22float2(vp[0]), vf1 = __half22float2(vp[1]);
+                        a0 += w * vf0.x;
+                        a1 += w * vf0.y;
+                        a2 += w * vf1.x;
+                        a3 += w * vf1.y;
+                    }
+                }
+            }
         }
         __syncthreads();
     }
-    float* out = part + ((size_t) g * kDsSplits + s) * kDsRows * kDsPart;
-#pragma unroll
-    for (int i = 0; i < kDsRows / 2; ++i)
-        if (r0 + 2 * i < R) out[(r0 + 2 * i) * kDsPart + d] = acc[i];
-    if (tid < R) out[tid * kDsPart + kDsHead] = mrun[tid], out[tid * kDsPart + kDsHead + 1] = lrun[tid];
+    if (r >= R) return;
+    float* out = part + ((size_t) g * kDsSplits + s) * kDsRows * kDsPart + r * kDsPart;
+    out[lane * 4 + 0] = a0;
+    out[lane * 4 + 1] = a1;
+    out[lane * 4 + 2] = a2;
+    out[lane * 4 + 3] = a3;
+    if (lane == 0) out[kDsHead] = m, out[kDsHead + 1] = l;
 }
 
-// query row t (blockIdx.x), head h (blockIdx.y), a thread a value: the splits' parts joined
-__global__ void ds_join_kernel(const float* part, DsPos p, int nb, int window, int heads, int kv_heads, float* out) {
+// query row t (blockIdx.x), head h (blockIdx.y), a thread a value: the splits' parts joined (+ optional q8_1)
+__global__ void ds_join_kernel(const float* part, DsPos p, int nb, int window, int heads, int kv_heads, float* out,
+                               QB* q8) {
     const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x, grp = heads / kv_heads;
     long long lo, nk;
     int per;
@@ -3782,7 +4800,10 @@ __global__ void ds_join_kernel(const float* part, DsPos p, int nb, int window, i
         l += w * in[s * step + kDsHead + 1];
         a += w * in[s * step + d];
     }
-    out[((size_t) t * heads + h) * kDsHead + d] = a / l;
+    const float y = a / l;
+    const int idx = ((t * heads + h) * kDsHead + d);
+    out[idx] = y;
+    if (q8) q8_put(q8, idx, y);
 }
 
 __global__ void ds_swiglu_kernel(float* g, const float* __restrict__ u, size_t n) {
@@ -3824,6 +4845,46 @@ __global__ void ds_markov_step_kernel(const float* __restrict__ ctx_h, const flo
     const float gate = 1.0f / (1.0f + expf(-raw(r)));
     state[r] = gate * state[r] + (1.0f - gate) * tanhf(raw(rank + r));
     latent[r] = tanhf(raw(2 * rank + r));
+}
+
+constexpr int kDsMarkovMaxRank = 512;
+__global__ void __launch_bounds__(256) ds_markov_fused_kernel(
+    const float* __restrict__ state_in, const uint16_t* __restrict__ w1, const int32_t* __restrict__ prev,
+    const uint16_t* __restrict__ wsp, const float* __restrict__ ctx_h, const float* __restrict__ ctx_f,
+    const float* __restrict__ bias, float* __restrict__ state_out, float* __restrict__ latent, QB* lat_q8, int rank) {
+    __shared__ float s_in[2 * kDsMarkovMaxRank];
+    __shared__ float s_sp[3][32];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int r0 = int(blockIdx.x) * 32;
+    const int ptok = *prev;
+    const uint16_t* w1_row = w1 + (size_t) ptok * rank;
+    for (int k = tid; k < rank; k += 256) {
+        s_in[k] = state_in[k];
+        s_in[rank + k] = ds_bf16(w1_row[k]);
+    }
+    __syncthreads();
+    const int n_in = 2 * rank;
+    for (int idx = warp; idx < 96; idx += 8) {
+        const int grp = idx >> 5, j = idx & 31;
+        const int out_row = grp * rank + r0 + j;
+        const uint16_t* wr = wsp + (size_t) out_row * n_in;
+        float acc = 0.0f;
+        for (int k = lane; k < n_in; k += 32) acc += ds_bf16(wr[k]) * s_in[k];
+        acc = warp_sum(acc);
+        if (lane == 0) s_sp[grp][j] = acc;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const int r = r0 + lane;
+        const float raw0 = ctx_h[r] + ctx_f[r] + bias[r] + s_sp[0][lane];
+        const float raw1 = ctx_h[rank + r] + ctx_f[rank + r] + bias[rank + r] + s_sp[1][lane];
+        const float raw2 = ctx_h[2 * rank + r] + ctx_f[2 * rank + r] + bias[2 * rank + r] + s_sp[2][lane];
+        const float gate = 1.0f / (1.0f + expf(-raw0));
+        state_out[r] = gate * s_in[r] + (1.0f - gate) * tanhf(raw1);
+        const float lat = tanhf(raw2);
+        latent[r] = lat;
+        if (lat_q8) q8_put(lat_q8, r, lat);
+    }
 }
 
 // A draft's pick in two launches: each block of the first takes a slice of the vocabulary, its scores
@@ -3966,10 +5027,20 @@ __device__ __forceinline__ __half scr_fit(const float* w, float& sh_out) {
     return hs;
 }
 
-// a thread a 32-weight group g of copy row `row`: its token's Q8_0 group into the copy
+__device__ __forceinline__ void scr_k4_sc(int sb, const uint8_t* q, uint8_t& sc, uint8_t& m) {
+    if (sb < 4) {
+        sc = q[sb] & 63u;
+        m = q[sb + 4] & 63u;
+    } else {
+        sc = (q[sb + 4] & 0x0Fu) | ((q[sb - 4] & 0xC0u) >> 2);
+        m = (q[sb + 4] >> 4) | ((q[sb] & 0xC0u) >> 2);
+    }
+}
+
+// a thread a 32-weight group g of copy row `row`: its token's Q8_0 / Q4_K / Q5_K group into the copy
 template <int N_IN>
-__global__ void scr_pack_kernel(const uint8_t* __restrict__ q8, int64_t n_rows, uint4* __restrict__ wq,
-                                uint16_t* __restrict__ sc) {
+__global__ void scr_pack_kernel(const uint8_t* __restrict__ w_raw, int64_t n_rows, uint4* __restrict__ wq,
+                                uint16_t* __restrict__ sc, uint32_t type) {
     constexpr int NB = N_IN / 32, kNw4 = scr_nw4(N_IN);
     const int64_t tiles = scr_tiles(n_rows);
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -3977,10 +5048,39 @@ __global__ void scr_pack_kernel(const uint8_t* __restrict__ q8, int64_t n_rows, 
     const int64_t row = i / NB, tok = scr_token(row, tiles);
     const int g = (int) (i % NB);
     if (tok >= n_rows) return;   // past the vocabulary: zeros, masked when scored
-    const uint8_t* b = q8 + (tok * NB + g) * 34;
-    const float d = __half2float(*(const __half*) b);
     float w[32];
-    for (int l = 0; l < 32; ++l) w[l] = d * (float) (int8_t) b[2 + l];
+    if (type == 13u) {   // Q5_K (256 values = 8 groups of 32, 176 bytes)
+        const int blk_idx = g >> 3, sb = g & 7;
+        const uint8_t* blk = w_raw + (tok * (N_IN / 256) + blk_idx) * 176;
+        const float d = __half2float(*(const __half*) blk);
+        const float dmin = __half2float(*(const __half*) (blk + 2));
+        uint8_t s0, m0;
+        scr_k4_sc(sb, blk + 4, s0, m0);
+        const float dl = d * (float) s0, ml = dmin * (float) m0;
+        const uint8_t* qh = blk + 16;
+        const uint8_t* qs = blk + 48 + 32 * (sb >> 1);
+        const uint8_t ul = (uint8_t) (1u << sb);
+        const int shift = (sb & 1) ? 4 : 0;
+        for (int l = 0; l < 32; ++l) {
+            const int qv = ((qs[l] >> shift) & 0x0F) + ((qh[l] & ul) ? 16 : 0);
+            w[l] = dl * (float) qv - ml;
+        }
+    } else if (type == 12u) {   // Q4_K (256 values = 8 groups of 32, 144 bytes)
+        const int blk_idx = g >> 3, sb = g & 7;
+        const uint8_t* blk = w_raw + (tok * (N_IN / 256) + blk_idx) * 144;
+        const float d = __half2float(*(const __half*) blk);
+        const float dmin = __half2float(*(const __half*) (blk + 2));
+        uint8_t s0, m0;
+        scr_k4_sc(sb, blk + 4, s0, m0);
+        const float dl = d * (float) s0, ml = dmin * (float) m0;
+        const uint8_t* qs = blk + 16 + 32 * (sb >> 1);
+        const int shift = (sb & 1) ? 4 : 0;
+        for (int l = 0; l < 32; ++l) w[l] = dl * (float) ((qs[l] >> shift) & 0x0F) - ml;
+    } else {   // Q8_0
+        const uint8_t* b = w_raw + (tok * NB + g) * 34;
+        const float d = __half2float(*(const __half*) b);
+        for (int l = 0; l < 32; ++l) w[l] = d * (float) (int8_t) b[2 + l];
+    }
     float sh;
     const __half hs = scr_fit(w, sh);
     const int tile = (int) (row >> 5), lane = (int) (row & 31), w4 = g / 2, h = g & 1;
@@ -4253,6 +5353,67 @@ __device__ __forceinline__ float scr_dot(const uint8_t* w, const QB* x, int nb, 
     return warp_sum(s);
 }
 
+__device__ __forceinline__ float scr_dot_q5k(const uint8_t* w, const QB* x, int nb, int lane) {
+    float s = 0.0f;
+    for (int g = lane; g < nb; g += 32) {
+        const int blk_idx = g >> 3, sb = g & 7;
+        const uint8_t* blk = w + (size_t) blk_idx * 176u;
+        const float d = __half2float(*(const __half*) blk);
+        const float dmin = __half2float(*(const __half*) (blk + 2));
+        uint8_t s0, m0;
+        scr_k4_sc(sb, blk + 4, s0, m0);
+        const float dl = d * (float) s0, ml = dmin * (float) m0;
+        const uint8_t* qh = blk + 16;
+        const uint8_t* qs = blk + 48 + 32 * (sb >> 1);
+        const uint8_t ul = (uint8_t) (1u << sb);
+        const int shift = (sb & 1) ? 4 : 0;
+        const int* xq = (const int*) x[g].qs;
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int l0 = 4 * j;
+            int qv = 0;
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                const int v = ((qs[l0 + b] >> shift) & 0x0F) + ((qh[l0 + b] & ul) ? 16 : 0);
+                qv |= v << (8 * b);
+            }
+            sumi = __dp4a(qv, xq[j], sumi);
+        }
+        const float2 ds = __half22float2(x[g].ds);
+        s += dl * ds.x * (float) sumi - ml * ds.y;
+    }
+    return warp_sum(s);
+}
+
+__device__ __forceinline__ float scr_dot_q4k(const uint8_t* w, const QB* x, int nb, int lane) {
+    float s = 0.0f;
+    for (int g = lane; g < nb; g += 32) {
+        const int blk_idx = g >> 3, sb = g & 7;
+        const uint8_t* blk = w + (size_t) blk_idx * 144u;
+        const float d = __half2float(*(const __half*) blk);
+        const float dmin = __half2float(*(const __half*) (blk + 2));
+        uint8_t s0, m0;
+        scr_k4_sc(sb, blk + 4, s0, m0);
+        const float dl = d * (float) s0, ml = dmin * (float) m0;
+        const uint8_t* qs = blk + 16 + 32 * (sb >> 1);
+        const int shift = (sb & 1) ? 4 : 0;
+        const int* xq = (const int*) x[g].qs;
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int l0 = 4 * j;
+            int qv = 0;
+#pragma unroll
+            for (int b = 0; b < 4; ++b) qv |= ((qs[l0 + b] >> shift) & 0x0F) << (8 * b);
+            sumi = __dp4a(qv, xq[j], sumi);
+        }
+        const float2 ds = __half22float2(x[g].ds);
+        s += dl * ds.x * (float) sumi - ml * ds.y;
+    }
+    return warp_sum(s);
+}
+
 // One block: the candidates scored exactly (a warp a row), the exact best is guess i: out[i] and *prev, with its
 // probability from the tiles' softmax sums with the rescored rows made exact
 template <int NE, int NR>
@@ -4275,7 +5436,9 @@ __global__ void __launch_bounds__(512) scr_final_kernel(DsScreen h, const QB* xh
     }
     for (int c = warp; c < n; c += 16) {   // by token from here: a tie goes to the lower token
         const int64_t tok = scr_token(f.list[c], n_tiles);
-        const float a = scr_dot((const uint8_t*) h.head + tok * NE * 34, xh, NE, lane);
+        const float a = h.head_type == 13u ? scr_dot_q5k((const uint8_t*) h.head + tok * (NE / 8) * 176, xh, NE, lane)
+                      : h.head_type == 12u ? scr_dot_q4k((const uint8_t*) h.head + tok * (NE / 8) * 144, xh, NE, lane)
+                                           : scr_dot((const uint8_t*) h.head + tok * NE * 34, xh, NE, lane);
         const float b = scr_dot((const uint8_t*) h.fold + tok * NR * 34, xl, NR, lane);
         if (lane == 0) f.ex[c] = h.cap * tanhf((a + b + h.fold_b[tok]) / h.cap), f.list[c] = (int) tok;
     }
@@ -4331,18 +5494,29 @@ void ds_rope(float* x, int heads, int rows, const float* w, float eps, float the
     launched("ds_rope");
 }
 
+void ds_rope_qkv(float* q, float* k, const float* v, int heads, int kv_heads, int rows, const float* qw,
+                 const float* kw, float eps, float theta, const DsPos& p, uint16_t* kcache, uint16_t* vcache,
+                 int64_t cap, long long* tags, void* stream) {
+    if (rows <= 0) return;
+    ds_rope_qkv_kernel<<<dim3(rows, heads + kv_heads), kDsHead, 0, cs(stream)>>>(
+        q, k, v, heads, kv_heads, qw, kw, eps, theta, p, (__half*) kcache, (__half*) vcache, (long long) cap, tags);
+    launched("ds_rope_qkv");
+}
+
 size_t ds_attend_floats(int kv_heads) { return (size_t) kv_heads * kDsSplits * kDsRows * kDsPart; }
 
 void ds_attend(const float* q, const uint16_t* keys, const uint16_t* vals, const long long* tags, int64_t cap,
                const DsPos& p, int window, int rows, int heads, int kv_heads, float scale, float* part, float* out,
-               void* stream) {
-    if (heads % kv_heads || rows * (heads / kv_heads) > kDsRows)
+               void* stream, void* q8) {
+    const int grp = heads / kv_heads, R = rows * grp;
+    if (heads % kv_heads || R < 1 || R > kDsRows)
         throw std::logic_error("ds_attend: more query rows a kv head than it holds");
-    ds_part_kernel<<<dim3(kv_heads, kDsSplits), 256, 0, cs(stream)>>>(
+    ds_part_kernel<<<dim3(kv_heads, kDsSplits), dim3(32, R), 0, cs(stream)>>>(
         q, (const __half*) keys, (const __half*) vals, tags, (long long) cap, p, rows, window, heads, kv_heads, scale,
         part);
     launched("ds_part");
-    ds_join_kernel<<<dim3(rows, heads), kDsHead, 0, cs(stream)>>>(part, p, rows, window, heads, kv_heads, out);
+    ds_join_kernel<<<dim3(rows, heads), kDsHead, 0, cs(stream)>>>(part, p, rows, window, heads, kv_heads, out,
+                                                                  (QB*) q8);
     launched("ds_join");
 }
 
@@ -4370,6 +5544,16 @@ void ds_markov_step(const float* ctx_h, const float* ctx_f, const float* bias, c
     launched("ds_markov_step");
 }
 
+void ds_markov_fused(const float* state_in, const uint16_t* w1, const int32_t* prev, const uint16_t* wsp,
+                     const float* ctx_h, const float* ctx_f, const float* bias, float* state_out, float* latent,
+                     void* lat_q8, int rank, void* stream) {
+    if (rank <= 0 || rank % 32 != 0 || rank > kDsMarkovMaxRank || state_in == state_out)
+        throw std::invalid_argument("ds_markov_fused: rank must be 32..512 (32k) and state_in != state_out");
+    ds_markov_fused_kernel<<<dim3(rank / 32), dim3(256), 0, cs(stream)>>>(
+        state_in, w1, prev, wsp, ctx_h, ctx_f, bias, state_out, latent, (QB*) lat_q8, rank);
+    launched("ds_markov_fused");
+}
+
 size_t ds_pick_floats() { return kDsPickBlocks * sizeof(DsPart) / sizeof(float); }
 
 void ds_pick(const float* base, const float* fy, const float* fb, int n_keep, float cap, float* scratch, Likeliest* out,
@@ -4393,16 +5577,17 @@ int64_t ds_screen_rows(int64_t n_rows) { return scr_tiles(n_rows) * 32; }
 
 size_t ds_screen_scratch_bytes(int64_t n_rows) { return (size_t) scr_tiles(n_rows) * (kScrPer + 1) * sizeof(float2); }
 
-void ds_screen_pack(const void* q8_0, int n_in, int64_t n_rows, void* copy, void* stream) {
+void ds_screen_pack(const void* w, int n_in, int64_t n_rows, void* copy, void* stream, uint32_t type) {
     if (n_in != 2304 && n_in != 256) throw std::logic_error("ds_screen_pack: rows of 2,304 or 256");
+    if (type != 8u && type != 12u && type != 13u) throw std::logic_error("ds_screen_pack: Q8_0, Q4_K or Q5_K");
     // the last tile's rows past n_rows score as zeros
     if (cudaMemsetAsync(copy, 0, scr_bytes(n_rows, n_in), cs(stream)) != cudaSuccess) launched("ds_screen_pack");
     const int64_t total = scr_tiles(n_rows) * 32 * (n_in / 32);
     const unsigned blocks = (unsigned) ((total + 127) / 128);
     uint16_t* sc = scr_scales(copy, n_rows, n_in);
-    const uint8_t* q = (const uint8_t*) q8_0;
-    if (n_in == 2304) scr_pack_kernel<2304><<<blocks, 128, 0, cs(stream)>>>(q, n_rows, (uint4*) copy, sc);
-    else scr_pack_kernel<256><<<blocks, 128, 0, cs(stream)>>>(q, n_rows, (uint4*) copy, sc);
+    const uint8_t* q = (const uint8_t*) w;
+    if (n_in == 2304) scr_pack_kernel<2304><<<blocks, 128, 0, cs(stream)>>>(q, n_rows, (uint4*) copy, sc, type);
+    else scr_pack_kernel<256><<<blocks, 128, 0, cs(stream)>>>(q, n_rows, (uint4*) copy, sc, type);
     launched("ds_screen_pack");
 }
 

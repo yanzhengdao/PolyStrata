@@ -395,6 +395,95 @@ void pinned_prompt() {
     check(d.ask(q) == 0, "and the prompt is read from its start");
 }
 
+void multi_slot_host_ram_pins() {
+    const std::vector<int32_t> common = text(100, 1200);
+    const std::vector<int32_t> meta = common + text(200, 1800);        // 3000 tokens
+    const std::vector<int32_t> alter_ego = common + text(300, 600);    // 1800 tokens
+
+    Chat c(options(64, 2));
+    std::vector<int32_t> m = meta;
+    c.ask(m, 0);
+    check(c.kept.pin_current("meta", true) == Restored::ok, "pin_current captures meta");
+    check(c.kept.pinned_count() == 1 && c.kept.pinned_tokens("meta") == 3000, "meta tokens recorded");
+    const std::vector<uint8_t> meta_bin = saved(c);
+
+    std::vector<int32_t> a = alter_ego;
+    c.ask(a, 0);
+    check(c.kept.pin_current("alter_ego", true) == Restored::ok, "pin_current captures alter_ego");
+    check(c.kept.pinned_count() == 2 && c.kept.pinned_tokens("alter_ego") == 1800, "both pins coexist");
+    const std::vector<uint8_t> alter_bin = saved(c);
+
+    // Longer match vs shorter match, alternating slots with parallel=1
+    std::vector<int32_t> qm1 = meta + text(400, 40);
+    int64_t read_before = c.e.read;
+    check(c.ask(qm1) == 3000 && (c.e.read - read_before) == 40 + 3, "meta pin hit restores all 3000 tokens");
+    std::vector<int32_t> qa1 = alter_ego + text(500, 35);
+    read_before = c.e.read;
+    check(c.ask(qa1) == 1800 && (c.e.read - read_before) == 35 + 3, "alternating to alter_ego hits 1800 tokens");
+    for (int k = 0; k < 4; ++k) {
+        std::vector<int32_t> noise = text(600 + k, 4000);
+        c.ask(noise);
+        c.kept.release();
+    }
+    std::vector<int32_t> qm2 = meta + text(700, 25);
+    check(c.ask(qm2) == 3000, "meta remains pinned after unrelated traffic and release() cycles");
+    std::vector<int32_t> qa2 = alter_ego + text(800, 20);
+    check(c.ask(qa2) == 1800, "alter_ego remains pinned too");
+
+    Chat restarted(options(0, 1));
+    auto load = [&](const std::string& name, const std::vector<uint8_t>& bytes) {
+        size_t at = 0;
+        return restarted.kept.pin_named(name, true, bytes.size(), Fake::ctx, 1000, [&](void* p, size_t n) {
+            if (n > bytes.size() - at) return false;
+            std::memcpy(p, bytes.data() + at, n);
+            at += n;
+            return true;
+        });
+    };
+    check(load("meta", meta_bin) == Restored::ok && load("alter_ego", alter_bin) == Restored::ok,
+          "restarted engine reloads persisted multi-slot .bin pins");
+    check(restarted.kept.pinned_count() == 2 && restarted.e.at == 0 && restarted.e.read == 0,
+          "reload touches neither engine KV nor position");
+    std::vector<int32_t> qr1 = meta + text(900, 15);
+    check(restarted.ask(qr1) == 3000, "reloaded meta resumes at 3000");
+    std::vector<int32_t> qr2 = alter_ego + text(901, 15);
+    check(restarted.ask(qr2) == 1800, "reloaded alter_ego resumes at 1800");
+
+    // Unpinning one slot keeps the other intact
+    check(restarted.kept.unpin_named("meta") && !restarted.kept.unpin_named("meta"), "unpin_named removes target only");
+    check(restarted.kept.pinned_count() == 1 && restarted.kept.pinned_tokens("alter_ego") == 1800,
+          "remaining pin survives unpin_named");
+}
+
+void resident_pin_skips_spill_and_respects_budget() {
+    // Verify resident Spill blob stays in heap across release(), whereas normal Spill leaves heap.
+    const size_t n = (size_t(3) << 20) + 64;
+    auto resident = std::make_shared<const strata::poly::Spill>(n);
+    check(resident->pin_ram() && resident->is_pinned_ram(), "pin_ram marks blob resident");
+    for (int i = 0; i < 20; ++i) {
+        resident->release();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    check(resident->has_heap(), "resident pinned blob never leaves heap RAM");
+    resident->unpin_ram();
+    check(!resident->is_pinned_ram(), "unpin_ram clears residency lock");
+
+    // pin_mib LRU eviction
+    CacheOptions o = options(0, 1);
+    o.pin_mib = 2;   // each 500-token pin with marks at 499 & 500 takes ~1.18 MiB; 2 pins (~2.36 MiB) exceed 2 MiB
+    Chat bounded(o);
+    bounded.e.state = 600 << 10;
+    std::vector<int32_t> p1 = text(10, 500);
+    bounded.ask(p1, 0);
+    check(bounded.kept.pin_current("first", true) == Restored::ok, "first pin fits 2 MiB budget");
+    std::vector<int32_t> p2 = text(20, 500);
+    bounded.ask(p2, 0);
+    check(bounded.kept.pin_current("second", true) == Restored::ok, "second pin evicts LRU first pin to fit");
+    check(bounded.kept.pinned_count() == 1 && bounded.kept.pinned_tokens("first") == 0 &&
+          bounded.kept.pinned_tokens("second") == 500,
+          "LRU pin evicted cleanly while newest pin kept");
+}
+
 // Any order of prompts over conversations that share starts, under any options: the engine always ends up
 // holding the prompt.  Now and then the conversation is saved as a session file, and one saved earlier comes back.
 // Half the rounds have a pinned conversation, which some prompts start with.
@@ -510,6 +599,8 @@ int main() {
     far = 0;
     session_files();
     pinned_prompt();
+    multi_slot_host_ram_pins();
+    resident_pin_skips_spill_and_respects_budget();
     quits = 3;   // with reads given up, the places a prompt is taken up from are others: any order, any options
     for (const int64_t f : {6000, 700}) {
         far = f;

@@ -86,6 +86,13 @@ kernel void ink_flash_128(constant Args& a [[buffer(0)]], uint2 tg [[threadgroup
         if (tot.is_valid_element(i)) tot[i] = 0.0f;
     const int d0 = sg * 64;
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    constexpr int TPR = NTH / QB, KPT = KC / TPR;
+    const int st = tid / TPR, sj = tid % TPR, sk1 = sj * KPT;
+    const long sown = start + t0 + st, slo = window > 0 ? max(0L, sown - window + 1) : 0;
+    const float ssink = st < n ? sink[st] : 0.0f, sscale = a.f[0];
+    threadgroup const float4* srs4 = reinterpret_cast<threadgroup const float4*>(rs + st * NR);
+    const float4 rs0 = st < n ? srs4[0] : float4(0.0f), rs1 = st < n ? srs4[1] : float4(0.0f),
+                 rs2 = st < n ? srs4[2] : float4(0.0f), rs3 = st < n ? srs4[3] : float4(0.0f);
     for (long c0 = first; c0 <= last; c0 += KC) {
         const int nc = int(min(long(KC), last - c0 + 1)), at = int(c0 - kfirst);
         {
@@ -108,46 +115,52 @@ kernel void ink_flash_128(constant Args& a [[buffer(0)]], uint2 tg [[threadgroup
         // the softmax, TPR lanes of one SIMD group a token, KPT keys a lane: only the keys the token reads (up to its
         // own, within the window) weigh.  The maximum is taken across the lanes; the sum stays one lane's.
         {
-            constexpr int TPR = NTH / QB, KPT = KC / TPR;
-            const int t = tid / TPR, j = tid % TPR, k1 = j * KPT;
             int c1 = 0, c2 = 0;
             float m0 = 0.0f, m = 0.0f;
-            if (t < n) {
-                const long own = start + t0 + t, lo = window > 0 ? max(0L, own - window + 1) : 0;
-                c1 = int(clamp(lo - c0, 0L, long(nc)));
-                c2 = int(clamp(own - c0 + 1, 0L, long(nc)));
-                m0 = mrun[t];
+            if (st < n) {
+                c1 = int(clamp(slo - c0, 0L, long(nc)));
+                c2 = int(clamp(sown - c0 + 1, 0L, long(nc)));
+                m0 = mrun[st];
                 m = m0;
-                for (int c = max(c1, k1); c < min(c2, k1 + KPT); ++c) {
-                    float v = 0.0f;
-                    for (int g = 0; g < NSG; ++g) v += sp[g][t * KC + c];
-                    v = v * a.f[0] - sink[t];
-                    const long dist = own - (c0 + c);
-                    if (dist < extent)
-                        for (int k = 0; k < NR; ++k) v += rs[t * NR + k] * rel[ulong(dist) * NR + k];
-                    sp[0][t * KC + c] = v;
+                const int lo_c = max(c1, sk1), hi_c = min(c2, sk1 + KPT);
+                float vreg[KPT];
+                const bool any_rel = sown - (c0 + hi_c - 1) < extent;
+                for (int c = lo_c; c < hi_c; ++c) {
+                    float v = (sp[0][st * KC + c] + sp[1][st * KC + c]) * sscale - ssink;
+                    if (any_rel) {
+                        const long dist = sown - (c0 + c);
+                        if (dist < extent) {
+                            device const float4* r4 = reinterpret_cast<device const float4*>(rel + ulong(dist) * NR);
+                            const float4 b0 = r4[0], b1 = r4[1], b2 = r4[2], b3 = r4[3];
+                            v += rs0.x * b0.x; v += rs0.y * b0.y; v += rs0.z * b0.z; v += rs0.w * b0.w;
+                            v += rs1.x * b1.x; v += rs1.y * b1.y; v += rs1.z * b1.z; v += rs1.w * b1.w;
+                            v += rs2.x * b2.x; v += rs2.y * b2.y; v += rs2.z * b2.z; v += rs2.w * b2.w;
+                            v += rs3.x * b3.x; v += rs3.y * b3.y; v += rs3.z * b3.z; v += rs3.w * b3.w;
+                        }
+                    }
+                    vreg[c - sk1] = v;
                     m = max(m, v);
                 }
                 for (int o = 1; o < TPR; o <<= 1) m = max(m, simd_shuffle_xor(m, ushort(o)));
-                for (int c = k1; c < k1 + KPT; ++c) {
-                    const float e = c >= c1 && c < c2 ? exp(sp[0][t * KC + c] - m) : 0.0f;
-                    sp[0][t * KC + c] = e;
-                    p[t * KC + c] = half(e);
+                for (int c = sk1; c < sk1 + KPT; ++c) {
+                    const float e = c >= c1 && c < c2 ? exp(vreg[c - sk1] - m) : 0.0f;
+                    sp[0][st * KC + c] = e;
+                    p[st * KC + c] = half(e);
                 }
             } else {
-                for (int c = k1; c < k1 + KPT; ++c) p[t * KC + c] = half(0.0h);
+                for (int c = sk1; c < sk1 + KPT; ++c) p[st * KC + c] = half(0.0h);
             }
             simdgroup_barrier(mem_flags::mem_threadgroup);   // a token's lanes are one SIMD group's
-            if (j == 0) {
-                if (t < n) {
+            if (sj == 0) {
+                if (st < n) {
                     const float f = exp(m0 - m);
-                    float l = lsum[t] * f;
-                    for (int c = c1; c < c2; ++c) l += sp[0][t * KC + c];
-                    mrun[t] = m;
-                    lsum[t] = l;
-                    fac[t] = f;
+                    float l = lsum[st] * f;
+                    for (int c = c1; c < c2; ++c) l += sp[0][st * KC + c];
+                    mrun[st] = m;
+                    lsum[st] = l;
+                    fac[st] = f;
                 } else
-                    fac[t] = 0.0f;
+                    fac[st] = 0.0f;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

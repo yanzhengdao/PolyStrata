@@ -21,10 +21,20 @@
 // ROCm 7.2.4 under WSL2 (librocdxg 1.2.2, an RX 9070 XT) refuses hipMemSetAccess (hipErrorInvalidValue) on a piece
 // mapped after a larger one in the same reservation - 64 MiB then 1 MiB, 2 then 1, 64 then 4 - while pieces of one
 // size always pass (64 + 64, 8 + 8, 1 + 1 MiB): the expert cache lost its shorter last piece, and an attention cache
-// grown to its reservation's end failed.  Under WSL (Engine::vmm_map()) every piece of a reservation is one size.
+// grown to its reservation's end failed.  Native ROCm 7.2.4 (/dev/kfd) refuses the shorter last piece of the expert cache
+// the same way.  Under WSL (Engine::vmm_map()) every piece of every reservation is one size; on native Linux only the
+// expert cache's.
 #if !defined(_WIN32)
 #define STRATA_VMM_EQUAL_PIECES 1
 #endif
+
+// A prompt's buffers are not lent to the expert cache between prompts on any HIP build (Engine::alloc()).  With them
+// lent, strata-poly crashed inside the HIP runtime's kernel launch in 15 of 16 runs: a SIGSEGV in libamdhip64 under
+// the dequantize launch of a dense product into the lent work memory (ROCm 7.2.4 with librocdxg, WSL2's way to the
+// Windows driver; an RX 9070 XT with some experts in RAM).  Native Windows has an access violation in amdhip64_7.dll
+// on the first long prompt of every start that fits the same path (issue 305, RX 7600 XT, Qwen3.6 UD-Q3_K_M with
+// some experts in RAM; not yet run with the lending off).  Native Linux (KFD) never showed it: off there to match.
+#define STRATA_VMM_NO_PROMPT_LEND 1
 
 typedef hipError_t CUresult;
 typedef int CUdevice;

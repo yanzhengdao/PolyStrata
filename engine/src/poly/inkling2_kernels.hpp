@@ -20,20 +20,34 @@ struct InkStates {
 /// states' sum.  `query` holds n_query queries of n_embd; out[j] gets query j's rows.
 void ink_mix(const InkStates& states, const float* query, int n_query, float* const* out, int n_embd, int rows,
              void* stream);
-/// ink_mix() of one row for `jobs` queries sets (up to 12) over the same states, in one launch with the same bits:
+/// ink_mix() of `rows` rows for `jobs` queries sets (up to 12) over the same states, in one launch with the same bits:
 /// job k's n_query queries at query[k], its outputs out[k * n_query + j].
 void ink_mix_many(const InkStates& states, const float* const* query, int n_query, float* const* out, int jobs,
-                  int n_embd, void* stream);
+                  int n_embd, void* stream, int rows = 1);
 /// ink_mix() and then rms_norm() of out[0] (weight norm_w, null: none) into norm_out, in one launch with the same bits.
 void ink_mix_norm(const InkStates& states, const float* query, int n_query, float* const* out, int n_embd, int rows,
                   const float* norm_w, float* norm_out, float eps, void* stream, void* q8 = nullptr, bool ffn = false);
-/// With q8 (one row): the norm also quantized there as native_quantize_q8_1() does it; with ffn the norm is
+/// With q8 (one or more rows): the norm also quantized there as native_quantize_q8_1() does it; with ffn the norm is
 /// native_add_rms_norm_q8_1()'s instead of rms_norm()'s (and q8 is required).  The same bytes.
 
 /// One row's rms_norm_many() of 1 to 3 inputs (a rows a launch of sum_threads(n) threads), each also quantized into
 /// q8[j] as native_quantize_q8_1() does it.  The same bytes.
 void ink_norm_many_q8(const float* const* x, const float* const* w, float* const* y, void* const* q8, int count, int n,
                       float eps, void* stream);
+/// Multi-row ink_norm_many_q8() for `rows` rows of 1 to 3 inputs in one launch, each row bit-identical to one row.
+void ink_norm_many_q8_rows(const float* const* x, const float* const* w, float* const* y, void* const* q8, int count,
+                           int n, int rows, float eps, void* stream);
+#if defined(STRATA_GPU_METAL)
+void ink_add_norm_q8_rows(float* x, const float* add, const float* w, float* y, void* q8, int n, int rows, float eps,
+                          void* stream);
+#endif
+/// Multi-row ink_control3_gate() for `rows` rows in one launch, each row bit-identical to one row.
+void ink_control3_gate_rows(const float* const* cur, const float* const* msg, const float* const* ch,
+                            const void* const* gain_w, const void* const* forget_w, float* const* out, int n, int rank,
+                            int rows, void* stream, int count = 3, bool bf16 = false);
+/// Multi-row ink_gate_norm_q8() for `rows` rows in one launch, each row bit-identical to one row.
+void ink_gate_norm_q8_rows(const float* cur, const float* msg, const float* gain, const float* forget, float* out,
+                           const float* w, float* y, void* q8, int n, int rows, float eps, void* stream);
 
 /// One row's ink_gate() into out, then native_add_rms_norm_q8_1() of out (weight w) into y and q8.  The same bytes.
 void ink_gate_norm_q8(const float* cur, const float* msg, const float* gain, const float* forget, float* out,
@@ -64,6 +78,12 @@ void ink_control3_gate(const float* const* cur, const float* const* msg, const f
 void ink_gate_set(const float* const* cur, const float* const* msg, const float* const* gain,
                   const float* const* forget, float* const* out, int count, size_t n, void* stream);
 
+/// A prompt's controller after its down product: gain = ch gain_w^T and forget = ch forget_w^T (rank values in, n_embd
+/// out, F32 or with bf16 BF16 matrices), then ink_gate() of them, in one launch.  Each product is one fmaf after the
+/// other in the rank's order: the bits of lin_pair()'s hipblasSgemm on gfx1201 (inkling2_test: ctrl_up_gate).  False,
+/// with nothing launched, for a rank other than 64.  out may be cur.
+bool ink_ctrl_up_gate(const float* cur, const float* msg, const float* ch, const void* gain_w, const void* forget_w,
+                      float* out, int n_embd, int rank, int rows, void* stream, bool bf16 = false);
 /// out = cur - tanh(forget) * cur + tanh(gain) * msg, n values.  out may be cur.
 void ink_gate(const float* cur, const float* msg, const float* gain, const float* forget, float* out, size_t n,
               void* stream);
@@ -99,6 +119,52 @@ void ink_conv_add_rows(const float* x, const InkStateRows& state, const float* w
 void ink_moe_conv_add(const float* x, const float* w, const float* scale, const int* ids, int n_used, float* fo,
                       float* state, const float* cw, float* out, float* acc, float a, int channels, int taps,
                       void* stream);
+/// One token's ink_conv_add() followed immediately by ink_mix_norm() over `states` (states.p[states.n - 1] == acc;
+/// in mode 1, states.p[states.n - 2] == keep), in one launch with the same bits.
+#if defined(STRATA_GPU_METAL)
+void ink_conv_mix(const float* x, float* state, const float* w, float* ao, float* acc, float* keep, float a, int mode,
+                  int taps, const InkStates& states, const float* query, int n_query, float* const* out, int n_embd,
+                  const float* norm_w, float* norm_out, float eps, void* stream, void* q8 = nullptr);
+#else
+void ink_conv_mix(const float* x, float* state, const float* w, float* ao, float* acc, float* keep, float a, int mode,
+                  int taps, const InkStates& states, const float* query, int n_query, float* const* out, int n_embd,
+                  const float* norm_w, float* norm_out, float eps, void* stream, void* q8 = nullptr, bool ffn = false);
+#endif
+/// One token's ink_moe_conv_add() followed immediately by ink_mix_norm() over `states` (states.p[states.n - 1] == acc),
+/// in one launch with the same bits.
+void ink_moe_conv_mix(const float* x, const float* w, const float* scale, const int* ids, int n_used, float* fo,
+                      float* state, const float* cw, float* fc, float* acc, float a, int taps, const InkStates& states,
+                      const float* query, int n_query, float* const* out, int n_embd, const float* norm_w,
+                      float* norm_out, float eps, void* stream, void* q8 = nullptr);
+/// Multi-row (1..8) ink_moe_conv_add() with optional conv snapshots (eliminates memset + moe_sum + ink_conv_few).
+void ink_moe_conv_add_rows(const float* x, const float* w, const float* scale, const int* ids, int n_used, float* fo,
+                           float* state, const float* cw, float* out, float* acc, float a, int channels, int taps,
+                           int rows, void* stream, float* snap = nullptr, size_t snap_stride = 0,
+                           unsigned snap_bits = 0);
+/// Multi-row (1..8) MoE weighted sum into fo.
+void ink_moe_sum_rows(const float* x, const float* w, const float* scale, const int* ids, int n_used, float* fo,
+                      int channels, int rows, void* stream);
+/// Multi-row (2..8) ink_conv_mix() reading state read-only; follow with ink_conv_state_update().
+#if defined(STRATA_GPU_METAL)
+void ink_conv_mix_rows(const float* x, const float* state, const float* w, float* ao, float* acc, float* keep, float a,
+                       int mode, int taps, const InkStates& states, const float* query, int n_query, float* const* out,
+                       int n_embd, int rows, const float* norm_w, float* norm_out, float eps, void* stream,
+                       void* q8 = nullptr);
+#else
+void ink_conv_mix_rows(const float* x, const float* state, const float* w, float* ao, float* acc, float* keep, float a,
+                       int mode, int taps, const InkStates& states, const float* query, int n_query, float* const* out,
+                       int n_embd, int rows, const float* norm_w, float* norm_out, float eps, void* stream,
+                       void* q8 = nullptr, bool ffn = false);
+#endif
+/// Updates a convolution state and optional window snapshots from `x`.
+void ink_conv_state_update(const float* x, float* state, int channels, int taps, int rows, float* snap,
+                           size_t snap_stride, unsigned snap_bits, void* stream);
+void ink_conv_state_update2(const float* x0, float* state0, float* snap0, int rows0, const float* x1, float* state1,
+                            float* snap1, int rows1, int channels, int taps, size_t snap_stride, unsigned snap_bits,
+                            void* stream);
+#if defined(STRATA_GPU_METAL)
+void ink_warmup();
+#endif
 
 /// Each head's `dim` values, times scale (null: none; [dim] a head), brought down to an L2 norm of at most `thr`
 /// (the norm has 1e-6 added), then times tau = 1 + alpha * log(max(1, (pos + row + 1) / floor)) when alpha > 0.
@@ -158,6 +224,9 @@ void ink_store_ring(const float* x, uint16_t* cache, int n, int64_t pos, int row
 /// logits[i] = cap * tanh(logits[i] / cap) for the first n_keep, -infinity for the rest of n_all, a row each.
 void ink_softcap(float* logits, int n_keep, int n_all, int rows, float cap, void* stream);
 
+/// LoopCD-Hidden in-place extrapolation: dst[i] += omega * (dst[i] - ref[i]), n values.
+void ink_loopcd_extrap(float* dst, const float* ref, float omega, size_t n, void* stream);
+
 /// One token's ink_conv() of K and V with their states, ink_clip() of Q, K and the relative positions' values,
 /// ink_head_rms() of V, and the stores of K and V as cache row p, or p % ring when ring > 0 (p: pos, or at[0] when the
 /// card holds it), in one launch with the same bits.  Heads of up to 128 values.
@@ -186,6 +255,9 @@ struct InkQkv {
     bool kvq8 = false;  ///< the caches are Q8_0 (InkAttn::kvq8)
 };
 void ink_qkv(const InkQkv& a, void* stream);
+/// Window (2..8 contiguous rows of one sequence) fused K/V conv + snapshots + Q/K/V/R clips + KV cache store.
+void ink_qkv_win(const InkQkv& a, int rows, float* ksnap, float* vsnap, size_t snap_stride, unsigned snap_bits,
+                 void* stream);
 /// ink_qkv() of `rows` tokens of different sequences in one launch: token t's rows of q, r, kraw, vraw, kdyn, vdyn, k
 /// and v a token's on from a's, its states and caches here, and its position what the card holds at a.at[2 t] (a.at
 /// is required; a.pos is not read).
@@ -302,13 +374,28 @@ void ds_mix(const DsMix& m, int n, int rows, float eps, void* stream);
 /// With tags, tags[pos % cap] = pos for each row written to the caches.
 void ds_rope(float* x, int heads, int rows, const float* w, float eps, float theta, const DsPos& p, uint16_t* cache,
              int64_t cap, const float* v, uint16_t* vcache, void* stream, long long* tags = nullptr);
+#if !defined(STRATA_GPU_METAL)
+/// Fused ds_rope(q) and ds_rope(k, v) in one launch.
+void ds_rope_qkv(float* q, float* k, const float* v, int heads, int kv_heads, int rows, const float* qw,
+                 const float* kw, float eps, float theta, const DsPos& p, uint16_t* kcache, uint16_t* vcache,
+                 int64_t cap, long long* tags, void* stream);
+#endif
 /// Each of `rows` query rows' heads (rows * heads / kv_heads at most 24) over the cache's positions [lo, p0 + rows),
 /// all of them (no causal mask), p0 the position of row 0 (p): lo = p0 - window (0 at least), or 0 with window 0.
 /// part: ds_attend_floats() floats of scratch.  With tags (ds_rope()'s), a cell that holds another position than the
 /// one read is left out.
+#if defined(STRATA_GPU_METAL)
 void ds_attend(const float* q, const uint16_t* keys, const uint16_t* vals, const long long* tags, int64_t cap,
                const DsPos& p, int window, int rows, int heads, int kv_heads, float scale, float* part, float* out,
                void* stream);
+void ds_attend_q8(const float* q, const uint16_t* keys, const uint16_t* vals, const long long* tags, int64_t cap,
+                  const DsPos& p, int window, int rows, int heads, int kv_heads, float scale, float* part, float* out,
+                  void* stream, void* q8);
+#else
+void ds_attend(const float* q, const uint16_t* keys, const uint16_t* vals, const long long* tags, int64_t cap,
+               const DsPos& p, int window, int rows, int heads, int kv_heads, float scale, float* part, float* out,
+               void* stream, void* q8 = nullptr);
+#endif
 size_t ds_attend_floats(int kv_heads);
 /// g = silu(g) * u
 void ds_swiglu(float* g, const float* u, size_t n, void* stream);
@@ -322,6 +409,12 @@ void ds_markov_in(const float* state, const uint16_t* w1, const int32_t* prev, f
 /// state + (1 - gate) * tanh(raw[r:2r]), latent = tanh(raw[2r:3r]).
 void ds_markov_step(const float* ctx_h, const float* ctx_f, const float* bias, const float* sp, float* state,
                     float* latent, int rank, void* stream);
+#if !defined(STRATA_GPU_METAL)
+/// Fused ds_markov_in + BF16 wsp GEMV + ds_markov_step (+ optional q8_1 quantization of latent) in one launch.
+void ds_markov_fused(const float* state_in, const uint16_t* w1, const int32_t* prev, const uint16_t* wsp,
+                     const float* ctx_h, const float* ctx_f, const float* bias, float* state_out, float* latent,
+                     void* lat_q8, int rank, void* stream);
+#endif
 /// A draft's pick from its scores cap tanh((base + fy + fb) / cap) over the first n_keep tokens: the lowest id of the
 /// largest and its softmax probability into out, the id into prev too.  scratch: ds_pick_floats() floats.
 void ds_pick(const float* base, const float* fy, const float* fb, int n_keep, float cap, float* scratch, Likeliest* out,
@@ -332,8 +425,9 @@ void ds_fold_q8(const float* ft, int n_rows, int blocks, int b, void* fold, void
 
 /// The Markov head's pick screened by 2-bit copies of its rows: draft i's scores cap tanh((head_v . h_i + fold_v .
 /// lat_i + fold_b[v]) / cap) over v < n_rows are scored from the copies, the rows near the best exactly (from head and
-/// fold, Q8_0 [vocabulary][2304] and [vocabulary][256]), and the exact best is the pick: the full head's whenever that
-/// row is among the ones scored exactly.  Its probability counts the rows not scored exactly at their copies' scores.
+/// fold, Q8_0/Q4_K/Q5_K [vocabulary][2304] and Q8_0 [vocabulary][256]), and the exact best is the pick: the full head's
+/// whenever that row is among the ones scored exactly.  Its probability counts the rows not scored exactly at their
+/// copies' scores.
 struct DsScreen {
     const void* head = nullptr;
     const void* fold = nullptr;
@@ -343,12 +437,13 @@ struct DsScreen {
     const void* fold_sc = nullptr;
     int64_t n_rows = 0;
     float cap = 30.f;
+    uint32_t head_type = 8;           ///< 8: Q8_0, 12: Q4_K (CUDA/HIP), 13: Q5_K
 };
 /// Whether a model of this width and Markov rank can screen (the kernels are built for 2,304 and 256).
 bool ds_screens(int n_embd, int rank);
 size_t ds_screen_bytes(int n_in, int64_t n_rows);
-/// The copy of n_rows Q8_0 rows of n_in (2,304 or 256) values; it has ds_screen_rows() rows.
-void ds_screen_pack(const void* q8_0, int n_in, int64_t n_rows, void* copy, void* stream);
+/// The copy of n_rows rows (Q8_0, Q4_K on CUDA/HIP, or Q5_K) of n_in (2,304 or 256) values; it has ds_screen_rows() rows.
+void ds_screen_pack(const void* w, int n_in, int64_t n_rows, void* copy, void* stream, uint32_t type = 8);
 int64_t ds_screen_rows(int64_t n_rows);
 /// by_row (ds_screen_rows() floats) = by_token in the copies' row order
 void ds_screen_order(const float* by_token, int64_t n_rows, float* by_row, void* stream);

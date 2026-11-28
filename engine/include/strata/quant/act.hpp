@@ -34,8 +34,10 @@ void quantize_q8_1_ref(const float* x, void* y, int64_t n);
 void quantize_q8_K_ref(const float* x, void* y, int64_t n);
 /// Q4_0 from floats, ggml's `quantize_row_q4_0_ref` (the `--mtp-q4` requantizer's output format).
 void quantize_q4_0_ref(const float* x, void* y, int64_t n);
-/// Q5_0 and IQ4_NL from floats, ggml's `quantize_row_q5_0_ref` and `quantize_row_iq4_nl_ref`.
+/// Q5_0, IQ4_NL, Q5_K and Q6_K from floats, ggml's reference row quantizers.
 void quantize_q5_0_ref(const float* x, void* y, int64_t n);
 void quantize_iq4_nl_ref(const float* x, void* y, int64_t n);
+void quantize_q5_K_ref(const float* x, void* y, int64_t n);
+void quantize_q6_K_ref(const float* x, void* y, int64_t n);
 
 }  // namespace strata::quant

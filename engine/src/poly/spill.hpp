@@ -32,6 +32,12 @@ public:
     /// Between requests, on the thread that uses data().
     void release() const;
 
+    /// Keep bytes hot in host heap RAM so release() / background spill skips dropping them.
+    bool pin_ram() const;
+    void unpin_ram() const;
+    bool is_pinned_ram() const;
+    bool has_heap() const;
+
 private:
     void write() const;   // on the writer's thread
     void map() const;
@@ -45,6 +51,7 @@ private:
     mutable bool filed_ = false;        // the file holds it
     mutable bool used_ = false;         // data() was asked since the last release()
     mutable bool cold_ = false;         // the mapping's pages are out of the process
+    mutable bool pinned_ram_ = false;   // resident in host RAM: never written out or evicted by release()
     mutable intptr_t file_ = -1;        // the file: a handle on Windows, a descriptor elsewhere
     mutable void* mapping_ = nullptr;   // Windows: the file mapping's handle
 };

@@ -23,6 +23,22 @@ void set_optimize(bool enabled);
 bool optimize();
 /// Submit pending commands without a host wait; graph capture records the boundary.
 Error submit(Stream s);
+/// Dispatches between parallel_begin() and parallel_end() have no data dependencies on each other and may run
+/// concurrently without intervening memory barriers (recorded by graph capture).
+Error parallel_begin(Stream s);
+Error parallel_end(Stream s);
+struct ParallelScope {
+    Stream s = nullptr;
+    bool active = false;
+    explicit ParallelScope(Stream st, bool on = true) : s(st), active(on) {
+        if (active) parallel_begin(s);
+    }
+    ~ParallelScope() {
+        if (active) parallel_end(s);
+    }
+    ParallelScope(const ParallelScope&) = delete;
+    ParallelScope& operator=(const ParallelScope&) = delete;
+};
 void set_scoped_residency(bool enabled);
 #if defined(STRATA_METAL_TESTING)
 namespace testing {
@@ -45,6 +61,7 @@ Error register_indirect(const void* table, const void* const* pointers, size_t c
 /// Compile MSL source at run time (the Command Line Tools have no offline `metal` compiler) and return the pipeline
 /// of `function`.  Cached by (source name, function name); nullptr and `err` on failure.
 MTL::ComputePipelineState* pipeline(const char* source_name, const char* source, const char* function, std::string& err);
+uint32_t max_threads(MTL::ComputePipelineState* p);
 
 struct Grid {
     uint32_t x = 1, y = 1, z = 1;

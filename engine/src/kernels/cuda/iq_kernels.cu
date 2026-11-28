@@ -5979,10 +5979,374 @@ bool slot_lanes_on() {
 }
 #endif
 
+#if !defined(__HIPCC__)
+bool nvfp4_lanes_on() {
+    static const bool on = [] {
+        if (const char* v = std::getenv("STRATA_NVFP4_LANES"); v && *v) return v[0] != '0';
+        return true;
+    }();
+    return on;
+}
+
+bool ids_group_on() {
+    static const bool on = [] {
+        if (const char* v = std::getenv("STRATA_IDS_GROUP"); v && *v) return v[0] != '0';
+        return true;
+    }();
+    return on;
+}
+
+// NVFP4 full-lane slots kernel (CUDA): R rows per warp so R * C is a multiple of 32 (C = n_in / 32: 72 for 2304 -> R=4,
+// 36 for 1152 -> R=8).  Uses the exact same vec_dot_nvfp4_q8_1 and lane-to-lane sum order as mmvq_slots_kernel<40>.
+template<int R, typename S>
+__global__ void __launch_bounds__(128) mmvq_slots_nvfp4_kernel(S slots, size_t row_bytes, int n_in, int n_out) {
+    const int row0 = (int(blockIdx.x) * 4 + int(threadIdx.y)) * R;
+    if (row0 >= n_out) return;
+    const SlotPtrs at = slot_ptrs(slots, int(blockIdx.y));
+    const int lane = int(threadIdx.x), C = (n_in / 64) * 2, rows = min(R, n_out - row0);
+    const uint8_t* w = (const uint8_t*) at.w + (size_t) row0 * row_bytes;
+    const block_q8_1* x = (const block_q8_1*) at.x;
+    float acc[R];
+#pragma unroll
+    for (int q = 0; q < R; ++q) acc[q] = 0.0f;
+    for (int f = lane; f < rows * C; f += 32) {
+        const int r = f / C, c = f - r * C, kbx = c >> 1, iqs = (c & 1) << 2;
+        const float v = vec_dot_nvfp4_q8_1(w + (size_t) r * row_bytes, x + kbx * 2, kbx, iqs);
+#pragma unroll
+        for (int q = 0; q < R; ++q)
+            if (q == r) acc[q] += v;
+    }
+#pragma unroll
+    for (int q = 0; q < R; ++q) {
+        float v = __shfl_sync(0xffffffffu, acc[q], (lane + q * C) & 31);
+        v = warp_sum(v);
+        if (q < rows && lane == 0) at.y[row0 + q] = v;
+    }
+}
+
+struct IdsGroups {
+    int32_t count;
+    int32_t expert[64];
+    uint8_t n[64];
+    uint8_t slot[64][8];
+};
+static_assert(sizeof(IdsGroups) <= kMmvqIdsGroupBytes, "IdsGroups fits kMmvqIdsGroupBytes");
+
+// 2-warp (64-thread) parallel GPU deduplication of up to 64 routed expert slots into unique expert groups (<= 8 slots/group).
+__global__ void ids_group_kernel(const int32_t* __restrict__ ids, int count, IdsGroups* __restrict__ out) {
+    __shared__ int32_t se[64];
+    __shared__ uint32_t s_mask[2];
+    __shared__ uint8_t s_grp[64];
+    const int tid = int(threadIdx.x), warp = tid >> 5, lane = tid & 31;
+    se[tid] = tid < count ? ids[tid] : -1;
+    __syncthreads();
+    int prev = 0, lead = tid, is_lead = 0;
+    const int32_t e = se[tid];
+    if (tid < count) {
+        for (int k = 0; k < tid; ++k) {
+            if (se[k] == e) {
+                if ((prev & 7) == 0) lead = k;
+                ++prev;
+            }
+        }
+        if ((prev & 7) == 0) {
+            is_lead = 1;
+            lead = tid;
+        }
+    }
+    const uint32_t wm = __ballot_sync(0xffffffffu, is_lead != 0);
+    if (lane == 0) s_mask[warp] = wm;
+    __syncthreads();
+    const uint64_t mask = (uint64_t) s_mask[0] | ((uint64_t) s_mask[1] << 32);
+    if (tid == 0) out->count = __popcll(mask);
+    if (is_lead) {
+        const uint64_t below = tid == 0 ? 0ULL : ((1ULL << tid) - 1ULL);
+        const int g = __popcll(mask & below);
+        s_grp[tid] = (uint8_t) g;
+        int n_g = 1;
+        for (int k = tid + 1; k < count && n_g < 8; ++k) {
+            if (se[k] == e) ++n_g;
+        }
+        out->expert[g] = e;
+        out->n[g] = (uint8_t) n_g;
+    }
+    __syncthreads();
+    if (tid < count) {
+        out->slot[s_grp[lead]][prev & 7] = (uint8_t) tid;
+    }
+}
+
+// Same math as row_dot_multi<TY, NC>, reading activation offsets from shared memory (zero register/stack pressure).
+template<int TY, int NC, bool EXACT_N = false>
+__device__ __forceinline__ void row_dot_multi_smem(const uint8_t* row, const block_q8_1* x, const int* s_off, int n,
+                                                   int nb, int lane, float (&s)[NC]) {
+    using F = Fmt<TY>;
+    using S = Split<TY>;
+#pragma unroll
+    for (int c = 0; c < NC; ++c) s[c] = 0.0f;
+    for (int k = lane; k < nb * F::ipb; k += 32) {
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        const typename S::W w = S::template load<false>(row, kbx, iqs);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) s[c] += S::apply(w, x + s_off[c] + kbx * (F::qk / 32), iqs);
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        if (EXACT_N || c < n) s[c] = warp_sum(s[c]);
+}
+
+// Grouped NVFP4 multi-token expert kernel: full-lane for m == 1 and m == 2 (with 2x weight reuse!), and Split<40>
+// weight-reuse row_dot_multi_smem for m == 3..8.  Zero stack spills; bit-identical to mmvq_slots_kernel<40>.
+template<int R>
+__global__ void __launch_bounds__(128) mmvq_ids_grouped_nvfp4_kernel(MmvqIds ids, const IdsGroups* __restrict__ grp,
+                                                                     size_t row_bytes, int n_in, int n_out) {
+    const int g = int(blockIdx.y);
+    if (g >= grp->count) return;
+    __shared__ int s_off[8];
+    __shared__ uint8_t s_sl[8];
+    const int m = grp->n[g];
+    const int x_blocks = (int) (ids.x_stride / sizeof(block_q8_1));
+    if (threadIdx.y == 0 && threadIdx.x < 8) {
+        const uint8_t sl = int(threadIdx.x) < m ? grp->slot[g][threadIdx.x] : 0;
+        s_sl[threadIdx.x] = sl;
+        s_off[threadIdx.x] = (int(sl) / ids.x_every) * x_blocks;
+    }
+    __syncthreads();
+    const int row0 = (int(blockIdx.x) * 4 + int(threadIdx.y)) * R;
+    if (row0 >= n_out) return;
+    const int lane = int(threadIdx.x), nb = n_in / 64, C = nb * 2, rows = min(R, n_out - row0);
+    const uint8_t* w = (const uint8_t*) ids.table[grp->expert[g]] + ids.offset + (size_t) row0 * row_bytes;
+    const block_q8_1* x_base = (const block_q8_1*) ids.x;
+    if (m == 1) {
+        const int sl0 = s_sl[0];
+        const block_q8_1* x0 = x_base + s_off[0];
+        float acc[R];
+#pragma unroll
+        for (int q = 0; q < R; ++q) acc[q] = 0.0f;
+        for (int f = lane; f < rows * C; f += 32) {
+            const int r = f / C, c = f - r * C, kbx = c >> 1, iqs = (c & 1) << 2;
+            const float v = vec_dot_nvfp4_q8_1(w + (size_t) r * row_bytes, x0 + kbx * 2, kbx, iqs);
+#pragma unroll
+            for (int q = 0; q < R; ++q)
+                if (q == r) acc[q] += v;
+        }
+#pragma unroll
+        for (int q = 0; q < R; ++q) {
+            float v = warp_sum(__shfl_sync(0xffffffffu, acc[q], (lane + q * C) & 31));
+            if (q < rows && lane == 0) ids.y[(size_t) sl0 * ids.y_stride + row0 + q] = v;
+        }
+        return;
+    }
+    if (m == 2) {
+        const int sl0 = s_sl[0], sl1 = s_sl[1];
+        const block_q8_1* x0 = x_base + s_off[0];
+        const block_q8_1* x1 = x_base + s_off[1];
+        float acc0[R], acc1[R];
+#pragma unroll
+        for (int q = 0; q < R; ++q) acc0[q] = 0.0f, acc1[q] = 0.0f;
+        for (int f = lane; f < rows * C; f += 32) {
+            const int r = f / C, c = f - r * C, kbx = c >> 1, iqs = (c & 1) << 2;
+            const typename Split<40>::W wt = Split<40>::load(w + (size_t) r * row_bytes, kbx, iqs);
+            const float v0 = Split<40>::apply(wt, x0 + kbx * 2, iqs);
+            const float v1 = Split<40>::apply(wt, x1 + kbx * 2, iqs);
+#pragma unroll
+            for (int q = 0; q < R; ++q)
+                if (q == r) acc0[q] += v0, acc1[q] += v1;
+        }
+#pragma unroll
+        for (int q = 0; q < R; ++q) {
+            float s0 = warp_sum(__shfl_sync(0xffffffffu, acc0[q], (lane + q * C) & 31));
+            float s1 = warp_sum(__shfl_sync(0xffffffffu, acc1[q], (lane + q * C) & 31));
+            if (q < rows && lane == 0) {
+                ids.y[(size_t) sl0 * ids.y_stride + row0 + q] = s0;
+                ids.y[(size_t) sl1 * ids.y_stride + row0 + q] = s1;
+            }
+        }
+        return;
+    }
+    if (m <= 4) {
+        for (int r = 0; r < rows; ++r) {
+            float s4[4];
+            row_dot_multi_smem<40, 4, false>(w + (size_t) r * row_bytes, x_base, s_off, m, nb, lane, s4);
+            if (lane == 0) {
+#pragma unroll
+                for (int c = 0; c < 4; ++c)
+                    if (c < m) ids.y[(size_t) s_sl[c] * ids.y_stride + row0 + r] = s4[c];
+            }
+        }
+        return;
+    }
+    for (int r = 0; r < rows; ++r) {
+        float s8[8];
+        row_dot_multi_smem<40, 8, false>(w + (size_t) r * row_bytes, x_base, s_off, m, nb, lane, s8);
+        if (lane == 0) {
+#pragma unroll
+            for (int c = 0; c < 8; ++c)
+                if (c < m) ids.y[(size_t) s_sl[c] * ids.y_stride + row0 + r] = s8[c];
+        }
+    }
+}
+
+// Grouped IQ3_S / IQ3_XXS multi-token expert kernel: full-lane R=4 with SMEM grid for m == 1, Split<TY> weight reuse
+// for m == 2..8.  Zero stack spills; bit-identical to mmvq_slots_kernel<TY> on cards where iq3_lanes_on() holds.
+template<int TY, int R>
+__global__ void __launch_bounds__(128) mmvq_ids_grouped_iq3_kernel(MmvqIds ids, const IdsGroups* __restrict__ grp,
+                                                                   size_t row_bytes, int n_in, int n_out) {
+    using T = Iq3Lane<TY>;
+    const int g = int(blockIdx.y);
+    if (g >= grp->count) return;
+    __shared__ uint32_t s_grid[T::GRID];
+    __shared__ int s_off[8];
+    __shared__ uint8_t s_sl[8];
+    const int m = grp->n[g];
+    const int x_blocks = (int) (ids.x_stride / sizeof(block_q8_1));
+    if (threadIdx.y == 0 && threadIdx.x < 8) {
+        const uint8_t sl = int(threadIdx.x) < m ? grp->slot[g][threadIdx.x] : 0;
+        s_sl[threadIdx.x] = sl;
+        s_off[threadIdx.x] = (int(sl) / ids.x_every) * x_blocks;
+    }
+    if (m == 1) {
+        for (int i = int(threadIdx.y) * 32 + int(threadIdx.x); i < T::GRID; i += 128) s_grid[i] = T::src()[i];
+    }
+    __syncthreads();
+    const int row0 = (int(blockIdx.x) * 4 + int(threadIdx.y)) * R;
+    if (row0 >= n_out) return;
+    const int lane = int(threadIdx.x), nb = n_in / 256, C = nb * 8, rows = min(R, n_out - row0);
+    const uint8_t* w = (const uint8_t*) ids.table[grp->expert[g]] + ids.offset + (size_t) row0 * row_bytes;
+    const block_q8_1* x_base = (const block_q8_1*) ids.x;
+    if (m == 1) {
+        const int sl0 = s_sl[0];
+        const block_q8_1* x0 = x_base + s_off[0];
+        float acc[R];
+#pragma unroll
+        for (int q = 0; q < R; ++q) acc[q] = 0.0f;
+        for (int f = lane; f < rows * C; f += 32) {
+            const int r = f / C, c = f - r * C, kbx = c / 8, iqs = 2 * (c % 8);
+            const float v = T::dot(w + (size_t) r * row_bytes, x0 + kbx * 8, kbx, iqs, s_grid);
+#pragma unroll
+            for (int q = 0; q < R; ++q)
+                if (q == r) acc[q] += v;
+        }
+#pragma unroll
+        for (int q = 0; q < R; ++q) {
+            float v = warp_sum(__shfl_sync(0xffffffffu, acc[q], (lane + q * C) & 31));
+            if (q < rows && lane == 0) ids.y[(size_t) sl0 * ids.y_stride + row0 + q] = v;
+        }
+        return;
+    }
+    if (m == 2) {
+        for (int r = 0; r < rows; ++r) {
+            float s2[2];
+            row_dot_multi_smem<TY, 2, true>(w + (size_t) r * row_bytes, x_base, s_off, 2, nb, lane, s2);
+            if (lane == 0) {
+                ids.y[(size_t) s_sl[0] * ids.y_stride + row0 + r] = s2[0];
+                ids.y[(size_t) s_sl[1] * ids.y_stride + row0 + r] = s2[1];
+            }
+        }
+        return;
+    }
+    if (m <= 4) {
+        for (int r = 0; r < rows; ++r) {
+            float s4[4];
+            row_dot_multi_smem<TY, 4, false>(w + (size_t) r * row_bytes, x_base, s_off, m, nb, lane, s4);
+            if (lane == 0) {
+#pragma unroll
+                for (int c = 0; c < 4; ++c)
+                    if (c < m) ids.y[(size_t) s_sl[c] * ids.y_stride + row0 + r] = s4[c];
+            }
+        }
+        return;
+    }
+    for (int r = 0; r < rows; ++r) {
+        float s8[8];
+        row_dot_multi_smem<TY, 8, false>(w + (size_t) r * row_bytes, x_base, s_off, m, nb, lane, s8);
+        if (lane == 0) {
+#pragma unroll
+            for (int c = 0; c < 8; ++c)
+                if (c < m) ids.y[(size_t) s_sl[c] * ids.y_stride + row0 + r] = s8[c];
+        }
+    }
+}
+
+// Generic grouped multi-token expert kernel for any kSplit<TY> format (IQ2/IQ1/IQ3/NVFP4).  Zero stack spills.
+template<int TY>
+__global__ void __launch_bounds__(128) mmvq_ids_grouped_kernel(MmvqIds ids, const IdsGroups* __restrict__ grp,
+                                                               size_t row_bytes, int n_in, int n_out) {
+    const int g = int(blockIdx.y);
+    if (g >= grp->count) return;
+    __shared__ int s_off[8];
+    __shared__ uint8_t s_sl[8];
+    const int m = grp->n[g];
+    const int x_blocks = (int) (ids.x_stride / sizeof(block_q8_1));
+    if (threadIdx.y == 0 && threadIdx.x < 8) {
+        const uint8_t sl = int(threadIdx.x) < m ? grp->slot[g][threadIdx.x] : 0;
+        s_sl[threadIdx.x] = sl;
+        s_off[threadIdx.x] = (int(sl) / ids.x_every) * x_blocks;
+    }
+    __syncthreads();
+    const int row = int(blockIdx.x) * 4 + int(threadIdx.y);
+    if (row >= n_out) return;
+    const int lane = int(threadIdx.x), nb = n_in / Fmt<TY>::qk;
+    const uint8_t* wr = (const uint8_t*) ids.table[grp->expert[g]] + ids.offset + (size_t) row * row_bytes;
+    const block_q8_1* x_base = (const block_q8_1*) ids.x;
+    if (m == 1) {
+        const float s = row_dot<TY>(wr, x_base + s_off[0], nb, lane);
+        if (lane == 0) ids.y[(size_t) s_sl[0] * ids.y_stride + row] = s;
+        return;
+    }
+    if (m == 2) {
+        float s2[2];
+        row_dot_multi_smem<TY, 2, true>(wr, x_base, s_off, 2, nb, lane, s2);
+        if (lane == 0) {
+            ids.y[(size_t) s_sl[0] * ids.y_stride + row] = s2[0];
+            ids.y[(size_t) s_sl[1] * ids.y_stride + row] = s2[1];
+        }
+        return;
+    }
+    if (m <= 4) {
+        float s4[4];
+        row_dot_multi_smem<TY, 4, false>(wr, x_base, s_off, m, nb, lane, s4);
+        if (lane == 0) {
+#pragma unroll
+            for (int c = 0; c < 4; ++c)
+                if (c < m) ids.y[(size_t) s_sl[c] * ids.y_stride + row] = s4[c];
+        }
+        return;
+    }
+    float s8[8];
+    row_dot_multi_smem<TY, 8, false>(wr, x_base, s_off, m, nb, lane, s8);
+    if (lane == 0) {
+#pragma unroll
+        for (int c = 0; c < 8; ++c)
+            if (c < m) ids.y[(size_t) s_sl[c] * ids.y_stride + row] = s8[c];
+    }
+}
+#endif
+
 template<typename S>
 void slots_of(int t, const S& slots, int count, int n_in, int n_out, void* stream) {
     const size_t rb = iq_row_bytes(t, n_in);
     const dim3 grid((unsigned) ((n_out + 3) / 4), (unsigned) count), block(32, 4);
+#if !defined(__HIPCC__)
+    if (t == 40 && slots.lanes && !g_old_kernels && nvfp4_lanes_on() && n_in % 64 == 0) {
+        const int C = n_in / 32;
+        if (C % 32 != 0 && C % 8 == 0) {
+            constexpr int R = 4;
+            const dim3 g4((unsigned) ((n_out + 4 * R - 1) / (4 * R)), (unsigned) count);
+            mmvq_slots_nvfp4_kernel<R, S><<<g4, block, 0, (cudaStream_t) stream>>>(slots, rb, n_in, n_out);
+            check("iq_mmvq_slots");
+            return;
+        }
+        if (C % 32 != 0 && C % 4 == 0) {
+            constexpr int R = 8;
+            const dim3 g8((unsigned) ((n_out + 4 * R - 1) / (4 * R)), (unsigned) count);
+            mmvq_slots_nvfp4_kernel<R, S><<<g8, block, 0, (cudaStream_t) stream>>>(slots, rb, n_in, n_out);
+            check("iq_mmvq_slots");
+            return;
+        }
+    }
+#endif
 #if !defined(__HIPCC__)
     if ((t == 21 || t == 18) && slots.lanes && !g_old_kernels && iq3_lanes_on()) {
         constexpr int R = 4;   // 72 calls a 2304 row: 4 rows are 9 full passes over the lanes
@@ -6023,7 +6387,69 @@ void iq_mmvq_slots(int t, const MmvqSlots& slots, int count, int n_in, int n_out
     slots_of(t, slots, count, n_in, n_out, stream);
 }
 
+void iq_mmvq_ids_group(const int32_t* ids, int count, void* group_buf, void* stream) {
+#if !defined(__HIPCC__)
+    if (!group_buf || count < 2 || count > 64 || g_old_kernels || !ids_group_on()) return;
+    ids_group_kernel<<<1, 64, 0, (cudaStream_t) stream>>>(ids, count, (IdsGroups*) group_buf);
+    check("iq_mmvq_ids_group");
+#else
+    (void) ids; (void) count; (void) group_buf; (void) stream;
+#endif
+}
+
 void iq_mmvq_ids(int t, const MmvqIds& ids, int count, int n_in, int n_out, void* stream) {
+#if !defined(__HIPCC__)
+    if (ids.group_buf && count >= 2 && count <= 64 && !g_old_kernels && ids_group_on() &&
+        ids.x_stride % sizeof(block_q8_1) == 0 &&
+        (t == 16 || t == 17 || t == 18 || t == 19 || t == 21 || t == 22 || t == 29 || t == 40)) {
+        const cudaStream_t s = (cudaStream_t) stream;
+        if (!ids.group_ready) {
+            ids_group_kernel<<<1, 64, 0, s>>>(ids.ids, count, (IdsGroups*) ids.group_buf);
+            check("iq_mmvq_ids_group");
+        }
+        const auto* grp = (const IdsGroups*) ids.group_buf;
+        const size_t rb = iq_row_bytes(t, n_in);
+        const dim3 block(32, 4);
+        if (t == 40 && ids.lanes && nvfp4_lanes_on() && n_in % 64 == 0) {
+            const int C = n_in / 32;
+            if (C % 32 != 0 && C % 8 == 0) {
+                constexpr int R = 4;
+                const dim3 g4((unsigned) ((n_out + 4 * R - 1) / (4 * R)), (unsigned) count);
+                mmvq_ids_grouped_nvfp4_kernel<R><<<g4, block, 0, s>>>(ids, grp, rb, n_in, n_out);
+                check("iq_mmvq_ids");
+                return;
+            }
+            if (C % 32 != 0 && C % 4 == 0) {
+                constexpr int R = 8;
+                const dim3 g8((unsigned) ((n_out + 4 * R - 1) / (4 * R)), (unsigned) count);
+                mmvq_ids_grouped_nvfp4_kernel<R><<<g8, block, 0, s>>>(ids, grp, rb, n_in, n_out);
+                check("iq_mmvq_ids");
+                return;
+            }
+        }
+        if ((t == 21 || t == 18) && ids.lanes && iq3_lanes_on()) {
+            constexpr int R = 4;
+            const dim3 g4((unsigned) ((n_out + 4 * R - 1) / (4 * R)), (unsigned) count);
+            if (t == 21) mmvq_ids_grouped_iq3_kernel<21, R><<<g4, block, 0, s>>>(ids, grp, rb, n_in, n_out);
+            else mmvq_ids_grouped_iq3_kernel<18, R><<<g4, block, 0, s>>>(ids, grp, rb, n_in, n_out);
+            check("iq_mmvq_ids");
+            return;
+        }
+        const dim3 grid((unsigned) ((n_out + 3) / 4), (unsigned) count);
+        switch (t) {
+        case 16: mmvq_ids_grouped_kernel<16><<<grid, block, 0, s>>>(ids, grp, rb, n_in, n_out); break;
+        case 17: mmvq_ids_grouped_kernel<17><<<grid, block, 0, s>>>(ids, grp, rb, n_in, n_out); break;
+        case 18: mmvq_ids_grouped_kernel<18><<<grid, block, 0, s>>>(ids, grp, rb, n_in, n_out); break;
+        case 19: mmvq_ids_grouped_kernel<19><<<grid, block, 0, s>>>(ids, grp, rb, n_in, n_out); break;
+        case 21: mmvq_ids_grouped_kernel<21><<<grid, block, 0, s>>>(ids, grp, rb, n_in, n_out); break;
+        case 22: mmvq_ids_grouped_kernel<22><<<grid, block, 0, s>>>(ids, grp, rb, n_in, n_out); break;
+        case 29: mmvq_ids_grouped_kernel<29><<<grid, block, 0, s>>>(ids, grp, rb, n_in, n_out); break;
+        default: mmvq_ids_grouped_kernel<40><<<grid, block, 0, s>>>(ids, grp, rb, n_in, n_out); break;
+        }
+        check("iq_mmvq_ids");
+        return;
+    }
+#endif
     slots_of(t, ids, count, n_in, n_out, stream);
 }
 
@@ -8461,7 +8887,7 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
 }
 
 }  // namespace strata::kernels
-#if defined(__HIPCC__)
+#if defined(STRATA_HIP_GFX906)   // (i8_mma.cu is empty there; the other HIP builds have it on RDNA3 / RDNA4)
 namespace strata::kernels {
 bool gemm_iq_i8_takes(int, int) { return false; }
 void gemm_iq_i8_turing(bool) {}

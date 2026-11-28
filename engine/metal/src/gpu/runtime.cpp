@@ -78,7 +78,7 @@ struct ResourceHold {
     ~ResourceHold() { release_resources(items); }
 };
 struct Op {
-    enum Kind { Dispatch, Copy, Fill, Record, Wait, Submit } kind = Dispatch;
+    enum Kind { Dispatch, Copy, Fill, Record, Wait, Submit, ParallelBegin, ParallelEnd } kind = Dispatch;
     MTL::ComputePipelineState* pipe = nullptr;
     uint8_t args[256];
     size_t arg_bytes = 0;
@@ -122,6 +122,9 @@ struct StreamImpl {
     GraphImpl* rec = nullptr;
     std::vector<std::shared_ptr<ResourceHold>> resources;
     std::unordered_set<uint64_t> enc_keys;   // the allocations the open encoder has made resident
+    int enc_dispatches = 0;
+    int parallel_depth = 0;
+    bool parallel_first = false;
     bool fallback_residency = false;
 };
 
@@ -289,9 +292,10 @@ void end_encoder(StreamImpl* s) {
 }
 MTL::ComputeCommandEncoder* encoder(StreamImpl* s) {
     if (!s->enc) {
-        s->enc = open_cb(s)->computeCommandEncoder();
+        s->enc = open_cb(s)->computeCommandEncoder(MTL::DispatchTypeConcurrent);
+        s->enc_dispatches = 0;
         if (s->fence_written) s->enc->waitForFence(s->fence);
-    }   // serial dispatch within an encoder; explicit ordering across blits
+    }   // concurrent encoder with explicit buffer barriers outside parallel_begin/parallel_end; fences across blits
     return s->enc;
 }
 void use_hold(StreamImpl* s, MTL::ComputeCommandEncoder* e, const std::shared_ptr<ResourceHold>& h) {
@@ -471,6 +475,10 @@ Error encode_dispatch(StreamImpl* s, const Op& o) {
     use_hold(s, e, o.resources);
     use_hold(s, e, indirect_hold);
     e->setComputePipelineState(o.pipe);
+    if (s->enc_dispatches > 0 && (s->parallel_depth == 0 || s->parallel_first))
+        e->memoryBarrier(MTL::BarrierScopeBuffers);
+    if (s->parallel_depth > 0) s->parallel_first = false;
+    ++s->enc_dispatches;
     if (o.big_args.empty()) e->setBytes(o.args, o.arg_bytes, 0);
     else e->setBytes(o.big_args.data(), o.big_args.size(), 0);
     if (o.tg_bytes) e->setThreadgroupMemoryLength(o.tg_bytes, 0);
@@ -504,6 +512,12 @@ Error run_op(StreamImpl* s, const Op& o) {
         case Op::Record: return record_event(o.ev, s);
         case Op::Wait: return wait_event(s, o.ev);
         case Op::Submit: flush(s); return kSuccess;
+        case Op::ParallelBegin:
+            if (++s->parallel_depth == 1) s->parallel_first = true;
+            return kSuccess;
+        case Op::ParallelEnd:
+            if (s->parallel_depth > 0) --s->parallel_depth;
+            return kSuccess;
     }
     return kSuccess;
 }
@@ -758,6 +772,8 @@ Error stream_destroy(Stream s) {
 Error stream_synchronize(Stream st) {
     StreamImpl* s = S(st);
     std::lock_guard<std::recursive_mutex> stream_lock(s->mu);
+    s->parallel_depth = 0;
+    s->parallel_first = false;
     flush(s);
     return wait_value(s->completion, s->submitted);
 }
@@ -828,6 +844,8 @@ Error begin_capture(Stream st) {
     StreamImpl* s = S(st);
     std::lock_guard<std::recursive_mutex> stream_lock(s->mu);
     if (s->rec) return fail(kErrorInvalidValue);
+    s->parallel_depth = 0;
+    s->parallel_first = false;
     flush(s);
     s->rec = new GraphImpl;
     return kSuccess;
@@ -835,6 +853,8 @@ Error begin_capture(Stream st) {
 Error end_capture(Stream st, Graph* g) {
     StreamImpl* s = S(st);
     std::lock_guard<std::recursive_mutex> stream_lock(s->mu);
+    s->parallel_depth = 0;
+    s->parallel_first = false;
     if (!s->rec) { *g = nullptr; return fail(kErrorInvalidValue); }
     if (std::any_of(s->rec->ops.begin(),s->rec->ops.end(),[](const Op& o) {
             return o.kind == Op::Dispatch && !o.complete_resources;
@@ -863,7 +883,11 @@ Error graph_launch(GraphExec x, Stream st) {
     s->resources.insert(s->resources.end(),x->holds.begin(),x->holds.end());
     for (const Op& o : x->ops) {
         const Error e = run_op(s, o);
-        if (e != kSuccess) return e;
+        if (e != kSuccess) {
+            s->parallel_depth = 0;
+            s->parallel_first = false;
+            return e;
+        }
     }
     return kSuccess;
 }
@@ -897,6 +921,20 @@ Error submit(Stream st) {
     else flush(s);
     return rt().failed.load() ? fail(kErrorLaunchFailure) : kSuccess;
 }
+Error parallel_begin(Stream st) {
+    auto* s = S(st);
+    std::lock_guard<std::recursive_mutex> stream_lock(s->mu);
+    if (s->rec) { Op o; o.kind = Op::ParallelBegin; s->rec->ops.push_back(o); }
+    else if (++s->parallel_depth == 1) s->parallel_first = true;
+    return kSuccess;
+}
+Error parallel_end(Stream st) {
+    auto* s = S(st);
+    std::lock_guard<std::recursive_mutex> stream_lock(s->mu);
+    if (s->rec) { Op o; o.kind = Op::ParallelEnd; s->rec->ops.push_back(o); }
+    else if (s->parallel_depth > 0) --s->parallel_depth;
+    return kSuccess;
+}
 
 
 MTL::ComputePipelineState* pipeline(const char* source_name, const char* source, const char* function, std::string& err) {
@@ -923,6 +961,10 @@ MTL::ComputePipelineState* pipeline(const char* source_name, const char* source,
     if (!p) { err = std::string("pipeline ") + function + ": " + (e ? e->localizedDescription()->utf8String() : "?"); return nullptr; }
     r.pipes[key] = p;
     return p;
+}
+
+uint32_t max_threads(MTL::ComputePipelineState* p) {
+    return p ? (uint32_t) p->maxTotalThreadsPerThreadgroup() : 0;
 }
 
 Error register_indirect(const void* table, const void* const* pointers, size_t count) {

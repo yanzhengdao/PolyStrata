@@ -390,6 +390,32 @@ class InklingCustomGgufTests(unittest.TestCase):
         for arch in setup.POLY_GGUF_ARCHS["inkling"]:
             self.assertEqual(strata_inspect.POLY_ARCHS.get(arch), setup.FAMILIES["inkling"]["title"], arch)
 
+    def test_folder_with_dspark_and_mmproj_sidecars_resolves_cleanly(self):
+        """A folder holding Inkling-2-Mini + dspark-Inkling-2-Mini-Q8_0.gguf + mmproj-F16.gguf resolves to the main
+        model file, and custom quantizations inherit DSpark's draft_model."""
+        tools = str(Path(_ROOT) / "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        import strata_inspect as real
+        stub = types.ModuleType("strata_inspect")
+        for k in ("verdict", "load_fingerprints", "PREVIEW_ARCHS", "POLY_ARCHS"):
+            setattr(stub, k, getattr(real, k))
+        stub.read_headers = lambda sources: ("inkling2_loop", [])
+        stub.fingerprint = lambda a, t: {"arch": a, "tensors": 704, "bytes": sum(self.IQ4_NL.values()),
+                                         "expert_bytes": self.IQ4_NL}
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+            d = Path(tmp)
+            main_gguf = d / "Inkling-2-Mini-IQ4_NL.gguf"
+            _write_gguf(main_gguf)
+            _write_gguf(d / "dspark-Inkling-2-Mini-Q8_0.gguf")
+            _write_gguf(d / "mmproj-F16.gguf")
+            stack.enter_context(mock.patch.dict(sys.modules, {"strata_inspect": stub}))
+            stack.enter_context(mock.patch.dict(setup.FAMILIES["inkling"]["models"]))
+            family, model, shards = setup.resolve_custom_gguf(str(d))
+            self.assertEqual((family, model, shards), ("inkling", "IQ4_NL", [main_gguf]))
+            self.assertEqual(setup.FAMILIES["inkling"]["models"]["IQ4_NL"]["draft_model"],
+                             "dspark-Inkling-2-Mini-Q8_0.gguf")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

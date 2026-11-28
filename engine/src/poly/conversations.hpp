@@ -19,9 +19,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <new>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -36,6 +38,7 @@ struct CacheOptions {
     int64_t park_mib = 0;      ///< host memory for parked conversations; 0: none is parked
     int park_slots = 4;        ///< parked conversations at most
     int64_t park_min = 1024;   ///< a conversation with fewer tokens before its last checkpoint is not parked
+    int64_t pin_mib = 0;       ///< host memory limit for pinned prefixes; 0: unlimited
     std::function<bool(size_t)> admit;   ///< whether the host can spare this many bytes; unset: it can
     FILE* log = nullptr;       ///< where parking is reported; the server reads these lines
 };
@@ -60,8 +63,29 @@ public:
             if (r > at || (r == at && i == cur_)) best = i, at = r, same = c;
         }
         ++clock_;
-        // The pinned conversation (pin()) gets the prompt further than any kept one: the engine takes a copy of it.
-        if (const int64_t far = marked(pinned_, common(pinned_.seq, ids), n); far > at) return from_pinned(far);
+        // Pinned prefixes get the prompt further than any kept one (longest matching prefix wins).
+        size_t best_pin = pinned_.size();
+        int64_t best_far = at, best_same = 0;
+        for (size_t i = 0; i < pinned_.size(); ++i) {
+            const int64_t c = common(pinned_[i].slot.seq, ids);
+            const int64_t f = marked(pinned_[i].slot, c, n);
+            if (f > best_far ||
+                (f == best_far && best_pin < pinned_.size() &&
+                 (c > best_same || (c == best_same && pinned_[i].stamp > pinned_[best_pin].stamp)))) {
+                best_pin = i;
+                best_far = f;
+                best_same = c;
+            } else if (f == at && at > 0 && best_pin == pinned_.size() &&
+                       (f > 0)) {
+                best_pin = i;
+                best_same = c;
+            }
+        }
+        if (best_pin < pinned_.size() && best_far > at) {
+            pinned_[best_pin].stamp = clock_;
+            return from_pinned(pinned_[best_pin].slot, best_far);
+        }
+        if (best_pin < pinned_.size() && best_far == at && at > 0) pinned_[best_pin].stamp = clock_;
         if (at == 0) {
             // nothing kept starts like this
             if (!cur().seq.empty() && park(slots_.size())) cur_ = take(cur_);
@@ -202,11 +226,7 @@ public:
         uint64_t row_bytes, state_bytes, tokens, prompt, marks, piece_rows;
     };
     /// What save() writes for the conversation as it stands; 0: the engine holds none.
-    uint64_t save_bytes() const {
-        const Slot& s = cur();
-        const uint64_t n = (uint64_t) len(s);
-        return n == 0 ? 0 : sizeof(Saved) + n * 4 + marks_saved(s) * (8 + e_.state_bytes()) + n * e_.row_bytes();
-    }
+    uint64_t save_bytes() const { return slot_save_bytes(cur()); }
     /// put(data, bytes) gets save_bytes() bytes, the rows in pieces of `piece` bytes at most, and returns false
     /// to stop.  The engine must be at the conversation's end.  The conversation stays as it is.  False: put
     /// stopped, or there was no memory for a piece.
@@ -276,18 +296,26 @@ public:
         return Restored::ok;
     }
 
-    /// What save() wrote becomes the pinned conversation, in place of one pinned before: a system prompt that every
-    /// chat starts with, read once.  It is kept beside the others with its rows in memory, as a parked one's, but
-    /// outside the budget and the slots, and nothing pushes it out.  A prompt that starts with it goes on from a
-    /// copy of it (resume()), so it stays as it was read.  The engine is not touched.  The result is restore()'s;
-    /// cut: get() ended inside the rows, and nothing is pinned.  The caller that then finds the bytes were not the
-    /// saved ones calls unpin().
+    struct PinInfo {
+        std::string name;
+        int64_t tokens = 0;
+        size_t bytes = 0;
+        bool resident = true;
+    };
+
+    /// What save() wrote becomes the anonymous pinned conversation (`""`), in place of one pinned before: a system
+    /// prompt that every chat starts with, read once.
     template<class Get>
     Restored pin(uint64_t bytes, int64_t most, size_t piece, Get&& get) {
+        return pin_named("", true, bytes, most, piece, std::forward<Get>(get));
+    }
+    /// Pin what save() wrote under `name` beside the conversation cache (resident in RAM when `resident` is true).
+    template<class Get>
+    Restored pin_named(const std::string& name, bool resident, uint64_t bytes, int64_t most, size_t piece, Get&& get) {
+        unpin_named(name);
         const size_t row = e_.row_bytes();
         Saved head;
         Slot in;
-        pinned_ = Slot{};
         if (const Restored r = read_start(bytes, most, piece, get, head, in); r != Restored::ok) return r;
         const int64_t n = (int64_t) head.tokens, per = (int64_t) head.piece_rows;
         for (int64_t first = 0; first < n; first += per) {
@@ -298,31 +326,122 @@ public:
             in.rows.push_back({b, first, m, m});
         }
         in.prompt = n;
-        pinned_ = std::move(in);
+        if (!fit_pins(name, slot_bytes(in))) return Restored::memory;
+        if (resident) {
+            for (const Checkpoint& m : in.marks)
+                if (!m.state->pin_ram()) return Restored::memory;
+            for (const Rows& r : in.rows)
+                if (!r.blob->pin_ram()) return Restored::memory;
+        }
+        pinned_.push_back({name, resident, ++clock_, std::move(in)});
         return Restored::ok;
     }
-    void unpin() { pinned_ = Slot{}; }
-    /// The pinned conversation's tokens (0: none), and the bytes its rows and states take.
-    int64_t pinned_tokens() const { return len(pinned_); }
-    size_t pinned_bytes() const {
-        size_t bytes = 0;
-        for (const Checkpoint& m : pinned_.marks) bytes += m.state->bytes();
-        for (const Rows& r : pinned_.rows) bytes += r.blob->bytes();
-        return bytes;
+    /// Capture the current conversation in the engine into a named pinned slot (`name` must be non-empty).
+    Restored pin_current(const std::string& name, bool resident = true) {
+        if (name.empty()) return Restored::other;
+        Slot& s = cur();
+        const int64_t n = len(s);
+        if (n < 1) return Restored::other;
+        const size_t row = e_.row_bytes(), state = e_.state_bytes();
+        const int64_t from = saved(s);
+        const bool need_end = !at_end(s);
+        size_t need = 0;
+        for (const Checkpoint& m : s.marks)
+            if (!is_pinned_excluding(m.state.get(), name)) need += m.state->bytes();
+        if (need_end) need += state;
+        for (const Rows& r : s.rows)
+            if (!is_pinned_excluding(r.blob.get(), name)) need += r.blob->bytes();
+        if (from < n) need += (size_t) (n - from) * row;
+        if (!fit_pins(name, need)) return Restored::memory;
+
+        const BlobPtr end_mark = need_end ? blob(state) : nullptr;
+        if (need_end && !end_mark) return Restored::memory;
+        const BlobPtr tail = from < n ? blob((size_t) (n - from) * row) : nullptr;
+        if (from < n && !tail) return Restored::memory;
+
+        if (end_mark) e_.save_state(end_mark->data());
+        if (tail) {
+            e_.save_rows(from, n - from, tail->data());
+            s.rows.push_back({tail, from, n - from, n - from});
+        }
+        Slot in;
+        in.seq = s.seq;
+        in.prompt = n;
+        in.marks = s.marks;
+        if (end_mark) in.marks.push_back({n, end_mark});
+        in.rows = s.rows;
+        if (resident) {
+            for (const Checkpoint& m : in.marks)
+                if (!m.state->pin_ram()) return Restored::memory;
+            for (const Rows& r : in.rows)
+                if (!r.blob->pin_ram()) return Restored::memory;
+        }
+        unpin_named(name);
+        pinned_.push_back({name, resident, ++clock_, std::move(in)});
+        return Restored::ok;
+    }
+    void unpin() { unpin_named(""); }
+    bool unpin_named(const std::string& name) {
+        for (size_t i = 0; i < pinned_.size(); ++i) {
+            if (pinned_[i].name != name) continue;
+            PinnedEntry old = std::move(pinned_[i]);
+            pinned_.erase(pinned_.begin() + (std::ptrdiff_t) i);
+            release_unpinned_blobs(old);
+            return true;
+        }
+        return false;
+    }
+    void unpin_all() {
+        auto old = std::move(pinned_);
+        pinned_.clear();
+        for (const PinnedEntry& p : old) release_unpinned_blobs(p);
+    }
+    size_t pinned_count() const { return pinned_.size(); }
+    /// Total tokens across all pinned slots (0: none), or one slot's tokens when named.
+    int64_t pinned_tokens() const {
+        int64_t total = 0;
+        for (const PinnedEntry& p : pinned_) total += len(p.slot);
+        return total;
+    }
+    int64_t pinned_tokens(const std::string& name) const {
+        for (const PinnedEntry& p : pinned_)
+            if (p.name == name) return len(p.slot);
+        return 0;
+    }
+    size_t pinned_bytes() const { return pinned_bytes_excluding(nullptr); }
+    size_t pinned_bytes(const std::string& name) const {
+        for (const PinnedEntry& p : pinned_)
+            if (p.name == name) return slot_bytes(p.slot);
+        return 0;
+    }
+    std::vector<PinInfo> pinned_info() const {
+        std::vector<PinInfo> out;
+        out.reserve(pinned_.size());
+        for (const PinnedEntry& p : pinned_)
+            out.push_back({p.name, len(p.slot), slot_bytes(p.slot), p.resident});
+        return out;
     }
 
     /// Between requests: what the parked conversations hold leaves the process.  On the laptop four parked
     /// conversations of Qwen3.6 held 1.1 to 1.7 GB, one of 29K tokens 1.05 GB.  The one in the engine keeps its
     /// states in memory: every request saves one (63 MB of Qwen3.6's), and the next request most likely goes on
-    /// from it, so written to the disk it would mostly be read back at once.
+    /// from it, so written to the disk it would mostly be read back at once.  Resident pinned prefixes stay hot in
+    /// Host RAM.
     void release() const {
         for (size_t i = 0; i < slots_.size(); ++i) {
             if (i == cur_) continue;
-            for (const Checkpoint& m : slots_[i].marks) m.state->release();
-            for (const Rows& r : slots_[i].rows) r.blob->release();
+            for (const Checkpoint& m : slots_[i].marks)
+                if (!is_resident_pinned(m.state.get())) m.state->release();
+            for (const Rows& r : slots_[i].rows)
+                if (!is_resident_pinned(r.blob.get())) r.blob->release();
         }
-        for (const Checkpoint& m : pinned_.marks) m.state->release();
-        for (const Rows& r : pinned_.rows) r.blob->release();
+        for (const PinnedEntry& p : pinned_) {
+            if (p.resident) continue;
+            for (const Checkpoint& m : p.slot.marks)
+                if (!is_resident_pinned(m.state.get())) m.state->release();
+            for (const Rows& r : p.slot.rows)
+                if (!is_resident_pinned(r.blob.get())) r.blob->release();
+        }
     }
 
     /// The parked conversations, the bytes they hold, and how many were pushed out so far.
@@ -351,9 +470,84 @@ private:
         std::vector<Rows> rows;         // back to back from row 0; a parked conversation has all of its rows
         uint64_t stamp = 0;
     };
+    struct PinnedEntry {
+        std::string name;
+        bool resident = true;
+        uint64_t stamp = 0;
+        Slot slot;
+    };
     struct Held {
         size_t count = 0, bytes = 0;
     };
+
+    uint64_t slot_save_bytes(const Slot& s) const {
+        const uint64_t n = (uint64_t) len(s);
+        return n == 0 ? 0 : sizeof(Saved) + n * 4 + marks_saved(s) * (8 + e_.state_bytes()) + n * e_.row_bytes();
+    }
+    static size_t slot_bytes(const Slot& s) {
+        size_t bytes = 0;
+        for (const Checkpoint& m : s.marks) bytes += m.state->bytes();
+        for (const Rows& r : s.rows) bytes += r.blob->bytes();
+        return bytes;
+    }
+    bool is_pinned_excluding(const Blob* b, const std::string& exclude) const {
+        for (const PinnedEntry& p : pinned_) {
+            if (p.name == exclude) continue;
+            for (const Checkpoint& m : p.slot.marks)
+                if (m.state.get() == b) return true;
+            for (const Rows& r : p.slot.rows)
+                if (r.blob.get() == b) return true;
+        }
+        return false;
+    }
+    bool is_resident_pinned(const Blob* b) const {
+        for (const PinnedEntry& p : pinned_) {
+            if (!p.resident) continue;
+            for (const Checkpoint& m : p.slot.marks)
+                if (m.state.get() == b) return true;
+            for (const Rows& r : p.slot.rows)
+                if (r.blob.get() == b) return true;
+        }
+        return false;
+    }
+    void release_unpinned_blobs(const PinnedEntry& dropped) const {
+        if (!dropped.resident) return;
+        for (const Checkpoint& m : dropped.slot.marks)
+            if (!is_resident_pinned(m.state.get())) m.state->unpin_ram();
+        for (const Rows& r : dropped.slot.rows)
+            if (!is_resident_pinned(r.blob.get())) r.blob->unpin_ram();
+    }
+    size_t pinned_bytes_excluding(const std::string* exclude) const {
+        std::vector<const Blob*> seen;
+        for (const PinnedEntry& p : pinned_) {
+            if (exclude && p.name == *exclude) continue;
+            for (const Checkpoint& m : p.slot.marks) seen.push_back(m.state.get());
+            for (const Rows& r : p.slot.rows) seen.push_back(r.blob.get());
+        }
+        std::sort(seen.begin(), seen.end());
+        seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
+        size_t total = 0;
+        for (const Blob* b : seen) total += b->bytes();
+        return total;
+    }
+    bool fit_pins(const std::string& keep_name, size_t need) {
+        if (o_.pin_mib < 1) return true;
+        const size_t budget = (size_t) o_.pin_mib << 20;
+        while (pinned_bytes_excluding(&keep_name) + need > budget) {
+            size_t victim = pinned_.size();
+            for (size_t i = 0; i < pinned_.size(); ++i)
+                if (pinned_[i].name != keep_name && (victim == pinned_.size() || pinned_[i].stamp < pinned_[victim].stamp))
+                    victim = i;
+            if (victim == pinned_.size()) return false;
+            PinnedEntry gone = std::move(pinned_[victim]);
+            pinned_.erase(pinned_.begin() + (std::ptrdiff_t) victim);
+            release_unpinned_blobs(gone);
+            if (o_.log)
+                std::fprintf(o_.log, "strata-poly: pinned prefix '%s' evicted (%lld tokens) to stay within %lld MiB\n",
+                             gone.name.c_str(), (long long) len(gone.slot), (long long) o_.pin_mib);
+        }
+        return true;
+    }
 
     Slot& cur() { return slots_[cur_]; }
     const Slot& cur() const { return slots_[cur_]; }
@@ -423,9 +617,8 @@ private:
     // The engine takes a copy of the pinned conversation's first `at` tokens, a checkpoint of it, and the pinned one
     // stays as it is.  The conversation that leaves is parked if it can be.  The rows it has from the pinned one's
     // blobs are in the caches already: a chat that began as such a copy gives way to the next one without a copy.
-    int64_t from_pinned(int64_t at) {
+    int64_t from_pinned(const Slot& p, int64_t at) {
         const Clock::time_point t0 = Clock::now();
-        const Slot& p = pinned_;
         int64_t have = 0;
         for (size_t k = 0; k < p.rows.size() && k < cur().rows.size() && p.rows[k].blob == cur().rows[k].blob; ++k) {
             have = p.rows[k].first + std::min(p.rows[k].keep, cur().rows[k].keep);
@@ -513,12 +706,14 @@ private:
         }
         std::sort(seen.begin(), seen.end());
         seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
-        // what a conversation shares with the pinned one is the pinned one's, outside the budget
+        // what a conversation shares with any pinned one is the pinned one's, outside the budget
         const auto pinned = [this](const Blob* b) {
-            for (const Checkpoint& m : pinned_.marks)
-                if (m.state.get() == b) return true;
-            for (const Rows& r : pinned_.rows)
-                if (r.blob.get() == b) return true;
+            for (const PinnedEntry& p : pinned_) {
+                for (const Checkpoint& m : p.slot.marks)
+                    if (m.state.get() == b) return true;
+                for (const Rows& r : p.slot.rows)
+                    if (r.blob.get() == b) return true;
+            }
             return false;
         };
         for (const Blob* b : seen)
@@ -634,8 +829,8 @@ private:
 
     E& e_;
     CacheOptions o_;
-    std::vector<Slot> slots_;   // the current conversation and the parked ones
-    Slot pinned_;               // pin()'s: beside them, never the engine's own, never pushed out
+    std::vector<Slot> slots_;           // the current conversation and the parked ones
+    std::vector<PinnedEntry> pinned_;   // named & anonymous pinned prefixes beside them, never pushed out by chats
     size_t cur_ = 0;
     uint64_t clock_ = 0;
     size_t evictions_ = 0;

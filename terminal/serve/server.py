@@ -451,15 +451,78 @@ TURN_OPENERS = {"function": ("<|im_start|>",), "gemma": ("<|turn>",),
 TURN_OPENERS_OF_PRE = {"laguna": ("<assistant>",)}
 WARM_MIN_TOKENS = 2048           # a shorter prompt start is quick to read again: not kept
 BEFORE_LOAD_TIMEOUT_S = 120.0  # #1997: how long the before_load command may run (the config's before_load_timeout_s)
+PIN_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+INKLING_EFFORT_RE = re.compile(r"<\|message_system\|>(?:<\|content_text\|>)?Thinking effort level:")
 
 
-def inkling_template_kwargs(kwargs: dict) -> dict:
+def parse_strata_pin(req: dict) -> dict | None:
+    """Validate optional OpenAI top-level `strata_pin` object (`{"name", "prefill_only", "resident", "anchor"}`)."""
+    spec = req.get("strata_pin")
+    if spec is None:
+        return None
+    if not isinstance(spec, dict):
+        raise ValueError("strata_pin must be an object")
+    allowed = {"name", "prefill_only", "resident", "anchor"}
+    unknown = [k for k in spec if k not in allowed]
+    if unknown:
+        raise ValueError(f"strata_pin: unknown field {unknown[0]!r}")
+    name = spec.get("name")
+    if not isinstance(name, str) or name in (".", "..") or not PIN_NAME_RE.fullmatch(name):
+        raise ValueError("strata_pin.name must be 1..64 characters of A-Z, a-z, 0-9, '.', '_', '-'")
+    prefill_only = spec.get("prefill_only")
+    if prefill_only is not None and not isinstance(prefill_only, bool):
+        raise ValueError("strata_pin.prefill_only must be true or false")
+    resident = spec.get("resident", "ram")
+    if resident == "disk":
+        resident = "spill"
+    if resident not in ("ram", "spill"):
+        raise ValueError('strata_pin.resident must be "ram" or "spill"')
+    anchor = spec.get("anchor")
+    if anchor is not None and not isinstance(anchor, str):
+        raise ValueError("strata_pin.anchor must be a string or null")
+    return {"name": name, "prefill_only": prefill_only, "resident": resident, "anchor": anchor or None}
+
+
+def configured_pin_dir(cfg: dict) -> str | None:
+    """Resolved pin directory from explicit config (`pin_dir` / `cache_dir`) or existing default `.pins/*.bin`."""
+    raw = cfg.get("pin_dir")
+    if isinstance(raw, str) and raw.strip():
+        return os.path.abspath(raw.strip())
+    cache = cfg.get("cache_dir")
+    if isinstance(cache, str) and cache.strip():
+        return os.path.join(os.path.abspath(cache.strip()), "pins")
+    existing = cfg.get("_existing_pin_dir")
+    if isinstance(existing, str) and existing.strip():
+        return os.path.abspath(existing.strip())
+    return None
+
+
+_INKLING_Q2_RE = re.compile(r"(?:^|[^a-z0-9])q2(?:[_\-.]|$)", re.IGNORECASE)
+
+
+def inkling_default_effort(model_name: str | None = None, model_path: str | None = None):
+    """Default reasoning_effort for Inkling 2 Mini when neither client nor config sets one:
+    "low" (0.2) for Q2 quantizations (e.g. UD-Q2_K_XL) and 0.4 for Q3/Q4 and other sizes."""
+    for text in (model_name, Path(str(model_path)).name if model_path else ""):
+        if text and _INKLING_Q2_RE.search(str(text)):
+            return "low"
+    return 0.4
+
+
+def inkling_template_kwargs(kwargs: dict, default=0.4) -> dict:
     """Inkling 2's template has one switch, reasoning_effort (a name or a number from 0 to 0.99), written in a system
-    message ahead of the conversation; an effort it does not know would stop the render.  Thinking off is "none"."""
+    message ahead of the conversation; an effort it does not know would stop the render.  Thinking off is "none".
+    When omitted, defaults to `default` (0.4 for Q3/Q4 and others, "low" / 0.2 for Q2); "medium" maps to 0.4."""
     effort = kwargs.get("reasoning_effort")
     known = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
-    level = "none" if kwargs.get("enable_thinking") is False else \
-        effort if effort in known or isinstance(effort, (int, float)) else "high"
+    if kwargs.get("enable_thinking") is False:
+        level = "none"
+    elif effort == "medium":
+        level = 0.4
+    elif effort in known or (isinstance(effort, (int, float)) and not isinstance(effort, bool)):
+        level = effort
+    else:
+        level = default
     rest = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
     return {**rest, "reasoning_effort": level}
 
@@ -2127,6 +2190,9 @@ class StrataEngine:
         born = self.gen                                 # the engine process this request is sent to
         hold = (sampling or {}).get(HOLD_KEY)           # the thinking budget's hold (P2b): the reasoning tokens left when this pass starts, and </think>'s id
         keys0 = self.sampling_keys({k: v for k, v in (sampling or {}).items() if k != HOLD_KEY}, hy4=getattr(self, "hy4_engine", False))   # (the hold's key goes on per leg: leg_keys below)
+        # turn_at as the one-request path sends it: the engine reads a prompt in calls that stop at that checkpoint,
+        # and Inkling 2's greedy answer depends on how a prompt's rows are grouped into calls
+        keys0 += "" if getattr(self, "hy4_engine", False) else self.turn_key(ids)
         # logprobs: only an admission's token can have an LP line here (the slot's "BT" lines carry none), so the
         # server refuses these requests unless max_tokens is 1.  The lines go to the request itself, through its
         # cancel Event: several requests read control lines at once, and the engine's lp_lines is one attribute.
@@ -2720,7 +2786,8 @@ class StrataEngine:
                     if carry is not NO_LINE:              # the line read after a token for its LP line
                         line, carry = carry, NO_LINE
                     else:
-                        line = lines_q.get(timeout=min(wait, 0.5))
+                        poll_s = 0.05 if getattr(cancel, "_fast_poll", False) else 0.5
+                        line = lines_q.get(timeout=min(wait, poll_s))
                 except queue.Empty:
                     if cancel.is_set():
                         return
@@ -2911,26 +2978,36 @@ class StrataEngine:
         with self._exclusive_control():
             return self._session_file(action, path)
 
+    def pin_cur(self, name: str, resident: str = "ram", path: str | None = None, save: bool | None = None) -> dict:
+        if not isinstance(name, str) or name in (".", "..") or not PIN_NAME_RE.fullmatch(name):
+            raise ValueError("invalid pin name")
+        if resident not in ("ram", "spill"):
+            raise ValueError('resident must be "ram" or "spill"')
+        parts = [name, f"resident={resident}"]
+        if save is not None:
+            parts.append(f"save={int(save)}")
+        if path:
+            parts.append(f"path={path}")
+        return self.session_file("pin_cur", " ".join(parts))
+
+    def pin_load(self, name: str, path: str) -> dict:
+        if not isinstance(name, str) or name in (".", "..") or not PIN_NAME_RE.fullmatch(name):
+            raise ValueError("invalid pin name")
+        return self.session_file("pin_load", f"{name} {path}")
+
+    def unpin_slot(self, name: str | None = None, unlink: bool = False) -> dict:
+        arg = "" if not name else (f"{name} unlink=1" if unlink else name)
+        return self.session_file("unpin", arg)
+
     def _session_file(self, action: str, path: str) -> dict:
-        """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO), and
-        strata-poly's `PIN <path>` (action "pin": the file's conversation is kept beside the conversation cache, and a
-        prompt that starts with it goes on from there; Service.pin_start).
-        -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
-        is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
-        malformed one, a bare ERR, an answer with negative counts or a non-finite time - means the two sides lost
-        step: the engine is ended (EngineDied) and the next request starts it again.  EngineDied also when it ended
-        by itself (a restore transfer that failed after the device state changed ends it on purpose: FATAL), and
-        EngineSilent (#481) when it printed nothing valid for engine_silence_s - a SESSION progress line (one per
-        block of the file moved, at most 16 MiB) counts only when its numbers are.  `SWAIT <phase> <seconds>` announces
-        a step that blocks in one call (a flush, the device transfer): until the next line the wait is that step's
-        explicit allowance (at most SESSION_WAIT_MAX_S) when it is longer than engine_silence_s - no more, so a step
-        that never ends is still ended."""
+        """Disk sessions and named host-RAM pins (`SAVE`, `RESTORE`, `PIN`, `PIN_CUR`, `PIN_LOAD`, `UNPIN`)."""
         send, want = {"save": ("SAVE", "SAVED"), "restore": ("RESTORE", "RESTORED"),
-                      "pin": ("PIN", "PINNED")}.get(action, ("", ""))
-        if not send or any(c in path for c in "\r\n\0"):
+                      "pin": ("PIN", "PINNED"), "pin_cur": ("PIN_CUR", "PINNED"),
+                      "pin_load": ("PIN_LOAD", "PINNED"), "unpin": ("UNPIN", "UNPINNED")}.get(action, ("", ""))
+        if not send or any(c in path for c in "\r\n\0") or (action != "unpin" and not path):
             raise ValueError("invalid session command")
         try:
-            self.proc.stdin.write(f"{send} {path}\n")
+            self.proc.stdin.write(f"{send} {path}\n" if path else f"{send}\n")
             self.proc.stdin.flush()
         except OSError:
             raise self._engine_died() from None
@@ -3000,11 +3077,16 @@ class StrataEngine:
                 raise SessionRefused(parts[1], parts[3].strip(), parts[2] == "1")
             if head == want:
                 try:
-                    if len(f) != 4:
-                        raise ValueError
-                    tokens, size, ms = count(f[1]), count(f[2]), float(f[3])
-                    if not math.isfinite(ms) or ms < 0:
-                        raise ValueError
+                    if want == "UNPINNED":
+                        if len(f) != 3:
+                            raise ValueError
+                        tokens, size, ms = count(f[1]), count(f[2]), 0.0
+                    else:
+                        if len(f) != 4:
+                            raise ValueError
+                        tokens, size, ms = count(f[1]), count(f[2]), float(f[3])
+                        if not math.isfinite(ms) or ms < 0:
+                            raise ValueError
                 except ValueError:
                     raise out_of_step(line) from None
                 return {"tokens": tokens, "bytes": size, "ms": ms}
@@ -3822,6 +3904,13 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
             args += ["--vram-segment-mib", str(seg)]
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
+    if poly:
+        pin_dir = configured_pin_dir(cfg)
+        if pin_dir and "--pin-dir" not in args:
+            args += ["--pin-dir", pin_dir]
+        pin_mib = cfg.get("pin_cache_mib")
+        if isinstance(pin_mib, int) and not isinstance(pin_mib, bool) and pin_mib > 0 and "--pin-cache-mib" not in args:
+            args += ["--pin-cache-mib", str(pin_mib)]
     args = conversation_cache_min_tokens_args(args, exe or cfg.get("exe"))
     return draft_costs_args(cfg, learned_profile_args(cfg, args), exe or cfg.get("exe"))
 
@@ -4297,6 +4386,8 @@ class Service:
         # "*" = any), and every name it answers to, which serve() works out from the address it listens on
         self.allowed_hosts: list[str] = []
         self.host_names: set[str] = set(LOOPBACK_NAMES)
+        # the PC's real network IP (what another device types in), shown in About > This PC; worked out once at serve()
+        self.server_ip: str | None = None
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         # "parallel" (the engine's batch slots): every running request's own status and rate window; self.status
@@ -4337,6 +4428,7 @@ class Service:
         self.instance_id = uuid.uuid4().hex
         self.status_lock = threading.Lock()
         self.admission_changed = threading.Condition(self.status_lock)
+        self.pin_idle_cond = threading.Condition(self.status_lock)
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         self.offline = False                             # no image URL fetch or MCP subprocess in strict local mode
         self.telemetry_key = ""                         # optional read-only key, valid only on /v1/telemetry
@@ -4371,6 +4463,12 @@ class Service:
         self.warm_start = False
         self.warm_ids = None                              # the start kept last (keep_start())
         self.warm_stop = threading.Event()                # set: no warm read runs, or the one running is to stop
+        self.pin_dir: str | None = None                   # opt-in named pin dir (--pin-dir / --cache-dir)
+        self.cache_dir: str | None = None
+        self.pin_cache_mib: int = 0
+        self.pin_preempt = threading.Event()              # set while interactive request is pending or running
+        self._pin_lock = threading.Lock()
+        self.real_requests_pending = 0
         self.models_root = ROOT                          # where the installation's run configs are (serve/models.py)
         # "memory_debug": true in the config (or $STRATA_MEMORY_DEBUG): a switch prints the free VRAM around it
         self.memory_debug = bool(os.environ.get("STRATA_MEMORY_DEBUG"))
@@ -4428,6 +4526,7 @@ class Service:
             self.parser_cls = InklingOutputParser
             self.text_open_ids = tokenizer.encode(INK_TEXT_OPEN, parse_special=True)
             self._force_text = inkling_forced_call
+        self.set_family("hy4" if self.hy4 else "inkling" if self.call_format == "inkling" else None)
         openers = TURN_OPENERS_OF_PRE.get(pre) or TURN_OPENERS[self.call_format]
         # templates that read a tool as OpenAI sends it, {"type": "function", "function": {...}}: Gemma's and DeepSeek's
         # look inside it, and Laguna's prints it whole (vLLM and llama.cpp give it the request's tools as they are)
@@ -4496,15 +4595,32 @@ class Service:
         config = Path(self.config_path)
         return config.with_name(config.stem + ".warm-start")
 
+    def _system_turn_end(self, ids) -> int | None:
+        """Index in `ids` where leading system/tools turns end (before `Thinking effort level:` on Inkling 2 and
+        before the first non-system turn)."""
+        opens = [i for i, t in enumerate(ids) if t in self.turn_ids]
+        if not opens:
+            return None
+        if self.call_format != "inkling":
+            return opens[1] if len(opens) > 1 else None
+        sys_id = self.tok.encode("<|message_system|>", parse_special=True)
+        sys_tok = sys_id[0] if len(sys_id) == 1 else None
+        for idx, p in enumerate(opens):
+            if sys_tok is not None and ids[p] != sys_tok:
+                return p
+            nxt = opens[idx + 1] if idx + 1 < len(opens) else len(ids)
+            head = self.tok.decode(ids[p:min(nxt, p + 64)])
+            if "Thinking effort level:" in head:
+                return p
+        return None
+
     def keep_start(self, ids, seed: bool = False) -> None:
-        """"warm_start": keep the prompt's first turn (the system prompt with the tools) for start_warm(), when it is
-        long and not the one kept already.  A first turn that leaves the kept one after a long common start (a date
-        or a folder written near its end) keeps that common start: it is what the next chat begins with as well, and
-        the session file made of it (pin_start()) ends where a chat can go on from.  `seed`: the first turn is the
-        config's own ("warm_start": "FILE"); it replaces a kept start that is not a part of it."""
-        opens = (i for i, t in enumerate(ids) if t in self.turn_ids)
-        next(opens, None)
-        end = next(opens, None)                         # the second turn's opener: the first turn ends there
+        """"warm_start": keep the prompt's static system/tools prefix for start_warm(), when it is long and not the one
+        kept already.  A first turn that leaves the kept one after a long common start (a date or a folder written near
+        its end) keeps that common start: it is what the next chat begins with as well, and the session file made of it
+        (pin_start()) ends where a chat can go on from.  `seed`: the first turn is the config's own ("warm_start":
+        "FILE"); it replaces a kept start that is not a part of it."""
+        end = self._system_turn_end(ids)
         if end is None:
             return
         first, kept = ids[:end], self.warm_ids or []
@@ -4557,6 +4673,43 @@ class Service:
               f"({r['bytes'] >> 20} MiB, {r['ms'] / 1000:.1f} s)", flush=True)
         return True
 
+    def default_pin_dir(self) -> Path | None:
+        if self.pin_dir:
+            return Path(self.pin_dir)
+        if self.cache_dir:
+            return Path(self.cache_dir) / "pins"
+        if self.config_path:
+            cfg = Path(self.config_path)
+            return cfg.with_name(cfg.stem + ".pins")
+        return None
+
+    def load_saved_pins(self) -> None:
+        """Reload persisted `<name>.bin` named pins when engine starts without `--pin-dir` CLI or after mock setup."""
+        info = getattr(self.engine, "info", None) or {}
+        if "pinned_tokens" not in info or getattr(self.engine, "batch", False):
+            return
+        if int(info.get("pinned_slots") or 0) > 0:
+            return
+        d = self.default_pin_dir()
+        if d is None or not d.is_dir():
+            return
+        loader = getattr(self.engine, "pin_load", None)
+        if loader is None and hasattr(self.engine, "session_file"):
+            loader = lambda name, p: self.engine.session_file("pin_load", f"{name} {p}")
+        if loader is None:
+            return
+        for path in sorted(d.glob("*.bin")):
+            name = path.stem
+            if name in (".", "..") or not PIN_NAME_RE.fullmatch(name):
+                continue
+            try:
+                with self.fifo:
+                    r = loader(name, str(path))
+                print(f"[strata] pinned prefix '{name}' reloaded: {r['tokens']} tokens ({r['bytes'] >> 20} MiB)",
+                      flush=True)
+            except (SessionRefused, EngineDied, ValueError, OSError) as e:
+                print(f"[strata] skipped saved pin {path.name}: {e}", flush=True)
+
     def start_warm(self) -> None:
         """"warm_start": read the prompt start keep_start() kept when the server ran last, so that the first request
         that starts with it again reads only what follows.  A request stops the read (run() sets warm_stop); the part
@@ -4564,6 +4717,7 @@ class Service:
         reads it only to write that file.  "warm_start": "FILE" names a chat request (messages and tools, as
         /v1/chat/completions takes them) whose first turn is the start, for an installation that knows its agent's
         system prompt before the first request."""
+        self.load_saved_pins()
         if not self.warm_start or not self.loaded():
             return
         path = self.warm_path()
@@ -5045,7 +5199,9 @@ class Service:
         strata-<model>.shared-settings.json: from the last time this model ran."""
         self.shared_path = str(Path(config_path).with_suffix("")) + ".shared-settings.json"
         try:
-            self.shared = clean_shared_defaults(json.loads(Path(self.shared_path).read_text(encoding="utf-8")))
+            self.shared = clean_shared_defaults(
+                json.loads(Path(self.shared_path).read_text(encoding="utf-8")),
+                hy4=self.hy4, inkling=self.call_format == "inkling")
             if self.shared:
                 print("[strata] other apps use the settings: " +
                       ", ".join(f"{k}={v}" for k, v in self.shared.items()), flush=True)
@@ -5571,7 +5727,7 @@ class Service:
 
     def set_shared(self, defaults) -> dict:
         """The settings every client gets for what it leaves out; {} / None = clients use their own again."""
-        self.shared = clean_shared_defaults(defaults)
+        self.shared = clean_shared_defaults(defaults, hy4=self.hy4, inkling=self.call_format == "inkling")
         if self.shared_path:
             try:
                 if self.shared:
@@ -5582,28 +5738,33 @@ class Service:
                 print(f"[strata] could not save the shared settings: {e}", flush=True)
         return self.shared
 
-    def effort_default(self) -> str | None:
+    def effort_default(self):
         """The thinking level of a request that names none: the settings shared with apps first, then the config's
         "reasoning_effort" (#1641).  Every API reads it here (the Responses API did not: 0.1.44.1)."""
-        return self.shared.get("reasoning_effort") or self.config_effort
+        effort = self.shared.get("reasoning_effort")
+        return effort if effort is not None else self.config_effort
+
+    def inkling_default_effort(self):
+        """Default Inkling 2 Mini reasoning_effort when neither request nor config sets one."""
+        return inkling_default_effort(self.model, getattr(self.engine, "model_path", None))
 
     def with_shared(self, req: dict, api: str) -> dict:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
         s = self.shared
         effort = self.effort_default()
-        if not s and not effort:
+        if not s and effort is None:
             return req
         req = dict(req)
         if "max_tokens" in s and not req.get("max_tokens") and not req.get("max_completion_tokens"):
             req["max_tokens"] = s["max_tokens"]
-        if effort:
+        if effort is not None:
             if api == "openai":
                 ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
                 if req.get("reasoning_effort") in (None, "") and not req.get("reasoning") and \
                         "enable_thinking" not in ctk and "reasoning_effort" not in ctk:
                     req["reasoning_effort"] = effort
             elif not req.get("thinking") and not req.get("output_config"):
-                if effort == "none":
+                if effort == "none" or effort == 0:
                     req["thinking"] = {"type": "disabled"}
                 else:                       # "thinking" too: under "on_request" an effort alone does not think
                     req["thinking"], req["output_config"] = {"type": "adaptive"}, {"effort": effort}
@@ -5754,11 +5915,13 @@ class Service:
             engine["vision_note"] = self.vision.cpu_note
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        static = dict(tel["static"])
+        if self.server_ip:                                # About > This PC: the PC's real network IP (no port)
+            static["server_ip"] = self.server_ip
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
-                "hardware_static":
-                tel["static"], "history": tel["history"], "time": now}
+                "hardware_static": static, "history": tel["history"], "time": now}
 
     def prometheus(self) -> str:
         """GET /metrics/prometheus: the totals and what is running in Prometheus' text format, under llama-server's
@@ -5875,7 +6038,8 @@ class Service:
         if self.openai_tools and tools:   # their templates read a tool as OpenAI sends it (_read_tokenizer())
             tools = [{"type": "function", "function": t} for t in tools]
         if self.call_format == "inkling":
-            prompt = self.template.render(messages, tools=tools, **inkling_template_kwargs(kwargs))
+            prompt = self.template.render(messages, tools=tools,
+                                          **inkling_template_kwargs(kwargs, default=self.inkling_default_effort()))
             # at effort 0 the model still opens a thinking block now and then: a reply that must not think starts
             # in its text block (the parser is told: _read_tokenizer()'s text_open_ids)
             return prompt + INK_TEXT_OPEN if off else prompt
@@ -6128,6 +6292,23 @@ class Service:
             ctx = getattr(self.engine, "known_ctx", 0)
             if ctx <= 0:
                 raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+        pin_spec = parse_strata_pin(req) if isinstance(req, dict) else None
+        pin_prefill_only = False
+        if pin_spec is not None and isinstance(req, dict):
+            limit_new = token_limit(req.get("max_completion_tokens"), "max_completion_tokens")
+            limit_old = token_limit(req.get("max_tokens"), "max_tokens")
+            explicit_zero = (limit_new == 0) or (limit_new is None and limit_old == 0)
+            pin_prefill_only = (pin_spec["prefill_only"] is True) or (pin_spec["prefill_only"] is None and explicit_zero)
+            prefix_ids = self.resolve_pin_prefix(messages, tools, kwargs, ids, anchor=pin_spec["anchor"],
+                                                 has_images=bool(images))
+            req["_strata_pin_resolved"] = {**pin_spec, "prefill_only": pin_prefill_only, "prefix_ids": prefix_ids}
+            if pin_prefill_only:
+                if len(prefix_ids) > ctx:
+                    self.forget_prompt(encoded_ids)
+                    raise ContextOverflow("request exceeds the context window: "
+                                          f"pinned prefix ({len(prefix_ids)} tokens) exceeds context ({ctx})",
+                                          prompt=len(prefix_ids), context=ctx)
+                return ids, kwargs.get("enable_thinking", True) is not False, 0
         room = ctx - CTX_SLACK - len(ids)
         fit = self.fit_max_tokens or self.drop_oldest
         if max_new is None or max_new <= 0 or (fit and room < 1):
@@ -6180,6 +6361,45 @@ class Service:
 
     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
 
+    def _head_prefix_ids(self, head_msgs, tools, kwargs, strip_inkling_effort: bool = False) -> list[int]:
+        """Token ids for rendered `head_msgs` + `tools`, trimmed at `PREFIX_END` (and Inkling 2's effort turn)."""
+        marked, marked_tools, changed = mark_think_literals(head_msgs, tools, self.literals)
+        effort = kwargs.get("reasoning_effort")
+        off = kwargs.get("enable_thinking") is False
+        kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
+              if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
+        if self.call_format == "inkling":
+            kw = inkling_template_kwargs(kwargs, default=self.inkling_default_effort())
+        elif self.hy4:
+            kw = hy4_dialect.template_kwargs(kwargs)
+        else:
+            kw = {**self.template_tokens, **({"preserve_thinking": True} if self.preserve_thinking else {}), **kw,
+                  "enable_thinking": not off}
+        if self.openai_tools and marked_tools:
+            marked_tools = [{"type": "function", "function": t} for t in marked_tools]
+        kw["add_generation_prompt"] = False
+        text = self.template.render(marked, tools=marked_tools, **kw)
+        cut = text.find(self.PREFIX_END)
+        if cut >= 0:
+            text = text[:cut]
+        if strip_inkling_effort and self.call_format == "inkling":
+            m = INKLING_EFFORT_RE.search(text)
+            if m:
+                text = text[:m.start()]
+        if changed:
+            text, plain = unmark_think_literals(text, self.literals)
+            return self.tok.encode(text, parse_special=True, plain=plain)
+        return self.tok.encode(text, parse_special=True)
+
+    @staticmethod
+    def _lcp_len(a, b) -> int:
+        n = 0
+        for x, y in zip(a, b):
+            if x != y:
+                break
+            n += 1
+        return n
+
     def resolve_prefix(self, spec, messages, tools, kwargs, ids, has_images=False) -> dict:
         """R1: `"strata_prefix"` marks the start of the prompt as a shared read-only prefix: a long document that many
         short questions follow.  Three ways to say where it ends: `{"messages": K}` (the first K messages), `{"message":
@@ -6201,34 +6421,6 @@ class Service:
             print("[strata] strata_prefix ignored: the request has images", flush=True)
             return {}
         what = ",".join(f"{k}={v}" for k, v in spec.items())
-
-        def lcp(a, b):
-            n = 0
-            for x, y in zip(a, b):
-                if x != y:
-                    break
-                n += 1
-            return n
-
-        def head_ids(msgs):
-            """The ids the rendered `msgs` start with (a message's trailing marker cut at PREFIX_END when it is there)."""
-            marked, marked_tools, changed = mark_think_literals(msgs, tools, self.literals)
-            effort = kwargs.get("reasoning_effort")
-            off = kwargs.get("enable_thinking") is False        # render_prompt's rule for #458's effort_end
-            kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
-                  if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
-            if self.call_format == "inkling":               # the effort as render_prompt writes it
-                kw = inkling_template_kwargs(kwargs)
-            kw["add_generation_prompt"] = False
-            text = self.template.render(marked, tools=marked_tools, **kw)
-            cut = text.find(self.PREFIX_END)
-            if cut >= 0:
-                text = text[:cut]
-            if changed:
-                text, plain = unmark_think_literals(text, self.literals)
-                return self.tok.encode(text, parse_special=True, plain=plain)
-            return self.tok.encode(text, parse_special=True)
-
         if "tokens" in spec:
             n = spec["tokens"]
         elif "messages" in spec:
@@ -6237,8 +6429,7 @@ class Service:
                 print(f"[strata] strata_prefix.messages={k} ignored: the request has {len(messages)} message(s) and the "
                       "prefix must leave at least the last one", flush=True)
                 return {}
-            head = head_ids(messages[:k])
-            n = lcp(head, ids)
+            n = self._lcp_len(self._head_prefix_ids(messages[:k], tools, kwargs), ids)
         else:
             i, chars = spec["message"], spec["chars"]
             text = messages[i].get("content") if 0 <= i < len(messages) else None
@@ -6246,13 +6437,147 @@ class Service:
                 print(f"[strata] strata_prefix ignored: message {i} has no text of {chars} characters", flush=True)
                 return {}
             cut = messages[:i] + [{**messages[i], "content": text[:chars] + self.PREFIX_END}]
-            head = head_ids(cut)
-            n = lcp(head, ids)
+            n = self._lcp_len(self._head_prefix_ids(cut, tools, kwargs), ids)
         if n < 1 or n >= len(ids) - 1:
             print(f"[strata] strata_prefix {what} ignored: it leaves no usable prefix of the {len(ids)}-token prompt "
                   f"(common start {n})", flush=True)
             return {}
         return {"tokens": n}
+
+    def resolve_pin_prefix(self, messages, tools, kwargs, ids, anchor: str | None = None,
+                           has_images: bool = False) -> list[int]:
+        """Compute static prefix token IDs for `strata_pin`.
+
+        - If `anchor` is provided and matches inside the leading system/developer prompt, truncates right before `anchor`
+          (excluding `anchor` itself).
+        - When `anchor` is omitted/null (or absent), renders tools + leading system prompt turns, stopping before
+          Inkling 2's `Thinking effort level:` turn and before any `<|message_user|>` turn.
+        """
+        if has_images:
+            raise ValueError("strata_pin does not support requests containing images")
+        sys_end = next((i for i, m in enumerate(messages) if m.get("role") not in ("system", "developer")), len(messages))
+        head = None
+        if anchor:
+            for idx in range(sys_end):
+                content = messages[idx].get("content")
+                if isinstance(content, str):
+                    pos = content.find(anchor)
+                    if pos >= 0:
+                        cut_msgs = list(messages[:idx]) + [{**messages[idx], "content": content[:pos] + self.PREFIX_END}]
+                        head = self._head_prefix_ids(cut_msgs, tools, kwargs, strip_inkling_effort=True)
+                        break
+                elif isinstance(content, list):
+                    found = False
+                    new_parts = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") in (None, "text", "input_text") and isinstance(part.get("text"), str):
+                            pos = part["text"].find(anchor)
+                            if pos >= 0:
+                                new_parts.append({**part, "text": part["text"][:pos] + self.PREFIX_END})
+                                found = True
+                                break
+                        new_parts.append(part)
+                    if found:
+                        cut_msgs = list(messages[:idx]) + [{**messages[idx], "content": new_parts}]
+                        head = self._head_prefix_ids(cut_msgs, tools, kwargs, strip_inkling_effort=True)
+                        break
+            if head is None:
+                print("[strata] strata_pin.anchor not found in system prompt; using full system prefix", flush=True)
+        if head is None:
+            if sys_end == 0 and not tools:
+                raise ValueError("strata_pin requires a system prompt or tools prefix")
+            head = self._head_prefix_ids(messages[:sys_end], tools, kwargs, strip_inkling_effort=True)
+        n = self._lcp_len(head, ids)
+        if n < 1:
+            raise ValueError("strata_pin produced an empty static prefix")
+        return list(ids[:n])
+
+    def _pin_file_path(self, name: str) -> str | None:
+        if self.pin_dir or self.cache_dir:
+            return None   # --pin-dir already configured on the engine
+        d = self.default_pin_dir()
+        if d is None:
+            return None
+        d.mkdir(parents=True, exist_ok=True)
+        return str(d / f"{name}.bin")
+
+    def _send_pin_cur(self, name: str, resident: str = "ram", path: str | None = None) -> dict:
+        if hasattr(self.engine, "pin_cur"):
+            return self.engine.pin_cur(name, resident=resident, path=path)
+        if hasattr(self.engine, "session_file"):
+            parts = [name, f"resident={resident}"]
+            if path:
+                parts.append(f"path={path}")
+            return self.engine.session_file("pin_cur", " ".join(parts))
+        raise ValueError("this engine does not support named prefix pinning (PIN_CUR)")
+
+    def pin_prefix(self, name: str, prefix_ids: list[int], resident: str = "ram", cancel=None) -> dict:
+        """Prefill `prefix_ids` and capture into named Host-RAM slot `name` (preemptible by interactive requests)."""
+        if getattr(self.engine, "batch", 0):
+            raise ValueError('strata_pin is not available with parallel requests ("parallel" / --batch)')
+
+        class _CombinedCancel:
+            _fast_poll = True
+
+            def __init__(self, primary, preempt):
+                self._primary, self._preempt = primary, preempt
+
+            def is_set(self) -> bool:
+                return (self._primary is not None and self._primary.is_set()) or self._preempt.is_set()
+
+        with self._pin_lock:
+            preempted = 0
+            pin_path = self._pin_file_path(name)
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise QueueCancelled("the client disconnected while waiting to pin prefix")
+                with self.status_lock:
+                    while self.real_requests_pending > 0:
+                        if cancel is not None and cancel.is_set():
+                            raise QueueCancelled("the client disconnected while waiting to pin prefix")
+                        self.pin_idle_cond.wait(timeout=0.1)
+                with self.fifo:
+                    if self.pin_preempt.is_set():
+                        preempted += 1
+                        continue
+                    self.ensure_loaded()
+                    if self.pin_preempt.is_set():
+                        preempted += 1
+                        continue
+                    t0 = time.perf_counter()
+                    warm_cancel = _CombinedCancel(cancel, self.pin_preempt)
+                    gen = self.engine.generate(prefix_ids, 0, {}, warm_cancel, prefill_only=True)
+                    try:
+                        for _ in gen:
+                            if self.pin_preempt.is_set() or (cancel is not None and cancel.is_set()):
+                                break
+                    finally:
+                        gen.close()
+                    if self.pin_preempt.is_set() and not (cancel is not None and cancel.is_set()):
+                        preempted += 1
+                        print(f"[strata] strata_pin '{name}': preempted by interactive request; retrying when idle",
+                              flush=True)
+                        continue
+                    if cancel is not None and cancel.is_set():
+                        raise QueueCancelled("the client disconnected during prefix prefill")
+                    last = dict(getattr(self.engine, "last", None) or {})
+                    reused = int(last.get("reused") or 0)
+                    prompt_ms = float(last.get("prompt_ms") or ((time.perf_counter() - t0) * 1000.0))
+                    t_pin = time.perf_counter()
+                    pin_res = self._send_pin_cur(name, resident=resident, path=pin_path)
+                    pin_ms = float(pin_res.get("ms") or ((time.perf_counter() - t_pin) * 1000.0))
+                    return {
+                        "name": name,
+                        "tokens": int(pin_res.get("tokens") or len(prefix_ids)),
+                        "bytes": int(pin_res.get("bytes") or 0),
+                        "resident": resident,
+                        "cached_tokens": reused,
+                        "prompt_tokens": len(prefix_ids),
+                        "prompt_ms": round(prompt_ms, 1),
+                        "pin_ms": round(pin_ms, 1),
+                        "preempted": preempted,
+                        "status": "pinned",
+                    }
 
     def drop_embeddings(self) -> None:
         """Delete the combined image file prepare() wrote when no run() took it over (a run deletes its own as it
@@ -6459,6 +6784,7 @@ class Service:
         if emb and getattr(self.engine, "split_engine", False) is not True:
             sampling = {**(sampling or {}), "image_pad": self.embeddings.pad}
         self.warm_stop.set()                            # a warm read (start_warm()) gives way
+        real_counted = False
         if self.warm_start and tools and not emb:
             self.keep_start(ids)
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
@@ -6507,6 +6833,10 @@ class Service:
             self._terminal_event_locked(request_id, "queued")
         queued_counted = True
         try:
+            with self.status_lock:
+                self.real_requests_pending += 1
+                self.pin_preempt.set()
+            real_counted = True
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
             turn = contextlib.ExitStack()
             if not par:
@@ -6991,6 +7321,11 @@ class Service:
             raise
         finally:
             with self.status_lock:
+                if real_counted:
+                    self.real_requests_pending = max(0, self.real_requests_pending - 1)
+                    if self.real_requests_pending == 0:
+                        self.pin_preempt.clear()
+                        self.pin_idle_cond.notify_all()
                 if queued_counted:
                     self.status["queued"] -= 1
                 self.terminal_requests.pop(request_id, None)
@@ -8671,6 +9006,7 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
+            pin_spec = parse_strata_pin(req)
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
             require_messages(messages)                # an empty conversation is a 400, as OpenAI answers it, not a reply to nothing
@@ -8722,13 +9058,49 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = self.cancel                             # watched since _post() (#430 #431 #1999)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            pin_resolved = req.pop("_strata_pin_resolved", None)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
-                               {t["name"] for t in extra}) if use_mcp else None
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
-            if validator is not None:
-                chunks = structured_chunks(chunks, validator)
-            chunks = self._capture(chunks, "openai")
+            if pin_resolved is not None and pin_resolved["prefill_only"]:
+                pin_info = svc.pin_prefix(pin_resolved["name"], pin_resolved["prefix_ids"],
+                                          resident=pin_resolved["resident"], cancel=cancel)
+                cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+                created = int(time.time())
+                model = svc.model_for(req)
+                usage = {
+                    "prompt_tokens": pin_info["prompt_tokens"],
+                    "completion_tokens": 0,
+                    "total_tokens": pin_info["prompt_tokens"],
+                    "prompt_tokens_details": {"cached_tokens": pin_info["cached_tokens"]},
+                }
+
+                def pin_chunks():
+                    yield {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
+                           "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""},
+                                        "finish_reason": None}]}
+                    yield {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
+                           "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                           "usage": usage, "strata_pin": pin_info}
+
+                chunks = self._capture(pin_chunks(), "openai")
+            else:
+                pin_info = None
+                if pin_resolved is not None:
+                    pin_info = svc.pin_prefix(pin_resolved["name"], pin_resolved["prefix_ids"],
+                                              resident=pin_resolved["resident"], cancel=cancel)
+                run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+                                   {t["name"] for t in extra}) if use_mcp else None
+                base_chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
+                if pin_info is not None:
+                    def with_pin(src):
+                        for c in src:
+                            if c is not None and c.get("usage") is not None:
+                                c = {**c, "strata_pin": pin_info}
+                            yield c
+                    base_chunks = with_pin(base_chunks)
+                chunks = base_chunks
+                if validator is not None:
+                    chunks = structured_chunks(chunks, validator)
+                chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
             self._sse()
@@ -9106,6 +9478,13 @@ def lan_addresses() -> list[str]:
     return ([first] if ok(first) else []) + sorted(ip for ip in ips if ok(ip) and ip != first)
 
 
+def machine_ip() -> str | None:
+    """The PC's real network IP (what another device types in): its IPv4 addresses on the networks, without loopback
+    or link-local. None when the machine has none (only loopback, or only IPv6)."""
+    ips = lan_addresses()
+    return ", ".join(ips) if ips else None
+
+
 def host_names_for(bind_host: str, allowed_hosts=(), trusted_origins=()) -> set[str]:
     """Every name this server answers to besides an IP address: localhost, the address it listens on, the config's
     allowed_hosts and trusted_origins' hosts, and - listening beyond this PC (0.0.0.0 or a LAN address) - this PC's
@@ -9128,6 +9507,7 @@ def host_names_for(bind_host: str, allowed_hosts=(), trusted_origins=()) -> set[
 
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
+    svc.server_ip = machine_ip()                       # About > This PC: the PC's real IP, worked out once at start
     svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
     httpd.svc = svc
@@ -9401,7 +9781,10 @@ def model_settings(cfg: dict, overrides: dict | None = None) -> dict:
 
     effort = None
     if cfg.get("reasoning_effort") is not None:        # #1641: the thinking level of requests that name none
-        effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}, hy4=hy4_kind.is_hy4(cfg)).get("reasoning_effort")
+        is_ink = ("inkling" in str(cfg.get("model_name") or "").lower()
+                  or any("inkling" in str(x).lower() for x in (cfg.get("args") or ())))
+        effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]},
+                                       hy4=hy4_kind.is_hy4(cfg), inkling=is_ink).get("reasoning_effort")
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise ValueError(f"anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
@@ -9438,6 +9821,9 @@ def model_settings(cfg: dict, overrides: dict | None = None) -> dict:
         "anthropic_think_unasked": mode == "model",
         "tool_call_recovery": flag("tool_call_recovery"),                    # opt-in: see OutputParser's recover
         "warm_start": warm,                                                  # opt-in: see Service.start_warm
+        "pin_dir": over["pin_dir"] if "pin_dir" in over else cfg.get("pin_dir") or None,
+        "cache_dir": over["cache_dir"] if "cache_dir" in over else cfg.get("cache_dir") or None,
+        "pin_cache_mib": over["pin_cache_mib"] if "pin_cache_mib" in over else number("pin_cache_mib", int, "a whole number of MiB"),
         "repeat_stop_tokens": rs,
         "reasoning_budget_tokens": budget if budget is not None else 0,
         "reasoning_loop_recovery": loops,
@@ -9799,6 +10185,12 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     ap.add_argument("--slot-save-path", default=None, metavar="DIR",
                     help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
+    ap.add_argument("--pin-dir", default=None, metavar="DIR",
+                    help="opt-in directory for persisted <name>.bin Host-RAM prefix pins (also \"pin_dir\" in the config)")
+    ap.add_argument("--cache-dir", default=None, metavar="DIR",
+                    help="opt-in cache directory (<dir>/pins holds persisted prefix pins; also \"cache_dir\" in the config)")
+    ap.add_argument("--pin-cache-mib", type=int, default=None, metavar="MIB",
+                    help="RAM budget in MiB for named pinned prefixes (default 0 = unlimited)")
     ap.add_argument("--replicas", type=int, default=None, metavar="N",
                     help="data-parallel replicas (opt-in): cut the \"gpu\" list into N equal groups and run one engine on "
                          "each, requests spread over them (also \"replicas\" in the config: a number, or "
@@ -9898,9 +10290,21 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                               "prefill_gpu": int(pair[0]), "decode_gpu": int(pair[1])}
     if a.gpu is not None:
         cfg_overrides["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
+    if a.pin_dir is not None:
+        cfg_overrides["pin_dir"] = a.pin_dir
+    if a.cache_dir is not None:
+        cfg_overrides["cache_dir"] = a.cache_dir
+    if a.pin_cache_mib is not None:
+        if a.pin_cache_mib < 0:
+            ap.error("--pin-cache-mib must be 0 or more")
+        cfg_overrides["pin_cache_mib"] = a.pin_cache_mib
     # (the file was read above, its saved tuning, --parallel, --batch-groups and --split-serve put on it: read again,
     # it lost them, and a server started with --parallel 16 answered one request at a time)
     cfg = {**cfg, **cfg_overrides} if a.config else dict(cfg_overrides)
+    if a.config and not cfg.get("pin_dir") and not cfg.get("cache_dir"):
+        default_pins = Path(a.config).with_name(Path(a.config).stem + ".pins")
+        if default_pins.is_dir() and any(default_pins.glob("*.bin")):
+            cfg["_existing_pin_dir"] = str(default_pins)
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
     supplied_args = argv if argv is not None else sys.argv[1:]
     if ("STRATA_API_KEY" in os.environ and not os.environ["STRATA_API_KEY"].strip()) or \
@@ -9959,6 +10363,12 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     lazy = False
     overrides = {"fit_max_tokens": True if a.fit_max_tokens else False if a.no_fit_max_tokens else None, "idle_unload_s": a.idle_unload,
                  "min_free_vram_mib": a.min_free_vram_mib, "before_load": a.before_load}
+    if a.pin_dir is not None:
+        overrides["pin_dir"] = a.pin_dir
+    if a.cache_dir is not None:
+        overrides["cache_dir"] = a.cache_dir
+    if a.pin_cache_mib is not None:
+        overrides["pin_cache_mib"] = a.pin_cache_mib
     try:
         settings = model_settings(cfg, overrides)       # #37: the model's own settings, read again at every switch
     except ValueError as e:
@@ -9992,7 +10402,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family("hy4" if svc.hy4 else None)
+        svc.set_family("hy4" if svc.hy4 else "inkling" if svc.call_format == "inkling" else None)
         if svc.hy4:
             svc._force_text = hy4_dialect.force_text
         requested = cfg.get("parallel")
@@ -10040,7 +10450,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         raise SystemExit(f"[strata] config \"prevent_sleep\" must be true or false, not {cfg['prevent_sleep']!r}")
     from serve.keepawake import KeepAwake
     svc.keep_awake = KeepAwake.create(cfg.get("prevent_sleep") is True)      # #1727: opt-in, Windows only
-    if svc.config_effort:                               # #1641: the thinking level of requests that name none
+    if svc.config_effort is not None:                   # #1641: the thinking level of requests that name none
         print(f"[strata] thinking level: {svc.config_effort} (reasoning_effort in the config; a request, or the "
               "settings shared with other apps, can set its own)", flush=True)
     if svc.aliases:

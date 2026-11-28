@@ -35,6 +35,13 @@ inline bool gfx_arch_is_gfx11_wmma(const char* gcn) {
 /// defined(__gfx1201__)`): the R9700 / 9070 (XT) are gfx1201, the 9060 (XT) gfx1200.
 inline bool gfx_arch_is_gfx12_wmma(const char* gcn) { return gfx_arch_is(gcn, "gfx1200") || gfx_arch_is(gcn, "gfx1201"); }
 
+/// RDNA2 (RX 6000: gfx1030 RX 6800 / 6900, gfx1031 RX 6700, gfx1032 RX 6600, gfx1033-gfx1036 the APUs and the
+/// smallest parts): the signed dot4 (v_dot4_i32_i8), no matrix cores.
+inline bool gfx_arch_is_rdna2(const char* gcn) {
+    return gfx_arch_is(gcn, "gfx1030") || gfx_arch_is(gcn, "gfx1031") || gfx_arch_is(gcn, "gfx1032") || gfx_arch_is(gcn, "gfx1033") ||
+           gfx_arch_is(gcn, "gfx1034") || gfx_arch_is(gcn, "gfx1035") || gfx_arch_is(gcn, "gfx1036");
+}
+
 /// Strix Halo (Ryzen AI Max, RDNA3.5): the part the gfx1151 defaults (docs/STRIX_HALO.md) are measured on.
 inline bool gfx_arch_is_gfx1151(const char* gcn) { return gfx_arch_is(gcn, "gfx1151"); }
 

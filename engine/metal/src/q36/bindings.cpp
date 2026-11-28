@@ -25,10 +25,6 @@ void native_q8_0_packed_unregister(const void*) {}
 void native_router_topk(const float* x,int32_t* ids,float* w,int ne,int k,int rows,void* s) {
     poly::route_rows(x,ne,k,rows,0,1,nullptr,nullptr,true,1,ids,w,s);
 }
-void native_swiglu_quantize_q8_1(const float* g,const float* u,void* q,int n,int rows,void* s) {
-    QArgs a;a.p[0]=g;a.p[1]=q;a.p[3]=u;a.ni=n;a.rows=rows;a.xstride=n;a.kind=1;
-    qrun("poly_quantize",a,s,{uint32_t(n/32),uint32_t(rows),1});
-}
 bool native_expert_supported(int gu,int down,int64_t n,int64_t f) noexcept {
     return quant_name(gu)&&quant_name(down)&&n>0&&f>0&&n%ggml_blck_size(ggml_type(gu))==0&&f%ggml_blck_size(ggml_type(down))==0;
 }

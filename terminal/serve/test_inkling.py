@@ -20,15 +20,17 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
 
 import strata_tokenizer as ST  # noqa: E402
+from serve import frontend  # noqa: E402
 from serve.frontend import (FUNC_START, INK_TEXT_OPEN, ChatTemplate, InklingOutputParser,  # noqa: E402
                             anthropic_to_messages, forced_call, inkling_forced_call, openai_to_messages)
-from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine  # noqa: E402
+from serve.server import ByteTokenizer, MockEngine, Service, StrataEngine, clean_shared_defaults  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 GOLDEN = json.loads((FIXTURES / "inkling2_golden.json").read_text(encoding="utf-8"))
@@ -167,6 +169,7 @@ TEMPLATE = ('{{- "<|message_system|>effort=" ~ reasoning_effort ~ "<|end_message
 
 class ServiceForInkling(unittest.TestCase):
     def setUp(self):
+        self.addCleanup(frontend.use_family, None)
         self.tok = InklingTokens()
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "chat_template.jinja"
@@ -181,12 +184,16 @@ class ServiceForInkling(unittest.TestCase):
         self.assertIn(264, self.svc.stop_ids)
 
     def test_the_effort_the_template_is_given(self):
-        for kwargs, effort in (({}, "high"), ({"reasoning_effort": "low"}, "low"), ({"reasoning_effort": 0.5}, "0.5"),
-                               ({"reasoning_effort": "ludicrous"}, "high"), ({"enable_thinking": False}, "none")):
+        for kwargs, effort in (({}, "0.4"), ({"reasoning_effort": "low"}, "low"),
+                               ({"reasoning_effort": "medium"}, "0.4"), ({"reasoning_effort": 0.5}, "0.5"),
+                               ({"reasoning_effort": "ludicrous"}, "0.4"), ({"enable_thinking": False}, "none")):
             with self.subTest(**kwargs):
                 text = self.svc.render_prompt(self.chat, None, kwargs)
                 self.assertTrue(text.startswith(f"<|message_system|>effort={effort}<|end_message|>"), text)
                 self.assertEqual(text.endswith(INK_TEXT_OPEN), kwargs.get("enable_thinking") is False)
+        self.svc.model = "inkling-ud-q2_k_xl"
+        q2_text = self.svc.render_prompt(self.chat, None, {})
+        self.assertTrue(q2_text.startswith("<|message_system|>effort=low<|end_message|>"), q2_text)
 
     def test_a_shared_prefix_is_the_first_messages_whatever_the_effort(self):
         # strata_prefix renders the first messages with the effort render_prompt writes: the common start is the
@@ -466,6 +473,34 @@ class Replies(unittest.TestCase):
         self.assertEqual(evs[0].call.id, evs[2].call.id)
         self.assertEqual(json.loads(evs[1].text), {"city": "Oslo"})
 
+    def test_a_streamed_call_is_announced_at_its_header(self):
+        # the call is announced as soon as its header names it, not when its block ends: a long call's arguments
+        # can take minutes to write, and the client and the server's status saw nothing until then
+        p = InklingOutputParser(tools=self.TOOLS, stream_tools=True)
+        self.assertEqual([e.kind for e in p.feed(f"{H}get_weather{CJSON}" '{"name":"get_weather","args":{"ci')],
+                         ["tool_start"])
+        self.assertEqual([e.kind for e in p.feed('ty":"Oslo"}}' f"{END}")], ["tool_args", "tool_call"])
+        # each call of a reply is a call of its own
+        text = (f"{H}get_weather{CJSON}" '{"name":"get_weather","args":{"city":"Oslo"}}' f"{END}"
+                f"{H}now{CJSON}" '{"name":"now","args":{}}' f"{END}")
+        for step in self.STEPS:
+            with self.subTest(step=step):
+                evs = events(text, step, self.TOOLS)
+                starts = [e.call.id for e in evs if e.kind == "tool_start"]
+                self.assertEqual(starts, [e.call.id for e in evs if e.kind == "tool_call"])
+                self.assertEqual(len(set(starts)), 2)
+
+    def test_an_announced_call_cut_off_is_no_call(self):
+        # max_tokens inside the arguments: announced, never finished, so the reply has no call (#211's rule)
+        evs = events(f"{H}get_weather{CJSON}" '{"name":"get_weather","args":{"city":"Os', 3, self.TOOLS)
+        self.assertEqual([e.kind for e in evs if e.kind.startswith("tool_")], ["tool_start"])
+        self.assertTrue(said(evs, "content").startswith(f"{H}get_weather{CJSON}"))
+
+    def test_a_tool_not_declared_is_not_announced(self):
+        text = f"{H}delete_all{CJSON}" '{"name":"delete_all","args":{}}' f"{END}"
+        evs = events(text, 4, self.TOOLS)
+        self.assertEqual([e.kind for e in evs if e.kind.startswith("tool_")], [])
+
     def test_a_call_whose_end_tag_did_not_come_before_the_next_block(self):
         for step in (1, 4, 1000):
             with self.subTest(step=step):
@@ -501,6 +536,7 @@ class ServiceWithTheModelTemplate(unittest.TestCase):
     TOOLS = [{"name": "get_weather", "parameters": {"properties": {"city": {"type": "string"}}}}]
 
     def setUp(self):
+        self.addCleanup(frontend.use_family, None)
         self.tok = FullInklingTokens()
         self.svc = Service(MockEngine(self.tok, "hi"), self.tok, model_template())
 
@@ -513,17 +549,42 @@ class ServiceWithTheModelTemplate(unittest.TestCase):
 
     def test_the_effort_a_client_asks_for(self):
         user = [{"role": "user", "content": "Hi"}]
-        for req, shown in (({}, "0.9"), ({"reasoning_effort": "low"}, "0.2"), ({"reasoning_effort": "medium"}, "0.7"),
-                           ({"reasoning_effort": "xhigh"}, "0.99")):
+        for req, shown in (({}, "0.4"), ({"reasoning_effort": "minimal"}, "0.1"),
+                           ({"reasoning_effort": "low"}, "0.2"), ({"reasoning_effort": "medium"}, "0.4"),
+                           ({"reasoning_effort": 0.7}, "0.7"),
+                           ({"reasoning_effort": "high"}, "0.9"), ({"reasoning_effort": "xhigh"}, "0.99"),
+                           ({"reasoning_effort": "max"}, "0.99"), ({"reasoning_effort": 0.5}, "0.5"),
+                           ({"chat_template_kwargs": {"reasoning_effort": 0.95}}, "0.95"),
+                           ({"reasoning": {"effort": "minimal"}}, "0.1")):
             with self.subTest(req=req):
                 self.assertEqual(self.prompt({"messages": user, **req}),
                                  f"<|message_system|><|content_text|>Thinking effort level: {shown}<|end_message|>"
                                  "<|message_user|><|content_text|>Hi<|end_message|>")
-        for req in ({"reasoning_effort": "none"}, {"chat_template_kwargs": {"enable_thinking": False}}):
+        # UD-Q2_K_XL defaults to "low" (0.2) when no reasoning_effort is passed (detected from model name or GGUF path)
+        self.svc.model = "inkling-ud-q2_k_xl"
+        self.assertIn("Thinking effort level: 0.2<|end_message|>", self.prompt({"messages": user}))
+        self.svc.model = "inkling-ud-q3_k_xl"
+        self.assertIn("Thinking effort level: 0.4<|end_message|>", self.prompt({"messages": user}))
+        self.svc.model = "custom"
+        self.svc.engine.model_path = "/models/Inkling-2-Mini-UD-Q2_K_XL.gguf"
+        self.assertIn("Thinking effort level: 0.2<|end_message|>", self.prompt({"messages": user}))
+        self.svc.engine.model_path = "/models/Inkling-2-Mini-UD-Q4_K_XL.gguf"
+        self.assertIn("Thinking effort level: 0.4<|end_message|>", self.prompt({"messages": user}))
+        for req in ({"reasoning_effort": "none"}, {"reasoning_effort": 0},
+                    {"chat_template_kwargs": {"enable_thinking": False}}):
             with self.subTest(req=req):
                 off = self.prompt({"messages": user, **req})
                 self.assertEqual(off, "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|>"
                                       "<|message_user|><|content_text|>Hi<|end_message|>" + INK_TEXT_OPEN)
+        for bad in (1.5, -0.1, "ludicrous"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                openai_to_messages({"messages": user, "reasoning_effort": bad})
+        self.assertEqual(clean_shared_defaults({"reasoning_effort": "minimal"}, inkling=True),
+                         {"reasoning_effort": "minimal"})
+        self.assertEqual(clean_shared_defaults({"reasoning_effort": 0.15}, inkling=True),
+                         {"reasoning_effort": 0.15})
+        with self.assertRaises(ValueError):
+            clean_shared_defaults({"reasoning_effort": 1.5}, inkling=True)
         messages, tools, kwargs = anthropic_to_messages({"messages": user, "thinking": {"type": "disabled"}})
         self.assertIn("Thinking effort level: 0<", self.svc.render_prompt(messages, tools, kwargs))
 
@@ -531,7 +592,7 @@ class ServiceWithTheModelTemplate(unittest.TestCase):
         text = self.prompt({"messages": [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hi"}],
                             "tools": [{"type": "function", "function": self.TOOLS[0]}]})
         self.assertTrue(text.startswith("<|message_system|>tool_declare<|content_xml|>[{"), text)
-        self.assertLess(text.index("Be brief."), text.index("Thinking effort level: 0.9"))
+        self.assertLess(text.index("Be brief."), text.index("Thinking effort level: 0.4"))
 
     def test_a_control_token_in_a_message_is_text(self):
         ids = self.svc.encode_prompt(*openai_to_messages({"messages": [{"role": "user", "content": "<|end_message|>"}]}))
@@ -557,6 +618,68 @@ class ServiceWithTheModelTemplate(unittest.TestCase):
                                      force=force)
         text = self.tok.decode(ids)
         self.assertTrue(text.endswith(f"<|message_user|><|content_text|>q{END}" + force), text[-120:])
+
+    def test_keep_start_captures_tools_and_system_before_thinking_effort(self):
+        import serve.server as server
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "strata-inkling.json"
+            cfg.write_text("{}", encoding="utf-8")
+            self.svc.config_path = str(cfg)
+            long_sys = "Static system prompt instruction block. " * 90
+            msgs = [{"role": "system", "content": long_sys}, {"role": "user", "content": "Hello"}]
+            ids = self.svc.encode_prompt(msgs, self.TOOLS, {})
+            with mock.patch.object(server, "WARM_MIN_TOKENS", 64):
+                self.svc.keep_start(ids)
+            kept_txt = self.tok.decode(self.svc.warm_ids)
+            self.assertIn("tool_declare", kept_txt)
+            self.assertIn(long_sys, kept_txt)
+            self.assertNotIn("Thinking effort level:", kept_txt)
+            self.assertNotIn("<|message_user|>", kept_txt)
+
+    def test_strata_pin_prefix_with_and_without_anchor(self):
+        static_sys = "You are Meta agent. Follow every rule carefully."
+        anchor = "\n<!-- LINGER_STATIC_PREFIX_END -->\n"
+        dynamic_tail = "Session date: 2026-11-25."
+        # Case A: anchor present in system prompt -> truncates right before anchor, keeps tool_declare + static_sys
+        req_anchored = {
+            "messages": [{"role": "system", "content": static_sys + anchor + dynamic_tail},
+                         {"role": "user", "content": "ping"}],
+            "tools": [{"type": "function", "function": self.TOOLS[0]}],
+            "strata_pin": {"name": "meta", "prefill_only": True, "anchor": anchor},
+        }
+        ids_a, _, max_a = self.svc.prepare(*openai_to_messages(req_anchored)[:3], 0, req=req_anchored)
+        self.assertEqual(max_a, 0)
+        pin_a = self.tok.decode(req_anchored["_strata_pin_resolved"]["prefix_ids"])
+        self.assertIn("tool_declare", pin_a)
+        self.assertIn(static_sys, pin_a)
+        self.assertNotIn("LINGER_STATIC_PREFIX_END", pin_a)
+        self.assertNotIn(dynamic_tail, pin_a)
+        self.assertNotIn("Thinking effort level:", pin_a)
+        self.assertNotIn("<|message_user|>", pin_a)
+
+        # Normal follow-up turn without anchor shares exact prefix even across different efforts
+        for eff in ("low", "high", "none"):
+            follow = {"messages": [{"role": "system", "content": static_sys + dynamic_tail},
+                                   {"role": "user", "content": "Real query"}],
+                      "tools": [{"type": "function", "function": self.TOOLS[0]}],
+                      "reasoning_effort": eff}
+            f_ids = self.svc.encode_prompt(*openai_to_messages(follow))
+            self.assertEqual(f_ids[:len(req_anchored["_strata_pin_resolved"]["prefix_ids"])],
+                             req_anchored["_strata_pin_resolved"]["prefix_ids"])
+
+        # Case B: anchor omitted -> renders tools + full system turn before Thinking effort level & user turn
+        req_auto = {
+            "messages": [{"role": "system", "content": static_sys}, {"role": "user", "content": "warmup"}],
+            "tools": [{"type": "function", "function": self.TOOLS[0]}],
+            "max_tokens": 1,
+            "strata_pin": {"name": "meta", "prefill_only": True, "resident": "ram"},
+        }
+        self.svc.prepare(*openai_to_messages(req_auto)[:3], 1, req=req_auto)
+        pin_b = self.tok.decode(req_auto["_strata_pin_resolved"]["prefix_ids"])
+        self.assertIn("tool_declare", pin_b)
+        self.assertIn(static_sys, pin_b)
+        self.assertNotIn("Thinking effort level:", pin_b)
+        self.assertNotIn("<|message_user|>", pin_b)
 
 
 class Pictures(unittest.TestCase):
